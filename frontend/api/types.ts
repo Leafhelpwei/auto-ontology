@@ -7,6 +7,10 @@ import type { Column, Schema } from '@/types/datasources';
 export type ApiError = {
 	message: string;
 	error: boolean;
+	/** Preserved for optimistic concurrency and structured validation failures. */
+	status?: number;
+	code?: string;
+	details?: unknown;
 };
 
 export type ResponseWithError<T> = T & Partial<ApiError>;

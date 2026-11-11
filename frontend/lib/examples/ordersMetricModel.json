@@ -1,0 +1,371 @@
+{
+	"model_id": "fixture-orders",
+	"name": "订单语义验收示例",
+	"dialect": "postgres",
+	"sources": [
+		{
+			"source_id": "lines",
+			"datasource_id": "fixture-postgres",
+			"catalog_table_id": "fixture-table-order_line",
+			"owner_term_id": "lines",
+			"schema_name": "ontology_fixture",
+			"table_name": "order_line",
+			"grain": ["order_line_id"],
+			"fields": [
+				{
+					"field_id": "order_line_id",
+					"catalog_column_id": "fixture-column-order_line_id",
+					"column_name": "order_line_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "order_id",
+					"catalog_column_id": "fixture-column-order_id",
+					"column_name": "order_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "product_id",
+					"catalog_column_id": "fixture-column-product_id",
+					"column_name": "product_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "quantity",
+					"catalog_column_id": "fixture-column-quantity",
+					"column_name": "quantity",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "unit_price",
+					"catalog_column_id": "fixture-column-unit_price",
+					"column_name": "unit_price",
+					"data_type": "number",
+					"nullable": false
+				}
+			],
+			"dimensions": [
+				{
+					"dimension_id": "currency_code",
+					"field": {
+						"source_id": "orders",
+						"field_id": "currency_code"
+					},
+					"relationship_path": ["line_order"]
+				},
+				{
+					"dimension_id": "customer_name",
+					"field": {
+						"source_id": "customers",
+						"field_id": "customer_name"
+					},
+					"relationship_path": ["line_order", "order_customer"]
+				},
+				{
+					"dimension_id": "product_name",
+					"field": {
+						"source_id": "products",
+						"field_id": "product_name"
+					},
+					"relationship_path": ["line_product"]
+				}
+			],
+			"required_filters": [],
+			"priority": 100,
+			"pre_aggregated": false,
+			"structure_fingerprint": ""
+		},
+		{
+			"source_id": "orders",
+			"datasource_id": "fixture-postgres",
+			"catalog_table_id": "fixture-table-sales_order",
+			"owner_term_id": "orders",
+			"schema_name": "ontology_fixture",
+			"table_name": "sales_order",
+			"grain": ["order_id"],
+			"fields": [
+				{
+					"field_id": "order_id",
+					"catalog_column_id": "fixture-column-order_id",
+					"column_name": "order_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "customer_id",
+					"catalog_column_id": "fixture-column-customer_id",
+					"column_name": "customer_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "status_code",
+					"catalog_column_id": "fixture-column-status_code",
+					"column_name": "status_code",
+					"data_type": "string",
+					"nullable": false
+				},
+				{
+					"field_id": "currency_code",
+					"catalog_column_id": "fixture-column-currency_code",
+					"column_name": "currency_code",
+					"data_type": "string",
+					"nullable": false
+				},
+				{
+					"field_id": "created_at",
+					"catalog_column_id": "fixture-column-created_at",
+					"column_name": "created_at",
+					"data_type": "datetime",
+					"nullable": false
+				},
+				{
+					"field_id": "confirmed_at",
+					"catalog_column_id": "fixture-column-confirmed_at",
+					"column_name": "confirmed_at",
+					"data_type": "datetime",
+					"nullable": true
+				}
+			],
+			"dimensions": [],
+			"required_filters": [],
+			"priority": 100,
+			"pre_aggregated": false,
+			"structure_fingerprint": ""
+		},
+		{
+			"source_id": "customers",
+			"datasource_id": "fixture-postgres",
+			"catalog_table_id": "fixture-table-customer",
+			"owner_term_id": "customers",
+			"schema_name": "ontology_fixture",
+			"table_name": "customer",
+			"grain": ["customer_id"],
+			"fields": [
+				{
+					"field_id": "customer_id",
+					"catalog_column_id": "fixture-column-customer_id",
+					"column_name": "customer_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "customer_name",
+					"catalog_column_id": "fixture-column-customer_name",
+					"column_name": "customer_name",
+					"data_type": "string",
+					"nullable": true
+				}
+			],
+			"dimensions": [],
+			"required_filters": [],
+			"priority": 100,
+			"pre_aggregated": false,
+			"structure_fingerprint": ""
+		},
+		{
+			"source_id": "products",
+			"datasource_id": "fixture-postgres",
+			"catalog_table_id": "fixture-table-product",
+			"owner_term_id": "products",
+			"schema_name": "ontology_fixture",
+			"table_name": "product",
+			"grain": ["product_id"],
+			"fields": [
+				{
+					"field_id": "product_id",
+					"catalog_column_id": "fixture-column-product_id",
+					"column_name": "product_id",
+					"data_type": "number",
+					"nullable": false
+				},
+				{
+					"field_id": "product_name",
+					"catalog_column_id": "fixture-column-product_name",
+					"column_name": "product_name",
+					"data_type": "string",
+					"nullable": false
+				}
+			],
+			"dimensions": [],
+			"required_filters": [],
+			"priority": 100,
+			"pre_aggregated": false,
+			"structure_fingerprint": ""
+		}
+	],
+	"relationships": [
+		{
+			"relationship_id": "line_order",
+			"source_id": "lines",
+			"target_id": "orders",
+			"role": "belongs_to",
+			"keys": [
+				{
+					"source_field_id": "order_id",
+					"target_field_id": "order_id"
+				}
+			],
+			"cardinality": "many_to_one",
+			"join_type": "inner",
+			"predicates": []
+		},
+		{
+			"relationship_id": "order_customer",
+			"source_id": "orders",
+			"target_id": "customers",
+			"role": "buyer",
+			"keys": [
+				{
+					"source_field_id": "customer_id",
+					"target_field_id": "customer_id"
+				}
+			],
+			"cardinality": "many_to_one",
+			"join_type": "left",
+			"predicates": []
+		},
+		{
+			"relationship_id": "line_product",
+			"source_id": "lines",
+			"target_id": "products",
+			"role": "product",
+			"keys": [
+				{
+					"source_field_id": "product_id",
+					"target_field_id": "product_id"
+				}
+			],
+			"cardinality": "many_to_one",
+			"join_type": "inner",
+			"predicates": []
+		}
+	],
+	"metrics": [
+		{
+			"metric_id": "confirmed_amount",
+			"name": "已确认商品金额",
+			"description": "当前已确认订单的明细数量乘成交单价，按币种分别计算。",
+			"owner_term_id": "lines",
+			"kind": "atomic",
+			"source_ids": ["lines"],
+			"aggregation": "sum",
+			"expression": {
+				"kind": "binary",
+				"operator": "multiply",
+				"left": {
+					"kind": "field",
+					"field_id": "quantity"
+				},
+				"right": {
+					"kind": "field",
+					"field_id": "unit_price"
+				}
+			},
+			"required_filters": [
+				{
+					"field": {
+						"source_id": "orders",
+						"field_id": "status_code"
+					},
+					"operator": "eq",
+					"value": "CONFIRMED"
+				}
+			],
+			"supported_dimensions": ["currency_code", "customer_name", "product_name"],
+			"time_field_id": null,
+			"time_role": null,
+			"supported_granularities": [],
+			"unit": "currency",
+			"currency_field_id": "currency_code",
+			"fixed_currency": null,
+			"empty_value": "null",
+			"zero_division": "null",
+			"family_id": null,
+			"default_of_family": false,
+			"evidence": []
+		},
+		{
+			"metric_id": "cancelled_amount",
+			"name": "已取消商品金额",
+			"description": "当前已确认订单的明细数量乘成交单价，按币种分别计算。",
+			"owner_term_id": "lines",
+			"kind": "atomic",
+			"source_ids": ["lines"],
+			"aggregation": "sum",
+			"expression": {
+				"kind": "binary",
+				"operator": "multiply",
+				"left": {
+					"kind": "field",
+					"field_id": "quantity"
+				},
+				"right": {
+					"kind": "field",
+					"field_id": "unit_price"
+				}
+			},
+			"required_filters": [
+				{
+					"field": {
+						"source_id": "orders",
+						"field_id": "status_code"
+					},
+					"operator": "eq",
+					"value": "CANCELLED"
+				}
+			],
+			"supported_dimensions": ["currency_code", "customer_name", "product_name"],
+			"time_field_id": null,
+			"time_role": null,
+			"supported_granularities": [],
+			"unit": "currency",
+			"currency_field_id": "currency_code",
+			"fixed_currency": null,
+			"empty_value": "null",
+			"zero_division": "null",
+			"family_id": null,
+			"default_of_family": false,
+			"evidence": []
+		},
+		{
+			"metric_id": "confirmed_order_count",
+			"name": "已确认订单数",
+			"description": "当前已确认且已通过明细完整性校验的订单去重数。",
+			"owner_term_id": "lines",
+			"kind": "atomic",
+			"source_ids": ["lines"],
+			"aggregation": "count_distinct",
+			"expression": {
+				"kind": "field",
+				"field_id": "order_id"
+			},
+			"required_filters": [
+				{
+					"field": {
+						"source_id": "orders",
+						"field_id": "status_code"
+					},
+					"operator": "eq",
+					"value": "CONFIRMED"
+				}
+			],
+			"supported_dimensions": ["currency_code", "customer_name", "product_name"],
+			"time_field_id": null,
+			"time_role": null,
+			"supported_granularities": [],
+			"unit": "count",
+			"currency_field_id": null,
+			"fixed_currency": null,
+			"empty_value": "zero",
+			"zero_division": "null",
+			"family_id": null,
+			"default_of_family": false,
+			"evidence": []
+		}
+	]
+}

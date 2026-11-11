@@ -1,6 +1,86 @@
 {
   "components": {
     "schemas": {
+      "BinaryExpression": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "binary",
+            "default": "binary",
+            "title": "Kind",
+            "type": "string"
+          },
+          "left": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpression",
+                "field": "#/components/schemas/FieldExpression",
+                "metric": "#/components/schemas/MetricExpression",
+                "number": "#/components/schemas/NumberExpression"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FieldExpression"
+              },
+              {
+                "$ref": "#/components/schemas/NumberExpression"
+              },
+              {
+                "$ref": "#/components/schemas/MetricExpression"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpression"
+              }
+            ],
+            "title": "Left"
+          },
+          "operator": {
+            "enum": [
+              "add",
+              "subtract",
+              "multiply",
+              "divide"
+            ],
+            "title": "Operator",
+            "type": "string"
+          },
+          "right": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpression",
+                "field": "#/components/schemas/FieldExpression",
+                "metric": "#/components/schemas/MetricExpression",
+                "number": "#/components/schemas/NumberExpression"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FieldExpression"
+              },
+              {
+                "$ref": "#/components/schemas/NumberExpression"
+              },
+              {
+                "$ref": "#/components/schemas/MetricExpression"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpression"
+              }
+            ],
+            "title": "Right"
+          }
+        },
+        "required": [
+          "operator",
+          "left",
+          "right"
+        ],
+        "title": "BinaryExpression",
+        "type": "object"
+      },
       "Body_import_model_api_model_import_post": {
         "properties": {
           "file": {
@@ -958,6 +1038,30 @@
         "title": "ConnectionTestResponse",
         "type": "object"
       },
+      "CreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "$ref": "#/components/schemas/GovernedModel"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "title": "CreateRequest",
+        "type": "object"
+      },
       "CustomAnalysis": {
         "additionalProperties": true,
         "description": "A verified SQL example, joined with the text of its ``Sql`` node.",
@@ -1660,6 +1764,51 @@
         "title": "DescriptionSuggestionResponse",
         "type": "object"
       },
+      "DimensionBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "dimension_id": {
+            "title": "Dimension Id",
+            "type": "string"
+          },
+          "field": {
+            "$ref": "#/components/schemas/FieldRef"
+          },
+          "relationship_path": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Relationship Path",
+            "type": "array"
+          }
+        },
+        "required": [
+          "dimension_id",
+          "field"
+        ],
+        "title": "DimensionBinding",
+        "type": "object"
+      },
+      "DraftRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "model": {
+            "$ref": "#/components/schemas/GovernedModel"
+          }
+        },
+        "required": [
+          "model",
+          "expected_version"
+        ],
+        "title": "DraftRequest",
+        "type": "object"
+      },
       "EntityCoverageCandidate": {
         "additionalProperties": true,
         "description": "One retrieved semantic candidate, ranked by vector distance.",
@@ -2071,6 +2220,86 @@
         "title": "ExportRequest",
         "type": "object"
       },
+      "FieldBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "catalog_column_id": {
+            "title": "Catalog Column Id",
+            "type": "string"
+          },
+          "column_name": {
+            "title": "Column Name",
+            "type": "string"
+          },
+          "data_type": {
+            "enum": [
+              "number",
+              "string",
+              "boolean",
+              "date",
+              "datetime"
+            ],
+            "title": "Data Type",
+            "type": "string"
+          },
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "nullable": {
+            "default": true,
+            "title": "Nullable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "field_id",
+          "catalog_column_id",
+          "column_name",
+          "data_type"
+        ],
+        "title": "FieldBinding",
+        "type": "object"
+      },
+      "FieldExpression": {
+        "additionalProperties": false,
+        "properties": {
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "field",
+            "default": "field",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field_id"
+        ],
+        "title": "FieldExpression",
+        "type": "object"
+      },
+      "FieldRef": {
+        "additionalProperties": false,
+        "properties": {
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "field_id"
+        ],
+        "title": "FieldRef",
+        "type": "object"
+      },
       "ForeignKeyRef": {
         "additionalProperties": true,
         "description": "One foreign-key column pair behind an exploration edge.\n\n``source_column`` always names a column on the edge's ``source``. The\nsample values are rendered through ``stringify_sample_values`` before\nreaching this model, so the types a column stores arrive here as a plain\nstring list.",
@@ -2331,6 +2560,55 @@
           "search_term"
         ],
         "title": "GlobalSearchRequest",
+        "type": "object"
+      },
+      "GovernedModel": {
+        "additionalProperties": false,
+        "properties": {
+          "dialect": {
+            "const": "postgres",
+            "default": "postgres",
+            "title": "Dialect",
+            "type": "string"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/Metric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "relationships": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Relationship"
+            },
+            "title": "Relationships",
+            "type": "array"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceBinding"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "model_id",
+          "name",
+          "sources",
+          "metrics"
+        ],
+        "title": "GovernedModel",
         "type": "object"
       },
       "GraphLink": {
@@ -2615,6 +2893,102 @@
         "title": "IdRef",
         "type": "object"
       },
+      "ImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "default": "auto-ontology-governed-model-v1",
+            "title": "Format",
+            "type": "string"
+          },
+          "model": {
+            "$ref": "#/components/schemas/GovernedModel"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "title": "ImportRequest",
+        "type": "object"
+      },
+      "InterpretationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "question": {
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Question",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "selected_metric_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Selected Metric Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "InterpretationRequest",
+        "type": "object"
+      },
+      "JoinKey": {
+        "additionalProperties": false,
+        "properties": {
+          "source_field_id": {
+            "title": "Source Field Id",
+            "type": "string"
+          },
+          "target_field_id": {
+            "title": "Target Field Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_field_id",
+          "target_field_id"
+        ],
+        "title": "JoinKey",
+        "type": "object"
+      },
       "ListResponse_DatabaseSummary_": {
         "additionalProperties": true,
         "properties": {
@@ -2835,6 +3209,304 @@
         "title": "ListResponse[Zone]",
         "type": "object"
       },
+      "Metric": {
+        "additionalProperties": false,
+        "properties": {
+          "aggregation": {
+            "anyOf": [
+              {
+                "enum": [
+                  "sum",
+                  "count",
+                  "count_distinct"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aggregation"
+          },
+          "currency_field_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency Field Id"
+          },
+          "default_of_family": {
+            "default": false,
+            "title": "Default Of Family",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "empty_value": {
+            "default": "null",
+            "enum": [
+              "null",
+              "zero"
+            ],
+            "title": "Empty Value",
+            "type": "string"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "expression": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "binary": "#/components/schemas/BinaryExpression",
+                    "field": "#/components/schemas/FieldExpression",
+                    "metric": "#/components/schemas/MetricExpression",
+                    "number": "#/components/schemas/NumberExpression"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/FieldExpression"
+                  },
+                  {
+                    "$ref": "#/components/schemas/NumberExpression"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MetricExpression"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BinaryExpression"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expression"
+          },
+          "family_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family Id"
+          },
+          "fixed_currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fixed Currency"
+          },
+          "kind": {
+            "default": "atomic",
+            "enum": [
+              "atomic",
+              "composite"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "metric_id": {
+            "title": "Metric Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_term_id": {
+            "title": "Owner Term Id",
+            "type": "string"
+          },
+          "required_filters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Predicate"
+            },
+            "title": "Required Filters",
+            "type": "array"
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Ids",
+            "type": "array"
+          },
+          "supported_dimensions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Supported Dimensions",
+            "type": "array"
+          },
+          "supported_granularities": {
+            "default": [],
+            "items": {
+              "enum": [
+                "day",
+                "month",
+                "year"
+              ],
+              "type": "string"
+            },
+            "title": "Supported Granularities",
+            "type": "array"
+          },
+          "time_field_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Field Id"
+          },
+          "time_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Role"
+          },
+          "unit": {
+            "default": "number",
+            "title": "Unit",
+            "type": "string"
+          },
+          "zero_division": {
+            "default": "null",
+            "enum": [
+              "null",
+              "error"
+            ],
+            "title": "Zero Division",
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric_id",
+          "name",
+          "description",
+          "owner_term_id",
+          "source_ids"
+        ],
+        "title": "Metric",
+        "type": "object"
+      },
+      "MetricExpression": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "metric",
+            "default": "metric",
+            "title": "Kind",
+            "type": "string"
+          },
+          "metric_id": {
+            "title": "Metric Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric_id"
+        ],
+        "title": "MetricExpression",
+        "type": "object"
+      },
+      "MetricQueryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "all_time": {
+            "default": false,
+            "title": "All Time",
+            "type": "boolean"
+          },
+          "dimensions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Dimensions",
+            "type": "array"
+          },
+          "filters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Predicate"
+            },
+            "title": "Filters",
+            "type": "array"
+          },
+          "limit": {
+            "default": 1000,
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "metric_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Metric Ids",
+            "type": "array"
+          },
+          "order_by": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/OrderBy"
+            },
+            "title": "Order By",
+            "type": "array"
+          },
+          "time": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TimeRange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "metric_ids"
+        ],
+        "title": "MetricQueryRequest",
+        "type": "object"
+      },
       "ModelFormat": {
         "description": "Serialisation dialect of an exchanged model document.",
         "enum": [
@@ -2979,6 +3651,34 @@
         "title": "NodeUpdateResult",
         "type": "object"
       },
+      "NumberExpression": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "number",
+            "default": "number",
+            "title": "Kind",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "NumberExpression",
+        "type": "object"
+      },
       "ObjectPageResponse_TableColumns_": {
         "additionalProperties": true,
         "properties": {
@@ -3000,6 +3700,29 @@
           "total"
         ],
         "title": "ObjectPageResponse[TableColumns]",
+        "type": "object"
+      },
+      "OrderBy": {
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "default": "asc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field_id"
+        ],
+        "title": "OrderBy",
         "type": "object"
       },
       "Owner": {
@@ -3315,6 +4038,86 @@
         "title": "PqlAnalysisCreate",
         "type": "object"
       },
+      "Predicate": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "$ref": "#/components/schemas/FieldRef"
+          },
+          "operator": {
+            "enum": [
+              "eq",
+              "ne",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "in",
+              "not_in",
+              "is_null",
+              "is_not_null"
+            ],
+            "title": "Operator",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "field",
+          "operator"
+        ],
+        "title": "Predicate",
+        "type": "object"
+      },
       "PublicConnection": {
         "additionalProperties": true,
         "description": "A UI-managed connection with its credentials stripped.\n\n``connection`` is absent from the delete response, which echoes only the\ndatabase name it tore down; the list and create reads carry the full\ncredential-free config.",
@@ -3340,6 +4143,101 @@
           "database_name"
         ],
         "title": "PublicConnection",
+        "type": "object"
+      },
+      "QueryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "preview": {
+            "default": false,
+            "title": "Preview",
+            "type": "boolean"
+          },
+          "query": {
+            "$ref": "#/components/schemas/MetricQueryRequest"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "QueryRequest",
+        "type": "object"
+      },
+      "Relationship": {
+        "additionalProperties": false,
+        "properties": {
+          "cardinality": {
+            "enum": [
+              "many_to_one",
+              "one_to_one",
+              "one_to_many",
+              "many_to_many"
+            ],
+            "title": "Cardinality",
+            "type": "string"
+          },
+          "join_type": {
+            "default": "left",
+            "enum": [
+              "inner",
+              "left"
+            ],
+            "title": "Join Type",
+            "type": "string"
+          },
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/JoinKey"
+            },
+            "title": "Keys",
+            "type": "array"
+          },
+          "predicates": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Predicate"
+            },
+            "title": "Predicates",
+            "type": "array"
+          },
+          "relationship_id": {
+            "title": "Relationship Id",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "target_id": {
+            "title": "Target Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "relationship_id",
+          "source_id",
+          "target_id",
+          "role",
+          "keys",
+          "cardinality"
+        ],
+        "title": "Relationship",
         "type": "object"
       },
       "Rule": {
@@ -3735,6 +4633,92 @@
           "last_failure_at"
         ],
         "title": "SemanticStatusResponse",
+        "type": "object"
+      },
+      "SourceBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "catalog_table_id": {
+            "title": "Catalog Table Id",
+            "type": "string"
+          },
+          "datasource_id": {
+            "title": "Datasource Id",
+            "type": "string"
+          },
+          "dimensions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/DimensionBinding"
+            },
+            "title": "Dimensions",
+            "type": "array"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FieldBinding"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "grain": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Grain",
+            "type": "array"
+          },
+          "owner_term_id": {
+            "title": "Owner Term Id",
+            "type": "string"
+          },
+          "pre_aggregated": {
+            "default": false,
+            "title": "Pre Aggregated",
+            "type": "boolean"
+          },
+          "priority": {
+            "default": 100,
+            "title": "Priority",
+            "type": "integer"
+          },
+          "required_filters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Predicate"
+            },
+            "title": "Required Filters",
+            "type": "array"
+          },
+          "schema_name": {
+            "title": "Schema Name",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "structure_fingerprint": {
+            "default": "",
+            "title": "Structure Fingerprint",
+            "type": "string"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "datasource_id",
+          "catalog_table_id",
+          "owner_term_id",
+          "schema_name",
+          "table_name",
+          "grain",
+          "fields"
+        ],
+        "title": "SourceBinding",
         "type": "object"
       },
       "SqlAttribute": {
@@ -5937,6 +6921,86 @@
         "title": "TermsPageResponse",
         "type": "object"
       },
+      "TimeRange": {
+        "additionalProperties": false,
+        "properties": {
+          "end_exclusive": {
+            "format": "date-time",
+            "title": "End Exclusive",
+            "type": "string"
+          },
+          "granularity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "day",
+                  "month",
+                  "year"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granularity"
+          },
+          "start": {
+            "format": "date-time",
+            "title": "Start",
+            "type": "string"
+          },
+          "time_role": {
+            "title": "Time Role",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end_exclusive",
+          "timezone",
+          "time_role"
+        ],
+        "title": "TimeRange",
+        "type": "object"
+      },
+      "TransitionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "expected_version"
+        ],
+        "title": "TransitionRequest",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -7915,6 +8979,740 @@
         "summary": "Update Group",
         "tags": [
           "users"
+        ]
+      }
+    },
+    "/api/metrics/config": {
+      "get": {
+        "description": "Report the query rollout flag; model governance remains available.",
+        "operationId": "config_api_metrics_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Config Api Metrics Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Config",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/import": {
+      "post": {
+        "description": "Import a native package as a new draft; never inherit certification.",
+        "operationId": "import_model_api_metrics_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Import Model Api Metrics Import Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Model",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models": {
+      "get": {
+        "description": "List non-archived governed models visible to catalog readers.",
+        "operationId": "list_models_api_metrics_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Models Api Metrics Models Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Models",
+        "tags": [
+          "metrics"
+        ]
+      },
+      "post": {
+        "description": "Create an untrusted draft bound to real Catalog and Term IDs.",
+        "operationId": "create_api_metrics_models_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Api Metrics Models Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}": {
+      "delete": {
+        "description": "Archive a model while retaining all revisions and review evidence.",
+        "operationId": "archive_api_metrics_models__model_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "title": "Expected Version",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Archive Api Metrics Models  Model Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive",
+        "tags": [
+          "metrics"
+        ]
+      },
+      "get": {
+        "description": "Read immutable revisions and server-recorded certification evidence.",
+        "operationId": "detail_api_metrics_models__model_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Detail Api Metrics Models  Model Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detail",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/activate": {
+      "post": {
+        "description": "Activate a certified revision only while its reviewed sources still match.",
+        "operationId": "activate_api_metrics_models__model_id__activate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Activate Api Metrics Models  Model Id  Activate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Activate",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/certify": {
+      "post": {
+        "description": "Record authenticated review evidence and a live PostgreSQL fingerprint.",
+        "operationId": "certify_api_metrics_models__model_id__certify_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Certify Api Metrics Models  Model Id  Certify Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Certify",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/compile": {
+      "post": {
+        "description": "Compile a standard query, or an explicitly untrusted editor preview.",
+        "operationId": "compile_model_api_metrics_models__model_id__compile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Compile Model Api Metrics Models  Model Id  Compile Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compile Model",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/deprecate": {
+      "post": {
+        "description": "Deprecate a revision and revoke its active pointer atomically.",
+        "operationId": "deprecate_api_metrics_models__model_id__deprecate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Deprecate Api Metrics Models  Model Id  Deprecate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deprecate",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/draft": {
+      "put": {
+        "description": "Append a draft without changing the active certified revision.",
+        "operationId": "draft_api_metrics_models__model_id__draft_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DraftRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Draft Api Metrics Models  Model Id  Draft Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Draft",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/execute": {
+      "post": {
+        "description": "Revalidate and execute server-compiled SQL using bound PostgreSQL parameters.",
+        "operationId": "execute_api_metrics_models__model_id__execute_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Execute Api Metrics Models  Model Id  Execute Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Execute",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/export": {
+      "get": {
+        "description": "Export a native contract snapshot with informational provenance.",
+        "operationId": "export_api_metrics_models__model_id__export_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Export Api Metrics Models  Model Id  Export Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/interpret": {
+      "post": {
+        "description": "Interpret a question against the active certified model and validate its plan.",
+        "operationId": "interpret_api_metrics_models__model_id__interpret_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InterpretationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Interpret Api Metrics Models  Model Id  Interpret Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Interpret",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/api/metrics/models/{model_id}/validate": {
+      "post": {
+        "description": "Validate contracts, actual Catalog bindings, grain and join guarantees.",
+        "operationId": "validate_api_metrics_models__model_id__validate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Validate Api Metrics Models  Model Id  Validate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate",
+        "tags": [
+          "metrics"
         ]
       }
     },

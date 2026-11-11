@@ -93,6 +93,22 @@
     "fetch_table_zones_map": "(zone_ids: 'list[str] | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None, table_ids: 'list[str] | None' = None) -> 'dict[str, list[dict[str, Any]]]'",
     "fetch_term_exploration_details": "(term_id: 'str', zone_ids: 'list[str] | None' = None, *, skip: 'int' = 0, limit: 'int | None' = None) -> 'dict[str, Any]'"
   },
+  "governed_models": {
+    "ModelNotFound": "class(ValueError)",
+    "VersionConflict": "class(ValueError)",
+    "archive": "(model_id: 'str', expected_version: 'int') -> 'dict[str, Any]'",
+    "certify": "(revision_id: 'str', *, reviewer_id: 'str', evidence: 'str', model_fingerprint: 'str', catalog_fingerprint: 'str') -> 'None'",
+    "create_draft": "(*, model_id: 'str', expected_version: 'int', payload: 'dict[str, Any]', fingerprint: 'str', user_id: 'str') -> 'dict[str, Any]'",
+    "create_model": "(*, payload: 'dict[str, Any]', fingerprint: 'str', user_id: 'str', owner_id: 'str | None') -> 'dict[str, Any]'",
+    "detail": "(model_id: 'str') -> 'dict[str, Any] | None'",
+    "get_model": "(model_id: 'str') -> 'dict[str, Any] | None'",
+    "get_revision": "(model_id: 'str', revision: 'int') -> 'dict[str, Any] | None'",
+    "list_models": "() -> 'list[dict[str, Any]]'",
+    "locked_model": "(model_id: 'str', expected_version: 'int') -> 'Iterator[dict[str, Any]]'",
+    "read_snapshot": "(model_id: 'str') -> 'Iterator[None]'",
+    "set_active": "(model_id: 'str', revision: 'int | None') -> 'None'",
+    "set_revision_status": "(revision_id: 'str', status: 'str', validation: 'dict[str, Any] | None' = None) -> 'None'"
+  },
   "groups": {
     "GroupNameTaken": "class(ValueError)",
     "UnknownGroupMembers": "class(ValueError)",

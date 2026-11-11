@@ -37,13 +37,32 @@ const extractServerMessage = (data: unknown): string | undefined => {
 	// out of their way to produce surfaced as "Request failed with status 400".
 	const { detail, error } = data as { detail?: unknown; error?: unknown };
 	if (typeof detail === 'string') return detail;
+	if (
+		detail != null &&
+		typeof detail === 'object' &&
+		'message' in detail &&
+		typeof detail.message === 'string'
+	)
+		return detail.message;
 	return typeof error === 'string' ? error : undefined;
 };
 
 const errorHandler = (err: AxiosError): ApiError => {
+	const data = err.response?.data;
+	const details =
+		data != null && typeof data === 'object' && 'detail' in data ? data.detail : undefined;
 	return {
 		message: (err.response != null && extractServerMessage(err.response.data)) || err.message,
 		error: true,
+		status: err.response?.status,
+		details,
+		code:
+			details != null &&
+			typeof details === 'object' &&
+			'code' in details &&
+			typeof details.code === 'string'
+				? details.code
+				: undefined,
 	};
 };
 

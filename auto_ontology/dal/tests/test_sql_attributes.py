@@ -403,6 +403,27 @@ def test_find_by_expression_is_scoped_to_the_term(world) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("stored", "proposed"),
+    [
+        ("SELECT 'PAID'", "SELECT 'paid'"),
+        ("SELECT 'a  b'", "SELECT 'a b'"),
+        ('SELECT "Amount" FROM p', 'SELECT "amount" FROM p'),
+    ],
+)
+def test_expression_lookup_keeps_literal_and_quoted_identity(
+    world, stored: str, proposed: str
+) -> None:
+    world.term("Revenue")
+    world.attribute("revenue", "Revenue", sql="SELECT 1", expression=stored)
+    assert (
+        sa.find_attr_by_expression(
+            term_id=world.terms["Revenue"], expression=proposed, exclude_id=None
+        )
+        is None
+    )
+
+
 def test_get_by_id_is_an_existence_check(world) -> None:
     world.term("Revenue")
     attr = world.attribute("revenue", "Revenue", sql="SELECT 1")

@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 import time
 import weakref
-from typing import Optional
+from typing import Any
 
 import pandas as pd
 import psycopg
@@ -20,13 +22,28 @@ from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
 
 
 def _fetch_frame(
-    conn: psycopg.Connection, sql: str, parameters: Optional[list]
+    conn: psycopg.Connection,
+    sql: str,
+    parameters: list[Any] | dict[str, Any] | None,
+    *,
+    preserve_types: bool = False,
 ) -> pd.DataFrame:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, parameters)
         if cur.description is None:
             return pd.DataFrame()
         rows = cur.fetchall()
+        description = cur.description
+    if preserve_types:
+        # Pandas otherwise converts nullable bigint columns to float64 before
+        # the caller can serialize them, irreversibly losing integer precision.
+        frame = pd.DataFrame(
+            rows, columns=[column.name for column in description], dtype=object
+        )
+        frame.attrs["postgres_types"] = {
+            column.name: column.type_code for column in description
+        }
+        return frame
     return pd.DataFrame(rows)
 
 
@@ -90,7 +107,7 @@ class PostgresDatabase(SQLDatabase):
     def execute(
         self,
         sql: str,
-        parameters: Optional[list] = None,
+        parameters: list[Any] | dict[str, Any] | None = None,
         *,
         timeout_s: float | None = None,
     ) -> pd.DataFrame:
@@ -116,6 +133,40 @@ class PostgresDatabase(SQLDatabase):
             except psycopg.errors.QueryCanceled as exc:
                 # QueryCanceled also covers pg_cancel_backend(); only the
                 # timeout we set is ours to relabel.
+                if "statement timeout" not in str(exc):
+                    raise
+                raise StatementTimeout.since(timeout_s, started) from exc
+
+    @contextmanager
+    def read_transaction(
+        self,
+        *,
+        timeout_s: float = 30,
+    ) -> Iterator[Callable[[str, list[Any] | dict[str, Any] | None], pd.DataFrame]]:
+        """Pin source validation and a governed query to one read-only snapshot.
+
+        This path preserves Decimal, nullable bigint and empty result columns.
+        Legacy execute() keeps its existing DataFrame behavior.
+        """
+        started = time.monotonic()
+        with self._pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    conn.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    )
+                    conn.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{max(1, int(timeout_s * 1000))}ms",),
+                    )
+
+                    def execute_scoped(
+                        sql: str, parameters: list[Any] | dict[str, Any] | None = None
+                    ) -> pd.DataFrame:
+                        return _fetch_frame(conn, sql, parameters, preserve_types=True)
+
+                    yield execute_scoped
+            except psycopg.errors.QueryCanceled as exc:
                 if "statement timeout" not in str(exc):
                     raise
                 raise StatementTimeout.since(timeout_s, started) from exc

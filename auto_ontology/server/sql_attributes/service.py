@@ -20,6 +20,7 @@ from auto_ontology.catalog.constants import Props
 
 from auto_ontology.connectors import get_connectors
 from auto_ontology.dal import sql_attributes as sql_attr_dal
+from auto_ontology.dal.session import write_transaction
 from auto_ontology.dal.pii import realign_sql_attribute_pii
 from auto_ontology.dal.sql_attributes import (
     SqlAttributeExpressionConflict,
@@ -320,6 +321,11 @@ def update_sql_attribute(
     certification flag only. The certification flag carries no embedding
     content, so a certification-only patch skips the VDB refresh.
 
+    SQL, Term, name, or description changes invalidate certification. SQL and
+    Term links are updated atomically with that flag; embedding refresh happens
+    only after the database commit. A separate certification-only patch is
+    required after reviewing a changed definition.
+
     The connector is resolved server-side (see
     :func:`_resolve_database_name`) — callers never need to pass one.
 
@@ -346,6 +352,14 @@ def update_sql_attribute(
         expression_changed = (
             existing.get("expression") or ""
         ).strip() != expression.strip()
+        term_changed = existing.get("term_id") != term_id
+        description_changed = (existing.get("description") or "") != next_description
+        definition_changed = (
+            expression_changed or term_changed or name_changed or description_changed
+        )
+        next_certified = (
+            False if definition_changed else existing.get("certified", False)
+        )
 
         conflict = find_attr_by_name(next_name, exclude_id=attr_id)
         if conflict is not None:
@@ -364,40 +378,44 @@ def update_sql_attribute(
             get_schemas(database_name),
         )
 
-        detach_existing_sql_edges(attr_id)
-        if name_changed or expression_changed:
-            clear_sql_attribute_description_suggestion(attr_id)
-        sql_attr_dal.update_sql_attribute(
-            attr_id,
-            name=next_name,
-            description=next_description,
-            expression=expression,
-            source=source,
-            modified_by=modified_by,
-            touch=touch,
-        )
-
-        attr_node = CatalogNode(
-            name=next_name,
-            label=LABEL_SQL_ATTRIBUTE,
-            props={
-                "name": next_name,
-                "description": next_description,
-                "expression": expression,
-                "source": source,
-            },
-            match_props={"id": attr_id},
-            existing_id=attr_id,
-        )
-
-        _persist_attr_with_sql(attr_node, expression, query_obj)
-        link_to_term(attr_id, term_id)
-        if expression_changed:
-            pii_tag = get_tag_by_name(PII_TAG_NAME)
-            realign_sql_attribute_pii(
+        # SQL, ownership links and certification must commit or roll back together.
+        with write_transaction():
+            detach_existing_sql_edges(attr_id)
+            if definition_changed:
+                clear_sql_attribute_description_suggestion(attr_id)
+            sql_attr_dal.update_sql_attribute(
                 attr_id,
-                str(pii_tag["id"]) if pii_tag else None,
+                name=next_name,
+                description=next_description,
+                expression=expression,
+                source=source,
+                certified=False if definition_changed else None,
+                modified_by=modified_by,
+                touch=touch,
             )
+
+            attr_node = CatalogNode(
+                name=next_name,
+                label=LABEL_SQL_ATTRIBUTE,
+                props={
+                    "name": next_name,
+                    "description": next_description,
+                    "expression": expression,
+                    "source": source,
+                    "certified": next_certified,
+                },
+                match_props={"id": attr_id},
+                existing_id=attr_id,
+            )
+
+            _persist_attr_with_sql(attr_node, expression, query_obj)
+            link_to_term(attr_id, term_id)
+            if expression_changed:
+                pii_tag = get_tag_by_name(PII_TAG_NAME)
+                realign_sql_attribute_pii(
+                    attr_id,
+                    str(pii_tag["id"]) if pii_tag else None,
+                )
         _reembed_sql_attribute(attr_id, database_name)
 
         return {
@@ -410,7 +428,7 @@ def update_sql_attribute(
             "term_name": term["name"],
             "term_id": term_id,
             "sql": expression,
-            "certified": existing.get("certified", False),
+            "certified": next_certified,
             "owner_id": existing.get("owner_id"),
         }
 
@@ -441,18 +459,22 @@ def update_sql_attribute(
                 f"SqlAttribute with name {next_name!r} already exists "
                 f"(id={conflict['id']!r})"
             )
-        clear_sql_attribute_description_suggestion(attr_id)
-
-    sql_attr_dal.update_sql_attribute(
-        attr_id,
-        name=next_name if name_changed else None,
-        description=next_description if description_changed else None,
-        certified=certified,
-        owner_id=owner_id,
-        set_owner=set_owner,
-        modified_by=modified_by,
-        touch=touch,
-    )
+    definition_changed = name_changed or description_changed
+    if definition_changed and certified is True:
+        raise ValueError("Save the changed definition before certifying it")
+    with write_transaction():
+        if definition_changed:
+            clear_sql_attribute_description_suggestion(attr_id)
+        sql_attr_dal.update_sql_attribute(
+            attr_id,
+            name=next_name if name_changed else None,
+            description=next_description if description_changed else None,
+            certified=False if definition_changed else certified,
+            owner_id=owner_id,
+            set_owner=set_owner,
+            modified_by=modified_by,
+            touch=touch,
+        )
     if name_changed or description_changed:
         _reembed_sql_attribute(attr_id, existing.get("database_name"))
 

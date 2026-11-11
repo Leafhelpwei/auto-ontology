@@ -42,6 +42,18 @@ To run a text-to-SQL benchmark such as BIRD, refer to the
 - **Flexible deployment** — Helm chart for Kubernetes or Docker Compose for a
   local stack.
 
+## Governed metrics extension
+
+This development branch adds a native `/metrics` workbench with versioned metric,
+source and relationship contracts, review evidence, deterministic PostgreSQL query
+compilation, and query explanations. Historical SQL candidates retain their full
+query context. Runtime is opt-in with
+`AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=true`.
+
+See the [setup and usage guide](docs/governed-metrics.md),
+[design decision](docs/plans/adr-001-governed-model-snapshots.md), and
+[implementation record](docs/plans/governed-metrics-progress.md).
+
 ## Software Components
 
 | Component           | Technology                                                             | Role                                       | Default port |

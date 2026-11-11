@@ -379,6 +379,50 @@ def find_attr_by_name(name: str, exclude_id: str | None) -> dict[str, str] | Non
     return {"id": rows[0]["id"], "name": rows[0]["name"]} if rows else None
 
 
+def _expression_key(expression: str) -> tuple[str, str]:
+    """Normalize SQL syntax without rewriting literals or identifier case.
+
+    No dialect is available at this DAL boundary. Keep original identifier,
+    function and literal spellings instead of trusting the generic generator's
+    function aliases (for example, NVL becomes COALESCE). Failed/partial parses
+    and comments only compare exact text; comments may be executable directives
+    in a source dialect. A missed duplicate is safer than merging business scopes.
+    """
+    import sqlglot
+    from sqlglot import expressions as exp
+    from sqlglot.tokens import Tokenizer, TokenType
+
+    try:
+        statements = sqlglot.parse(expression)
+        if len(statements) == 1 and statements[0] is not None:
+            statement = statements[0]
+            if not any(isinstance(node, exp.Command) for node in statement.walk()):
+                tokens = Tokenizer().tokenize(expression)
+                if not any(token.comments for token in tokens):
+                    # Preserve original token boundaries and quoted spelling. Only
+                    # recognized keywords are case-insensitive here, not VARs:
+                    # those may be case-sensitive identifiers or user functions.
+                    protected = {TokenType.VAR, TokenType.IDENTIFIER, TokenType.STRING}
+                    identifiers = {
+                        node.name for node in statement.find_all(exp.Identifier)
+                    }
+                    spellings = tuple(
+                        (
+                            token.token_type.name,
+                            expression[token.start : token.end + 1].upper()
+                            if token.token_type not in protected
+                            and token.text not in identifiers
+                            and expression[token.start : token.end + 1].isalpha()
+                            else expression[token.start : token.end + 1],
+                        )
+                        for token in tokens
+                    )
+                    return ("tokens", repr(spellings))
+    except (sqlglot.errors.SqlglotError, ValueError):
+        pass
+    return ("literal", expression.strip())
+
+
 def find_attr_by_expression(
     *,
     term_id: str,
@@ -387,15 +431,11 @@ def find_attr_by_expression(
 ) -> dict[str, str] | None:
     """A same-term SqlAttribute with equivalent SQL, or ``None``.
 
-    Equivalence ignores case and collapses whitespace, matching the legacy
-    snippet validation. Compared in Python rather than SQL, as before: the
-    normalisation is ``" ".join(x.split())``, which collapses *runs* of any
-    whitespace to one space, and no SQL expression reproduces that — ``regexp_replace``
-    on ``\\s+`` comes close but differs on the Unicode whitespace ``str.split``
-    accepts. Matching the old behaviour exactly is worth one full scan of a
-    single term's attributes.
+    SQL keyword case and token-external whitespace are normalized; literals,
+    whitespace inside literals, function spelling and identifiers stay significant.
+    Unrecognized SQL only matches the same text, never a casefolded guess.
     """
-    normalized = " ".join(expression.split()).lower()
+    normalized = _expression_key(expression)
     statement = (
         select(
             s.sql_attribute.c.id,
@@ -417,7 +457,7 @@ def find_attr_by_expression(
         candidate = row["expression"]
         if not isinstance(candidate, str):
             continue
-        if " ".join(candidate.split()).lower() == normalized:
+        if _expression_key(candidate) == normalized:
             return {"id": row["id"], "name": row["name"]}
     return None
 

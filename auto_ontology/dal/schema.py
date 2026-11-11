@@ -172,6 +172,75 @@ def _owner_id() -> Column:
     return Column("owner_id", Text, nullable=True)
 
 
+# Governed metric models keep immutable semantic snapshots. Lifecycle metadata is
+# separate from the payload: a client can never import certification authority.
+governed_model = Table(
+    "governed_model",
+    METADATA,
+    Column("model_id", Text, primary_key=True),
+    Column("name", Text, nullable=False),
+    _owner_id(),
+    Column("version", Integer, nullable=False, server_default=text("1")),
+    Column("latest_revision", Integer, nullable=False, server_default=text("1")),
+    Column("active_revision", Integer, nullable=True),
+    Column("archived", Boolean, nullable=False, server_default=text("false")),
+    Column("created_by", Text, nullable=False),
+    Column(
+        "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    CheckConstraint("version > 0 AND latest_revision > 0", name="positive_versions"),
+)
+
+governed_model_revision = Table(
+    "governed_model_revision",
+    METADATA,
+    _id(),
+    Column(
+        "model_id",
+        Text,
+        ForeignKey(governed_model.c.model_id, ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("revision", Integer, nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column("fingerprint", Text, nullable=False),
+    Column("status", Text, nullable=False, server_default=text("'draft'")),
+    Column("validation", JSONB, nullable=True),
+    Column("created_by", Text, nullable=False),
+    Column(
+        "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    UniqueConstraint("model_id", "revision", name="uq_governed_model_revision_number"),
+    CheckConstraint("revision > 0", name="positive_revision"),
+    CheckConstraint(
+        "status IN ('draft', 'validated', 'certified', 'deprecated')", name="status"
+    ),
+)
+
+governed_model_certification = Table(
+    "governed_model_certification",
+    METADATA,
+    _id(),
+    Column(
+        "revision_id",
+        Text,
+        ForeignKey(governed_model_revision.c.id, ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("reviewer_id", Text, nullable=False),
+    Column("evidence", Text, nullable=False),
+    Column("model_fingerprint", Text, nullable=False),
+    Column("catalog_fingerprint", Text, nullable=False),
+    Column(
+        "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+)
+Index(
+    "ix_governed_model_certification_revision_id",
+    governed_model_certification.c.revision_id,
+)
+
+
 # ---------------------------------------------------------------------------
 # Catalog tier — Database -> Schema -> Table -> Column
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ const SECTION_LABELS: Record<string, string> = {
 	'/chat': 'Chat',
 	'/discovery': 'Discovery',
 	'/terms': 'Terms',
+	'/metrics': 'Metrics',
 	'/analysis': 'Analysis',
 	'/exploration': 'Exploration',
 	'/data': 'All Data',
