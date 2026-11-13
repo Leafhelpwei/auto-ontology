@@ -4,6 +4,13 @@
 
 import type { ResolvedUser } from '@/auth/resolve-user';
 import { getPrisma } from '@/lib/prisma';
+import { chatQueryContextSchema } from '@/lib/openapiSchemas';
+
+/** The database stores JSON; only the declared server-authored shape leaves the history API. */
+export const publishedQueryContext = (value: unknown) => {
+	const parsed = chatQueryContextSchema.safeParse(value);
+	return parsed.success ? parsed.data : null;
+};
 
 // Shared by the watch, cancel, and visualization proxies. Each must confirm
 // that a conversation belongs to the caller, and none should create one.

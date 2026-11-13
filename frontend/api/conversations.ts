@@ -2,7 +2,7 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Conversation, ChatMessage } from '@/types/chat';
+import type { Conversation, ChatMessage, ChatQueryContext } from '@/types/chat';
 
 export type ConversationSummary = {
 	id: string;
@@ -19,6 +19,7 @@ export type ConversationDetail = ConversationSummary & {
 		content: string;
 		sql_code: string | null;
 		sql_response: string | null;
+		query_context?: ChatQueryContext | null;
 		created_at: string;
 	}>;
 };
@@ -90,6 +91,7 @@ export function toMessage(msg: ConversationDetail['messages'][number]): ChatMess
 		content: msg.content,
 		sql: msg.sql_code ?? undefined,
 		sqlResponse: msg.sql_response ?? undefined,
+		queryContext: msg.query_context,
 		timestamp: new Date(msg.created_at).getTime(),
 	};
 }

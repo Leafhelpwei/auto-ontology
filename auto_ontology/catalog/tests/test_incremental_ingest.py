@@ -132,6 +132,33 @@ def test_first_ingest_creates_the_catalog(source_db: str) -> None:
         "name",
         "email",
     }
+    from auto_ontology.dal.session import store
+
+    assert (
+        store().query_read(
+            "SELECT dialect FROM catalog_database WHERE name = :name",
+            {"name": source_db},
+        )[0]["dialect"]
+        == "postgres"
+    )
+
+
+def test_reingest_backfills_legacy_database_dialect(source_db: str) -> None:
+    from auto_ontology.dal.session import store
+
+    _ingest(source_db)
+    store().query_write(
+        "UPDATE catalog_database SET dialect = NULL WHERE name = :name",
+        {"name": source_db},
+    )
+    _ingest(source_db)
+    assert (
+        store().query_read(
+            "SELECT dialect FROM catalog_database WHERE name = :name",
+            {"name": source_db},
+        )[0]["dialect"]
+        == "postgres"
+    )
 
 
 def test_reingest_without_changes_is_a_no_op(source_db: str) -> None:

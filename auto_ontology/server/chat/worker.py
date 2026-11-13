@@ -211,6 +211,37 @@ def _worker_loop(
                 pass
 
 
+def _metrics_worker_loop(
+    in_q: "mp.Queue[tuple[str, Any]]", out_q: "mp.Queue[tuple[str, Any]]"
+) -> None:
+    """A cancellable worker that never initializes exploratory SQL prerequisites."""
+    logging.basicConfig(level=logging.INFO)
+    try:
+        from auto_ontology.server.chat.metrics_flow import stream_metric_response
+
+        out_q.put((_TAG_READY, None))
+    except BaseException:
+        logger.exception("Metric worker init failed")
+        out_q.put((_TAG_ERROR, "Metric worker could not initialize"))
+        out_q.put((_TAG_DONE, None))
+        return
+    while True:
+        try:
+            tag, payload = in_q.get()
+        except (EOFError, OSError):
+            return
+        if tag != _MSG_ASK:
+            continue
+        try:
+            for event in stream_metric_response(payload):
+                out_q.put((_TAG_EVENT, event))
+        except BaseException:
+            logger.exception("Metric worker failed")
+            out_q.put((_TAG_ERROR, "Governed metric query failed"))
+        finally:
+            out_q.put((_TAG_DONE, None))
+
+
 class PrewarmedWorker:
     """A subprocess running ``_worker_loop`` — imports done, ready to ask.
 
@@ -224,12 +255,13 @@ class PrewarmedWorker:
         worker.kill()               # SIGTERM → SIGKILL; idempotent
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str = "explore") -> None:
+        self._mode = mode
         self._ctx = mp.get_context("spawn")
         self._in_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
         self._out_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
         self._proc = self._ctx.Process(
-            target=_worker_loop,
+            target=_metrics_worker_loop if mode == "metrics" else _worker_loop,
             args=(self._in_q, self._out_q),
             daemon=True,
         )
@@ -246,6 +278,10 @@ class PrewarmedWorker:
         subject_token: str | None = None,
         conversation_history: list[dict[str, str | None]] | None = None,
         evidence: str | None = None,
+        metric_context: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        persistent: bool = False,
+        turn_id: str | None = None,
     ) -> None:
         """Ask *question*, optionally forcing the prediction/SQL branch.
 
@@ -258,6 +294,21 @@ class PrewarmedWorker:
         *evidence* is optional authoritative evidence kept separate from
         the question.
         """
+        if self._mode == "metrics":
+            self._in_q.put(
+                (
+                    _MSG_ASK,
+                    {
+                        "question": question,
+                        "metric_context": metric_context,
+                        "user_id": user_id,
+                        "persistent": persistent,
+                        "turn_id": turn_id,
+                        "conversation_history": conversation_history or [],
+                    },
+                )
+            )
+            return
         self._in_q.put(
             (
                 _MSG_ASK,
@@ -341,7 +392,8 @@ class WarmPool:
     on subprocess startup unless the standby genuinely isn't there yet.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str = "explore") -> None:
+        self._mode = mode
         self._lock = threading.Lock()
         self._standby: PrewarmedWorker | None = None
         self._spawn_async()
@@ -350,7 +402,7 @@ class WarmPool:
         threading.Thread(target=self._spawn_sync, daemon=True).start()
 
     def _spawn_sync(self) -> None:
-        worker = PrewarmedWorker()
+        worker = PrewarmedWorker(self._mode)
         # Block here (off the request path) until imports complete, so
         # ``acquire()`` is more likely to hand back a fully warm worker.
         # We don't enforce a timeout — initial imports can be slow on
@@ -370,7 +422,7 @@ class WarmPool:
         if w is not None and w.is_alive():
             return w
         # Standby missing/dead — pay cold start synchronously this once.
-        w = PrewarmedWorker()
+        w = PrewarmedWorker(self._mode)
         w.drain_until_ready()
         return w
 
@@ -402,6 +454,7 @@ class WarmPool:
 
 
 _pool: WarmPool | None = None
+_metrics_pool: WarmPool | None = None
 _pool_lock = threading.Lock()
 
 
@@ -415,13 +468,23 @@ def get_pool() -> WarmPool:
         return _pool
 
 
-def shutdown_pool() -> None:
-    global _pool
+def get_metrics_pool() -> WarmPool:
+    """Lazily warm only the governed-query worker's minimal dependencies."""
+    global _metrics_pool
     with _pool_lock:
-        pool = _pool
-        _pool = None
-    if pool is not None:
-        pool.shutdown()
+        if _metrics_pool is None:
+            _metrics_pool = WarmPool("metrics")
+        return _metrics_pool
+
+
+def shutdown_pool() -> None:
+    global _pool, _metrics_pool
+    with _pool_lock:
+        pool, metrics_pool = _pool, _metrics_pool
+        _pool = _metrics_pool = None
+    for current in (pool, metrics_pool):
+        if current is not None:
+            current.shutdown()
 
 
 def refresh_chat_workers() -> None:
@@ -433,3 +496,8 @@ def refresh_chat_workers() -> None:
     if standby is not None:
         standby.kill()
     pool._spawn_async()
+    global _metrics_pool
+    with _pool_lock:
+        metrics_pool, _metrics_pool = _metrics_pool, None
+    if metrics_pool is not None:
+        metrics_pool.shutdown()

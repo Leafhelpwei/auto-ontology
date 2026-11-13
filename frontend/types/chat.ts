@@ -2,6 +2,49 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type {
+	InterpretationResult,
+	MetricPlan,
+	MetricQueryRequest,
+	MetricQueryResult,
+} from './governedMetrics';
+
+export type QueryMode = 'explore' | 'metrics';
+export type MetricChatContext = {
+	model_id: string;
+	revision?: number;
+	selected_metric_ids?: string[];
+};
+export type ChatSelection = {
+	query_mode: QueryMode;
+	metric_context: MetricChatContext | null;
+	metric_selection_explicit?: boolean;
+};
+export type MetricsQueryContext = {
+	version: 1;
+	query_mode: 'metrics';
+	model_id: string;
+	turn_id?: string;
+	revision?: number | null;
+	model_fingerprint?: string | null;
+	selected_metric_ids?: string[] | null;
+	status?: 'running' | 'ready' | 'clarification' | 'rejected' | 'error' | 'cancelled';
+	trusted?: boolean;
+	query?: MetricQueryRequest | null;
+	base_query?: MetricQueryRequest | null;
+	clarification?: {
+		code: string;
+		message: string;
+		options: InterpretationResult['options'];
+	} | null;
+	plan?: MetricPlan | null;
+	columns?: string[];
+	column_metadata?: MetricQueryResult['column_metadata'];
+};
+export type ChatQueryContext =
+	| { version: 1; query_mode: 'explore'; turn_id?: string }
+	| MetricsQueryContext;
+
 export type ChatMessage = {
 	id: string;
 	role: 'user' | 'assistant';
@@ -9,6 +52,7 @@ export type ChatMessage = {
 	sql?: string;
 	sqlResponse?: string;
 	thoughts?: string;
+	queryContext?: ChatQueryContext | null;
 	timestamp: number;
 };
 
@@ -23,6 +67,8 @@ export type ChatRequest = {
 	conversationId?: string | null;
 	/** Scope retrieval/SQL to one connected database when multiple are loaded. */
 	target_db?: string | null;
+	query_mode?: QueryMode;
+	metric_context?: MetricChatContext | null;
 };
 
 /**
@@ -55,7 +101,7 @@ export type SqlEvent = {
 };
 
 /** Shape of the executed SQL result, as returned by `sql_response_from_db`. */
-export type SqlResult = string[] | { [key: string]: string }[];
+export type SqlResult = string | string[] | { [key: string]: string | number | boolean | null }[];
 
 export type ResultEvent = {
 	type: 'result';
@@ -64,12 +110,14 @@ export type ResultEvent = {
 		sql_code?: string;
 		sql_response_from_db?: SqlResult;
 		thoughts?: string;
+		query_context?: ChatQueryContext | null;
 	};
 };
 
 export type ErrorEvent = {
 	type: 'error';
 	message: string;
+	query_context?: ChatQueryContext | null;
 };
 
 /**
@@ -83,9 +131,17 @@ export type ChartsEvent = {
 	type: 'charts';
 	content: string;
 	sql_response?: string | null;
+	query_context?: ChatQueryContext | null;
 };
 
-export type ChatStreamEvent = StepEvent | SqlEvent | ResultEvent | ErrorEvent | ChartsEvent;
+export type MetricContextEvent = { type: 'metric_context'; query_context: MetricsQueryContext };
+export type ChatStreamEvent =
+	| StepEvent
+	| SqlEvent
+	| ResultEvent
+	| ErrorEvent
+	| ChartsEvent
+	| MetricContextEvent;
 
 export type GraphStep = {
 	node: string;

@@ -146,6 +146,7 @@ def test_worker_submit_passes_prediction_through() -> None:
 
     sent: list = []
     worker = PrewarmedWorker.__new__(PrewarmedWorker)
+    worker._mode = "explore"
     worker._in_q = type("Q", (), {"put": lambda _self, item: sent.append(item)})()
 
     worker.submit("q", prediction=True)
@@ -162,6 +163,7 @@ def test_worker_submit_accepts_every_field_by_keyword() -> None:
 
     sent: list = []
     worker = PrewarmedWorker.__new__(PrewarmedWorker)
+    worker._mode = "explore"
     worker._in_q = type("Q", (), {"put": lambda _self, item: sent.append(item)})()
 
     worker.submit(
@@ -188,6 +190,7 @@ def test_worker_payload_unpacks_as_the_loop_expects() -> None:
 
     sent: list = []
     worker = PrewarmedWorker.__new__(PrewarmedWorker)
+    worker._mode = "explore"
     worker._in_q = type("Q", (), {"put": lambda _self, item: sent.append(item)})()
 
     worker.submit("q", prediction=True, target_db="db", subject_token="tok")
@@ -196,3 +199,42 @@ def test_worker_payload_unpacks_as_the_loop_expects() -> None:
     assert (question, prediction, target_db, subject_token) == ("q", True, "db", "tok")
     assert history == []
     assert evidence is None
+
+
+def test_metric_worker_submit_uses_separate_structured_protocol() -> None:
+    """A governed worker carries server context instead of exploration flags."""
+    from auto_ontology.server.chat.worker import PrewarmedWorker
+
+    sent: list = []
+    worker = PrewarmedWorker.__new__(PrewarmedWorker)
+    worker._mode = "metrics"
+    worker._in_q = type("Q", (), {"put": lambda _self, item: sent.append(item)})()
+    selection = {"model_id": "orders", "revision": 3, "selected_metric_ids": None}
+    history = [
+        {
+            "question": "previous",
+            "response": "clarify",
+            "query_context": {"revision": 3},
+        }
+    ]
+    worker.submit(
+        "q",
+        metric_context=selection,
+        user_id="user",
+        persistent=True,
+        turn_id="turn",
+        conversation_history=history,
+    )
+    assert sent == [
+        (
+            "ask",
+            {
+                "question": "q",
+                "metric_context": selection,
+                "user_id": "user",
+                "persistent": True,
+                "turn_id": "turn",
+                "conversation_history": history,
+            },
+        )
+    ]

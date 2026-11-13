@@ -31,6 +31,7 @@ export const messageSelect = {
 	content: true,
 	sql_code: true,
 	sql_response: true,
+	query_context: true,
 	created_at: true,
 } as const;
 

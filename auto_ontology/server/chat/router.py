@@ -101,7 +101,9 @@ from auto_ontology.server.chat.conversation_dal import (
     prepare_conversation,
 )
 from auto_ontology.server.chat.settings_dal import is_visualization_enabled
-from auto_ontology.server.chat.worker import PrewarmedWorker, get_pool
+from auto_ontology.server.chat.worker import PrewarmedWorker, get_pool, get_metrics_pool
+from auto_ontology.server.chat.metrics_flow import require_metric_access
+from auto_ontology.semantic.contracts.models import ContractError
 from auto_ontology.server.identity import resolve_internal_user
 from auto_ontology.utils.llm_invoke import get_llm_client, get_non_reasoning_llm_client
 from auto_ontology.server.responses import ChatCancelResponse
@@ -237,6 +239,8 @@ class _Slot:
     # never got a query past validation has no ``sql`` event and so persists
     # none. See ``_pump``.
     last_sql: str | None = None
+    query_mode: str = "explore"
+    query_context: dict[str, Any] | None = None
 
 
 # Keyed by authenticated user + conversation_id (or a per-request unique key
@@ -285,7 +289,7 @@ def _release(slot: _Slot) -> None:
         if _active_slots.get(slot.key) is slot:
             del _active_slots[slot.key]
 
-    pool = get_pool()
+    pool = get_metrics_pool() if slot.query_mode == "metrics" else get_pool()
     if slot.cancelled.is_set():
         pool.replace(slot.worker)
     else:
@@ -345,7 +349,7 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
 
     charts: list[dict[str, Any]] | None = None
     llm = _non_reasoning_llm or _reasoning_llm
-    if llm is not None:
+    if llm is not None and slot.query_mode != "metrics":
         try:
             if is_visualization_enabled():
                 charts = analyze_and_visualize(
@@ -374,11 +378,15 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
             user_id=slot.user_id,
             content=content,
             sql_response=sql_response,
+            query_context=answer.get("query_context") or slot.query_context,
         )
     except Exception:  # noqa: BLE001 — persistence must not break SSE
         logger.exception("Failed to persist chart/result message")
 
-    return {"type": "charts", "content": content, "sql_response": sql_response}
+    event = {"type": "charts", "content": content, "sql_response": sql_response}
+    if slot.query_mode == "metrics":
+        event["query_context"] = answer.get("query_context") or slot.query_context
+    return event
 
 
 def _pump(slot: _Slot) -> None:
@@ -393,9 +401,12 @@ def _pump(slot: _Slot) -> None:
     """
 
     persisted = False
+    terminal_received = False
 
     def persist_event(event: dict) -> None:
-        nonlocal persisted
+        nonlocal persisted, terminal_received
+        if event.get("type") in {"result", "error"}:
+            terminal_received = True
         if persisted or slot.user_id is None or slot.analytics_id is None:
             return
 
@@ -408,9 +419,11 @@ def _pump(slot: _Slot) -> None:
             # Fall back to the last one streamed so the failed query is still
             # in history, matching what the user watched live.
             sql_code = answer.get("sql_code") or slot.last_sql
+            query_context = answer.get("query_context") or slot.query_context
         elif event_type == "error":
             response = str(event.get("message") or "")
             sql_code = slot.last_sql
+            query_context = slot.query_context
         else:
             return
         if not response and not sql_code:
@@ -424,6 +437,7 @@ def _pump(slot: _Slot) -> None:
                     analytics_id=slot.analytics_id,
                     response=response,
                     sql_code=sql_code,
+                    query_context=query_context,
                 )
             else:
                 persist_analytics_result(
@@ -443,10 +457,22 @@ def _pump(slot: _Slot) -> None:
                 # heartbeat clients actually see is generated per-consumer
                 # in `_stream_slot` instead, so there's nothing to buffer.
                 continue
+            if slot.cancelled.is_set():
+                break
             event = item
+            if event.get("type") == "metric_context":
+                slot.query_context = event["query_context"]
+            elif event.get("type") == "result" and event.get("answer", {}).get(
+                "query_context"
+            ):
+                slot.query_context = event["answer"]["query_context"]
             if event.get("type") == "step":
                 node_name = event.get("node", "")
-                event = {**event, "label": NODE_LABELS.get(node_name, node_name)}
+                event = {
+                    **event,
+                    "label": event.get("label")
+                    or NODE_LABELS.get(node_name, node_name),
+                }
             elif event.get("type") == "sql":
                 # Streamed straight through for the live view; remembered so
                 # the failure paths above have something to persist.
@@ -466,10 +492,50 @@ def _pump(slot: _Slot) -> None:
     except RuntimeError as exc:
         logger.exception("Agent stream failed")
         error_event = {"type": "error", "message": f"Agent stream failed: {exc}"}
+        if slot.query_mode == "metrics":
+            message = "标准指标查询失败。未运行探索查询。"
+            context = {
+                **(slot.query_context or {}),
+                "status": "error",
+                "trusted": False,
+                "clarification": {
+                    "code": "WORKER_FAILED",
+                    "message": message,
+                    "options": [],
+                },
+            }
+            error_event = {
+                "type": "result",
+                "answer": {"response": message, "query_context": context},
+            }
         persist_event(error_event)
         with slot.buffer_lock:
             slot.buffer.append(error_event)
     finally:
+        if slot.query_mode == "metrics" and not terminal_received:
+            cancelled = slot.cancelled.is_set()
+            message = (
+                "标准指标查询已取消。未返回执行结果。"
+                if cancelled
+                else "标准指标查询未能完成。未运行探索查询。"
+            )
+            context = {
+                **(slot.query_context or {}),
+                "status": "cancelled" if cancelled else "error",
+                "trusted": False,
+                "clarification": {
+                    "code": "QUERY_CANCELLED" if cancelled else "WORKER_STOPPED",
+                    "message": message,
+                    "options": [],
+                },
+            }
+            event = {
+                "type": "result",
+                "answer": {"response": message, "query_context": context},
+            }
+            persist_event(event)
+            with slot.buffer_lock:
+                slot.buffer.append(event)
         slot.finished.set()
         _release(slot)
 
@@ -552,8 +618,13 @@ async def chat_completions(
     persistence happen server-side regardless of whether anyone keeps
     listening (see ``_build_charts_event``).
 
-    Requires a compiled semantic layer; without one the request is rejected with
-    409 rather than run against a bare schema. ``conversation_id`` persists the
+    ``query_mode=explore`` (the compatibility default) requires a compiled
+    semantic layer. ``query_mode=metrics`` instead requires ``metric_context``
+    selecting an active certified model, authenticates catalog/chat access,
+    interprets a typed request and executes the governed read-only path. It
+    never falls back to exploratory SQL. Clarifications/errors are persisted;
+    exact table values and query evidence travel in ``query_context`` JSON.
+    ``conversation_id`` persists the
     turn and claims that conversation's single run slot — a second concurrent
     request for the same conversation gets 409 too. Omitting ``conversation_id``
     runs the question statelessly: no history, no persisted turn, and no chart
@@ -561,28 +632,48 @@ async def chat_completions(
     """
     logger.info("Chat completions request: %s", request.model_dump())
 
-    # Block chat when the semantic layer hasn't been built — no connectors/graph
-    # run happens. The chat page gates on the status API; this is the backstop.
-    if not semantic_layer_calculated():
+    if request.query_mode == "explore" and not semantic_layer_calculated():
         raise HTTPException(status_code=409, detail=_SEMANTIC_MISSING_MSG)
-
-    target_db = await asyncio.to_thread(_resolve_chat_target_db, request.target_db)
-
-    # Conversation persistence trusts identity forwarded by the private Next.js
-    # gateway; only calls that persist (i.e. carry a conversation_id) need it.
-    user_id = resolve_internal_user(
-        http_request, required=request.conversation_id is not None
+    target_db = (
+        await asyncio.to_thread(_resolve_chat_target_db, request.target_db)
+        if request.query_mode == "explore"
+        else None
     )
+    user_id = resolve_internal_user(
+        http_request,
+        required=request.conversation_id is not None or request.query_mode == "metrics",
+    )
+    if request.query_mode == "metrics":
+        try:
+            await asyncio.to_thread(
+                require_metric_access,
+                user_id,
+                persistent=request.conversation_id is not None,
+            )
+        except ContractError as exc:
+            raise HTTPException(
+                403, detail={"code": exc.code, "message": exc.message}
+            ) from exc
     key = (
         f"{user_id}:{request.conversation_id}"
         if request.conversation_id is not None
         else str(uuid.uuid4())
     )
-
-    subject_token = _subject_token(http_request)
-
-    pool = get_pool()
+    subject_token = (
+        _subject_token(http_request) if request.query_mode == "explore" else None
+    )
+    pool = get_metrics_pool() if request.query_mode == "metrics" else get_pool()
     worker = await asyncio.to_thread(pool.acquire)
+    query_context: dict[str, Any] = {"version": 1, "query_mode": request.query_mode}
+    if request.metric_context is not None:
+        query_context.update(
+            request.metric_context.model_dump(mode="json"),
+            status="running",
+            trusted=False,
+        )
+        query_context["selected_metric_ids"] = list(
+            request.metric_context.selected_metric_ids or ()
+        )
     slot = _Slot(
         key=key,
         worker=worker,
@@ -590,6 +681,8 @@ async def chat_completions(
         conversation_id=request.conversation_id,
         analytics_id=None,
         question=request.question,
+        query_mode=request.query_mode,
+        query_context=query_context,
         client_alive=threading.Event(),
         cancelled=threading.Event(),
         released=threading.Event(),
@@ -608,9 +701,20 @@ async def chat_completions(
         # Previous client was gone — replace the orphan via the pool so a
         # fresh standby is on its way for the next request.
         displaced.cancelled.set()
-        _release(displaced)
+        await asyncio.to_thread(displaced.worker.kill)
+        if not await asyncio.to_thread(displaced.finished.wait, 5):
+            # Preserve the old finalization barrier after returning 409. A
+            # subsequent request must still wait for its terminal DB write.
+            with _slot_lock:
+                if _active_slots.get(key) is slot and not displaced.finished.is_set():
+                    _active_slots[key] = displaced
+            _release(slot)
+            raise HTTPException(
+                409,
+                detail="Previous conversation turn is still being finalized; retry shortly",
+            )
 
-    conversation_history: list[dict[str, str | None]] = []
+    conversation_history: list[dict[str, Any]] = []
     if request.conversation_id is not None and user_id is not None:
         try:
             prepared = await asyncio.to_thread(
@@ -619,6 +723,7 @@ async def chat_completions(
                 user_id=user_id,
                 question=request.question,
                 source=http_request.headers.get("x-auto-ontology-source") or "api",
+                query_context=query_context,
             )
         except ConversationAccessError as exc:
             _release(slot)
@@ -633,11 +738,13 @@ async def chat_completions(
             ) from exc
 
         slot.analytics_id = prepared.analytics_id
+        slot.query_context["turn_id"] = prepared.analytics_id
         conversation_history = [
             {
                 "question": turn.question,
                 "response": turn.response,
                 "sql_code": turn.sql_code,
+                "query_context": turn.query_context,
             }
             for turn in prepared.history
         ]
@@ -652,14 +759,24 @@ async def chat_completions(
         except Exception:  # noqa: BLE001 — analytics is best-effort
             logger.exception("Failed to create stateless conversation analytics")
 
-    worker.submit(
-        request.question,
-        prediction=request.prediction,
-        target_db=target_db,
-        subject_token=subject_token,
-        conversation_history=conversation_history,
-        evidence=request.evidence,
-    )
+    if request.query_mode == "metrics":
+        worker.submit(
+            request.question,
+            metric_context=request.metric_context.model_dump(mode="json"),
+            user_id=user_id,
+            persistent=request.conversation_id is not None,
+            turn_id=slot.analytics_id,
+            conversation_history=conversation_history,
+        )
+    else:
+        worker.submit(
+            request.question,
+            prediction=request.prediction,
+            target_db=target_db,
+            subject_token=subject_token,
+            conversation_history=conversation_history,
+            evidence=request.evidence,
+        )
     threading.Thread(target=_pump, args=(slot,), daemon=True).start()
     asyncio.create_task(_watch_disconnect(http_request, slot))
 
@@ -704,6 +821,13 @@ async def chat_watch(conversation_id: UUID, request: Request) -> StreamingRespon
             headers=_SSE_HEADERS,
         )
 
+    if slot.query_mode == "metrics":
+        try:
+            await asyncio.to_thread(require_metric_access, user_id, persistent=True)
+        except ContractError as exc:
+            raise HTTPException(
+                403, detail={"code": exc.code, "message": exc.message}
+            ) from exc
     return StreamingResponse(
         _stream_slot(slot),
         media_type="text/event-stream",
@@ -719,11 +843,13 @@ async def chat_cancel(conversation_id: UUID, request: Request) -> dict[str, bool
     the browser while the agent kept running and holding the slot, so the
     very next question in the same conversation was rejected with 409.
 
-    Killing the worker makes ``PrewarmedWorker.events()`` return rather
-    than raise, so ``_pump`` appends no error event: the run's buffer ends
-    with whatever steps completed and the stream closes with ``[DONE]``.
-    Consumers therefore see a run that stopped without an answer, and the
-    conversation keeps its user turn with no assistant reply.
+    The worker is killed and the route waits briefly for its pump to finish
+    persistence. Metric runs record an untrusted cancellation result tied to
+    their server-generated turn ID; exploratory runs retain their existing
+    partial-stream behavior. The slot remains unavailable while terminal
+    persistence is unfinished, so a subsequent question cannot consume a late
+    assistant result. PostgreSQL 14+ detects the dead client during execution;
+    older versions retain the governed statement-timeout bound.
     """
 
     user_id = resolve_internal_user(request, required=True)
@@ -735,5 +861,8 @@ async def chat_cancel(conversation_id: UUID, request: Request) -> dict[str, bool
         return {"cancelled": False}
 
     slot.cancelled.set()
-    _release(slot)
+    await asyncio.to_thread(slot.worker.kill)
+    # Pump owns terminal persistence and release. Do not admit the next user
+    # turn before the cancelled assistant has been attached to its own turn.
+    await asyncio.to_thread(slot.finished.wait, 5)
     return {"cancelled": True}

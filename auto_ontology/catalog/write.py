@@ -46,7 +46,9 @@ def populate_tabular_data(data, num_workers, dialect):
     database = data["database_name"]
     logger.info(f"Started parsing db {database}.")
 
-    all_schemas = populate_db(tables_df, columns_df, database, num_workers)
+    all_schemas = populate_db(
+        tables_df, columns_df, database, num_workers, dialect=dialect
+    )
 
     if "fks" in data:
         populate_fks(fks=data["fks"], database_name=database)
@@ -60,13 +62,18 @@ def populate_tabular_data(data, num_workers, dialect):
     return all_schemas
 
 
-def populate_db(tables_df, columns_df, database, num_workers):
+def populate_db(
+    tables_df, columns_df, database, num_workers, *, dialect: str | None = None
+):
     schemas, db_node = schemas_parser.parse_df(
         tables_df, columns_df, database_name=database
     )
     existing_db_id, loaded = db_exists(db_node)
 
     latest_timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+    database_properties = {"pulled": latest_timestamp}
+    if dialect is not None:
+        database_properties["dialect"] = dialect
 
     if existing_db_id is None or not loaded:
         if existing_db_id is not None:
@@ -77,7 +84,7 @@ def populate_db(tables_df, columns_df, database, num_workers):
             add_schema(schema, latest_timestamp, num_workers)
             logger.info(f"Added schema {schema_name} to db.")
 
-        update_node_property("db", str(db_node.get_id()), {"pulled": latest_timestamp})
+        update_node_property("db", str(db_node.get_id()), database_properties)
 
         logger.info(f"Time took to add schemas:{time.time() - before_adding_schemas}")
         return schemas
@@ -139,7 +146,7 @@ def populate_db(tables_df, columns_df, database, num_workers):
 
     logger.info(f"Time took to update schemas:{time.time() - before_adding_schema}")
 
-    update_node_property("db", existing_db_id, {"pulled": latest_timestamp})
+    update_node_property("db", existing_db_id, database_properties)
     return schemas
 
 

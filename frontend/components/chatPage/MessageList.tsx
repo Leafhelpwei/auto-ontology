@@ -5,7 +5,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type { ChatMessage, GraphStep } from '@/types/chat';
+import type { ChatMessage, GraphStep, MetricsQueryContext, QueryMode } from '@/types/chat';
 import { EmptyState } from '@/common/EmptyState';
 import { Icon, IconName } from '@/common/icons';
 import { SkeletonBlock } from '@/common/Skeleton';
@@ -20,6 +20,8 @@ type MessageListProps = {
 	/** SQL the running agent has produced but not finished executing. */
 	liveSql?: string | null;
 	messageListLoading?: boolean;
+	queryMode?: QueryMode;
+	onSelectMetric?: (context: MetricsQueryContext, metricId: string) => void;
 };
 
 export const MessageList = ({
@@ -28,6 +30,8 @@ export const MessageList = ({
 	steps,
 	liveSql,
 	messageListLoading = false,
+	queryMode = 'explore',
+	onSelectMetric,
 }: MessageListProps) => {
 	const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -64,7 +68,11 @@ export const MessageList = ({
 					</div>
 				}
 				title="Ask a Question"
-				description="Type a natural-language question and the system will search your data, construct a SQL query, and return results."
+				description={
+					queryMode === 'metrics'
+						? 'Select an activated metric model, then ask about its certified definitions. Ambiguous requests require clarification before execution.'
+						: 'Type a natural-language question and the system will search your data, construct a SQL query, and return results.'
+				}
 			/>
 		);
 	}
@@ -73,7 +81,12 @@ export const MessageList = ({
 		<div className="flex-1 overflow-y-auto">
 			<div className="mx-auto max-w-3xl space-y-4 px-4 py-6">
 				{messages.map((msg) => (
-					<MessageBubble key={msg.id} message={msg} />
+					<MessageBubble
+						key={msg.id}
+						message={msg}
+						onSelectMetric={onSelectMetric}
+						disabled={isLoading}
+					/>
 				))}
 				{isLoading && <ThinkingMessage steps={steps} liveSql={liveSql} />}
 				<div ref={bottomRef} />

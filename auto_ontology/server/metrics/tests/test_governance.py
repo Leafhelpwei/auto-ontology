@@ -369,6 +369,10 @@ def test_api_permissions_import_provenance_and_flag(
     )
     monkeypatch.delenv("AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED")
     assert client.get("/api/metrics/config", headers=viewer).json() == {
+        "data": {"enabled": True}
+    }
+    monkeypatch.setenv("AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED", "false")
+    assert client.get("/api/metrics/config", headers=viewer).json() == {
         "data": {"enabled": False}
     }
     disabled = client.post(f"{route}/execute", headers=viewer, json=query)

@@ -61,14 +61,15 @@ Agent 已经能够检索文档、查询数据库，但数据分析的价值取�
 - **结构化定义**：定义指标、数据来源和关联关系，明确计算表达式、过滤条件、维度、时间口径、粒度和币种。
 - **版本与认证**：保存不可变修订版，记录审核依据，经过校验、认证后激活。首版以整个模型快照为认证和发布单元。
 - **确定性 PostgreSQL 查询**：从结构化请求生成参数化 SQL，返回来源、过滤、关联和指标口径等查询依据，并执行只读查询。
-- **自然语言解析与澄清**：将问题解析为受约束的结构化请求；信息不足时要求澄清，解析成功后由用户执行。
+- **自然语言解析与澄清**：将问题解析为受约束的结构化请求；信息不足时要求澄清，工作台解析成功后由用户执行。
+- **Chat 标准指标模式**：选择已激活模型后，可连续提问、回答澄清并查看结果与查询依据。会话保留指标请求及模型版本，复用同一校验、编译和执行服务；拒绝时不会自动转为探索性 SQL。
 - **历史 SQL 上下文保留**：保留候选 SQL 的完整查询上下文；修改 SQLAttribute 的语义内容后清除旧认证。
 - **原生导入导出**：以专用格式导出模型快照，导入时创建新草稿。
 
-运行开关默认关闭，在后端配置以下环境变量后启用：
+运行开关默认开启，未配置环境变量时也会启用；标准查询仍须使用已认证、已激活的模型修订版。如需停用运行入口，在后端设置：
 
 ```dotenv
-AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=true
+AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=false
 ```
 
 关闭开关时仍可管理模型，但编译、草稿预览、自然语言解析和执行不可用。Docker Compose 修改 `.env` 后，已有本分支镜像的环境需重新创建后端容器以加载配置：
@@ -77,9 +78,9 @@ AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=true
 docker compose up -d --no-deps --force-recreate auto-ontology
 ```
 
-普通 `docker compose restart` 不会加载新的环境变量。首次安装使用下文的完整构建流程；从旧版本升级时，应先按指南备份元数据、执行迁移，并构建本分支镜像。Helm 对应配置为 `backend.governedMetricsEnabled=true`。
+普通 `docker compose restart` 不会加载新的环境变量。首次安装使用下文的完整构建流程；从旧版本升级时，应先按指南备份元数据、执行迁移，并构建本分支镜像。Helm 的 `backend.governedMetricsEnabled` 同样默认 `true`，显式设为 `false` 可关闭。
 
-标准指标查询目前在 `/metrics` 工作台内完成，尚未接入原有 Chat 的流式会话与历史记录。该扩展首版支持 PostgreSQL，不支持跨事实来源联合计算、自动预聚合改写或未定义汇率的跨币种汇总；不要将下文原有数据源连接能力等同于指标编译器的方言支持。
+标准指标查询可在 `/metrics` 工作台或 Chat 的标准指标模式中进行，探索模式继续提供原有查询流程。该扩展首版支持 PostgreSQL，不支持跨事实来源联合计算、自动预聚合改写或未定义汇率的跨币种汇总；不要将下文原有数据源连接能力等同于指标编译器的方言支持。当前验证使用本地环境，没有真实 LLM 密钥或生产数据，不能将集成测试等同于真实模型和业务验收。
 
 详见 [安装与使用指南](./docs/governed-metrics.md)、[模型快照设计决策](./docs/plans/adr-001-governed-model-snapshots.md) 和 [实施与验证记录](./docs/plans/governed-metrics-progress.md)。
 
@@ -144,7 +145,7 @@ Auto Ontology 使用 NVIDIA NIM 端点进行推理，可以接入托管的 [NVID
 
    `AUTH_SECRET` 可使用 `openssl rand -base64 32` 生成；连接串中的数据库密码必须与 `POSTGRES_PASSWORD` 一致。Compose 会将 PostgreSQL、pgAdmin 和 Web 应用端口映射到宿主机，启动前请替换默认密码。`.env.example` 还为各模型角色设置了密钥占位符：将所有 `nvapi-your-api-key-here` 替换为有效密钥，或者删除相应的角色密钥配置，使其回退到 `DEFAULT_MODELS_API_KEY`。
 
-   如需同时使用新增指标工作台，在 `.env` 中将 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED` 改为 `true`。
+   新增指标运行时默认开启。如果沿用旧版 `.env` 且该项仍为 `false`，将 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED` 改为 `true` 或移除该设置；显式关闭配置会继续生效。
 
 2. 启动 PostgreSQL 并加载示例数据库。初始化脚本位于 `auto-ontology-eval`，需传入上一步设置的数据库密码：
 

@@ -26,6 +26,66 @@ const timestamp = () => z.string().meta({ format: 'date-time' });
 /** `NextResponse.json({ error }, { status })`, the shape every handler uses. */
 export const errorSchema = z.object({ error: z.string() });
 
+/** Server-authored mode and immutable metric revision, persisted with each turn. */
+export const chatQueryContextSchema = z.union([
+	z.object({
+		version: z.literal(1),
+		query_mode: z.literal('explore'),
+		turn_id: z.string().optional(),
+	}),
+	z.object({
+		version: z.literal(1),
+		query_mode: z.literal('metrics'),
+		model_id: z.string(),
+		turn_id: z
+			.string()
+			.optional()
+			.describe('Server-generated turn identity for replay and history pairing.'),
+		revision: z.number().int().positive().nullish(),
+		model_fingerprint: z.string().nullish(),
+		selected_metric_ids: z.array(z.string()).nullish(),
+		status: z
+			.enum(['running', 'ready', 'clarification', 'rejected', 'error', 'cancelled'])
+			.optional(),
+		trusted: z.boolean().optional(),
+		query: z
+			.record(z.string(), z.unknown())
+			.nullish()
+			.describe('Validated MetricQueryRequest, never free SQL.'),
+		base_query: z.record(z.string(), z.unknown()).nullish(),
+		clarification: z
+			.object({
+				code: z.string(),
+				message: z.string(),
+				options: z.array(
+					z.object({
+						metric_id: z.string(),
+						name: z.string(),
+						description: z.string(),
+						family_id: z.string().nullable(),
+					}),
+				),
+			})
+			.nullish(),
+		plan: z
+			.record(z.string(), z.unknown())
+			.nullish()
+			.describe(
+				'Executed parameterized SQL plan with fingerprints, bound parameters, and evidence.',
+			),
+		columns: z.array(z.string()).optional(),
+		column_metadata: z
+			.array(
+				z.object({
+					name: z.string(),
+					postgres_type_oid: z.number().int(),
+					json_encoding: z.enum(['native', 'decimal-string', 'integer-string']),
+				}),
+			)
+			.optional(),
+	}),
+]);
+
 export const conversationSchema = z.object({
 	id: uuid(),
 	user_id: z.string().describe('Owner of the conversation; always the caller.'),
@@ -44,6 +104,11 @@ export const messageSchema = z.object({
 		.string()
 		.nullable()
 		.describe('Serialised result table / chart payload for the bubble.'),
+	query_context: chatQueryContextSchema
+		.nullable()
+		.describe(
+			'Server-authored query mode, model revision, clarification and execution evidence. Null for legacy/manual messages.',
+		),
 	created_at: timestamp(),
 });
 

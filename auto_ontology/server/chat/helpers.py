@@ -7,10 +7,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Re-exported so the router (and any other server-side consumer) can keep
 # importing NODE_LABELS from here. The dict itself now lives next to the
@@ -29,10 +29,37 @@ __all__ = [
 ]
 
 
+class MetricChatContext(BaseModel):
+    """User selections only; trusted query state comes from owned history."""
+
+    model_config = ConfigDict(extra="forbid")
+    model_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    revision: int | None = Field(default=None, ge=1)
+    selected_metric_ids: tuple[str, ...] | None = None
+
+
 class ChatRequest(BaseModel):
     """Payload sent by the frontend to start a chat completion."""
 
     question: str = Field(..., min_length=1)
+    query_mode: Literal["explore", "metrics"] = "explore"
+    metric_context: MetricChatContext | None = None
+
+    @model_validator(mode="after")
+    def validate_query_mode(self) -> ChatRequest:
+        if self.query_mode == "metrics":
+            if len(self.question) > 8000:
+                raise ValueError("Metric questions must not exceed 8000 characters")
+            if self.metric_context is None:
+                raise ValueError("metric_context is required for metrics mode")
+            if self.target_db is not None or self.prediction is True or self.evidence:
+                raise ValueError(
+                    "Metrics mode uses its certified model; target_db, prediction and evidence overrides are unsupported"
+                )
+        elif self.metric_context is not None:
+            raise ValueError("metric_context is only supported in metrics mode")
+        return self
+
     evidence: str | None = Field(
         default=None,
         description=(

@@ -48,9 +48,19 @@ To run a text-to-SQL benchmark such as BIRD, refer to the
 
 This development branch adds a native `/metrics` workbench with versioned metric,
 source and relationship contracts, review evidence, deterministic PostgreSQL query
-compilation, and query explanations. Historical SQL candidates retain their full
-query context. Runtime is opt-in with
-`AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=true`.
+compilation, and query explanations. Chat also supports an explicit standard
+metrics mode with model selection, clarification, follow-up questions and saved
+query context. It uses the same governed compiler and executor; a rejected metric
+request never falls back to exploratory SQL. Historical SQL candidates retain
+their full query context. The runtime is enabled by default; standard queries still
+require an active, certified model revision. Set
+`AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=false` (or Helm
+`backend.governedMetricsEnabled=false`) to disable governed queries while retaining
+model management and revision history.
+
+Local integration checks cover authenticated HTTP sessions, clarification and
+follow-ups against PostgreSQL, using a scripted local model substitute. Live LLM,
+browser UI end-to-end and production-data validation remain outstanding.
 
 See the [setup and usage guide](docs/governed-metrics.md),
 [design decision](docs/plans/adr-001-governed-model-snapshots.md), and
@@ -109,7 +119,8 @@ Microsoft's sample sales database. You need Docker with Compose v2,
 1. Clone the repository and create `.env`:
 
    ```bash
-   git clone https://github.com/NVIDIA/auto-ontology.git && cd auto-ontology
+   git clone --branch feat/governed-metrics https://github.com/Leafhelpwei/auto-ontology.git
+   cd auto-ontology
    cp .env.example .env
    ```
 

@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from auto_ontology.infra.postgres import FRONTEND_SCHEMA, get_postgres_connection_string
 
@@ -35,6 +37,7 @@ class ConversationTurn:
     question: str
     response: str
     sql_code: str | None = None
+    query_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,29 +61,102 @@ def _is_context_assistant(row: dict) -> bool:
     return bool(content or row["sql_code"])
 
 
-def _rows_to_history(rows: list[dict]) -> list[ConversationTurn]:
-    turns: list[ConversationTurn] = []
-    pending_question: str | None = None
+def _rows_to_history(
+    rows: list[dict], *, include_incomplete: bool = False
+) -> list[ConversationTurn]:
+    """Pair trusted turn IDs, retaining complete metric turns and boundaries.
 
-    for row in rows:
-        role = row["role"]
-        if role == "user":
-            pending_question = (row["content"] or "").strip()
+    User ordering is stable even when equal timestamps place an assistant row
+    first. Legacy rows retain their adjacent-pair behavior and text caps.
+    """
+    users: list[dict] = []
+    by_turn: dict[str, dict] = {}
+    at_index: dict[int, dict] = {}
+    for index, row in enumerate(rows):
+        if row["role"] == "user":
+            entry = {"row": row, "answer": None}
+            users.append(entry)
+            at_index[index] = entry
+            turn_id = (row.get("query_context") or {}).get("turn_id")
+            if turn_id:
+                by_turn[turn_id] = entry
+    pending: dict | None = None
+    for index, row in enumerate(rows):
+        if row["role"] == "user":
+            pending = at_index[index]
             continue
-        if pending_question and _is_context_assistant(row):
-            turns.append(
-                ConversationTurn(
-                    question=pending_question[:_MAX_QUESTION_CHARS],
-                    response=(row["content"] or "").strip()[:_MAX_RESPONSE_CHARS],
-                    sql_code=(row["sql_code"] or "")[:_MAX_SQL_CHARS] or None,
+        if not _is_context_assistant(row):
+            continue
+        turn_id = (row.get("query_context") or {}).get("turn_id")
+        target = by_turn.get(turn_id) if turn_id else pending
+        if target is None or target["answer"] is not None:
+            continue
+        user_turn_id = (target["row"].get("query_context") or {}).get("turn_id")
+        if user_turn_id and user_turn_id != turn_id:
+            continue
+        target["answer"] = row
+        if target is pending:
+            pending = None
+    turns: list[ConversationTurn] = []
+    for entry in users:
+        question = (entry["row"]["content"] or "").strip()
+        answer = entry["answer"]
+        if not question:
+            if include_incomplete:
+                turns.append(
+                    ConversationTurn(
+                        question="",
+                        response="",
+                        query_context={"query_mode": "boundary"},
+                    )
                 )
+            continue
+        if answer is None:
+            if include_incomplete:
+                turns.append(
+                    ConversationTurn(
+                        question="",
+                        response="",
+                        query_context={"query_mode": "boundary"},
+                    )
+                )
+            continue
+        response = (answer["content"] or "").strip()
+        sql_code = (answer["sql_code"] or "") or None
+        context = answer.get("query_context")
+        if not include_incomplete:
+            question = question[:_MAX_QUESTION_CHARS]
+            response = response[:_MAX_RESPONSE_CHARS]
+            sql_code = sql_code[:_MAX_SQL_CHARS] if sql_code else None
+        else:
+            # Metric interpretation receives typed requests, never prior SQL.
+            sql_code = None
+        turns.append(
+            ConversationTurn(
+                question=question,
+                response=response,
+                sql_code=sql_code,
+                query_context=context,
             )
-            pending_question = None
-
+        )
     selected: list[ConversationTurn] = []
     used_chars = 0
     for turn in reversed(turns):
         turn_chars = len(turn.question) + len(turn.response) + len(turn.sql_code or "")
+        if include_incomplete and not selected and turn_chars > _MAX_HISTORY_CHARS:
+            # Keep the scope pin but demand a restatement. Silently truncating
+            # a pending clarification could discard its final exclusion clause.
+            selected.append(
+                ConversationTurn(
+                    question="",
+                    response="",
+                    query_context={
+                        **(turn.query_context or {}),
+                        "context_too_large": True,
+                    },
+                )
+            )
+            break
         if selected and used_chars + turn_chars > _MAX_HISTORY_CHARS:
             break
         selected.append(turn)
@@ -96,11 +172,14 @@ def prepare_conversation(
     user_id: str,
     question: str,
     source: str,
+    query_context: dict[str, Any] | None = None,
 ) -> PreparedConversation:
     """Verify/create a conversation, load prior turns, then persist the user turn."""
 
     conversation_str = str(conversation_id)
     analytics_id = str(uuid.uuid4())
+    if query_context is not None:
+        query_context = {**query_context, "turn_id": analytics_id}
     with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -124,22 +203,30 @@ def prepare_conversation(
 
             cur.execute(
                 f"""
-                SELECT role, content, sql_code, sql_response
+                SELECT role, content, sql_code, sql_response, query_context
                 FROM {FRONTEND_SCHEMA}.messages
                 WHERE conversation_id = %s
                 ORDER BY created_at ASC, id ASC
                 """,
                 (conversation_str,),
             )
-            history = _rows_to_history([dict(row) for row in cur.fetchall()])
+            history = _rows_to_history(
+                [dict(row) for row in cur.fetchall()],
+                include_incomplete=(query_context or {}).get("query_mode") == "metrics",
+            )
 
             cur.execute(
                 f"""
                 INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, created_at)
-                VALUES (%s, %s, 'user', %s, NOW())
+                    (id, conversation_id, role, content, query_context, created_at)
+                VALUES (%s, %s, 'user', %s, %s, NOW())
                 """,
-                (str(uuid.uuid4()), conversation_str, question),
+                (
+                    str(uuid.uuid4()),
+                    conversation_str,
+                    question,
+                    Jsonb(query_context) if query_context is not None else None,
+                ),
             )
             cur.execute(
                 f"""
@@ -164,6 +251,7 @@ def persist_assistant_result(
     analytics_id: str,
     response: str,
     sql_code: str | None,
+    query_context: dict[str, Any] | None = None,
 ) -> None:
     """Persist one final assistant turn and complete its analytics row."""
 
@@ -179,10 +267,16 @@ def persist_assistant_result(
             cur.execute(
                 f"""
                 INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, sql_code, created_at)
-                VALUES (%s, %s, 'assistant', %s, %s, NOW())
+                    (id, conversation_id, role, content, sql_code, query_context, created_at)
+                VALUES (%s, %s, 'assistant', %s, %s, %s, NOW())
                 """,
-                (str(uuid.uuid4()), conversation_str, response, sql_code),
+                (
+                    str(uuid.uuid4()),
+                    conversation_str,
+                    response,
+                    sql_code,
+                    Jsonb(query_context) if query_context is not None else None,
+                ),
             )
             cur.execute(
                 f"""
@@ -204,6 +298,7 @@ def persist_result_message(
     user_id: str,
     content: str,
     sql_response: str | None,
+    query_context: dict[str, Any] | None = None,
 ) -> None:
     """Persist the chart/table bubble ("Message 2") for a completed turn.
 
@@ -226,10 +321,16 @@ def persist_result_message(
             cur.execute(
                 f"""
                 INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, sql_response, created_at)
-                VALUES (%s, %s, 'assistant', %s, %s, NOW())
+                    (id, conversation_id, role, content, sql_response, query_context, created_at)
+                VALUES (%s, %s, 'assistant', %s, %s, %s, NOW())
                 """,
-                (str(uuid.uuid4()), conversation_str, content, sql_response),
+                (
+                    str(uuid.uuid4()),
+                    conversation_str,
+                    content,
+                    sql_response,
+                    Jsonb(query_context) if query_context is not None else None,
+                ),
             )
             cur.execute(
                 f"UPDATE {FRONTEND_SCHEMA}.conversations "

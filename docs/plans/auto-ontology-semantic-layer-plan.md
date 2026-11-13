@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 - 主体项目：[NVIDIA/auto-ontology](https://github.com/NVIDIA/auto-ontology)
 - 参考项目：[zao-sheng/Ontology-Playground-zh-dev](https://github.com/zao-sheng/Ontology-Playground-zh-dev)
 - 执行顺序：P0 口径保留与结构化契约 → P1 统一校验与确定性查询 → P2 业务编辑与解释界面。
-- 文档状态：规划基线。首版实现范围、已执行测试和剩余工作见 [实施记录](governed-metrics-progress.md)；本文件的目标不等于全部功能已完成或企业口径已认证。
+- 文档状态：规划基线，运行默认值已按 2026-11-13 的集成要求更新为开启。首版实现范围、已执行测试和剩余工作见 [实施记录](governed-metrics-progress.md)；本文件的目标不等于全部功能已完成或企业口径已认证。
 
 ## 1. 任务目标与实施原则
 
@@ -126,7 +126,7 @@ S0 产物：基线记录、ADR、任务清单、可运行夹具。完成后直�
 - 新表、新字段和新接口采用增量方式；现有 Term、ColumnAttribute、SqlAttribute ID 不变。
 - 新指标通过可选引用关联 SqlAttribute；筛选集合、连接定义等 SQLAttribute 不强制转为 Metric。
 - 旧 `certified` 标记不能直接认证一个新建的指标契约版本。
-- 现有查询入口保持可用；新增受治理路径通过功能开关逐步启用。
+- 现有探索性查询入口保持可用；受治理运行时默认开启，可显式关闭，标准查询仍须使用已认证、已激活的契约。
 - 新路径已经命中指标但校验失败时，不自动转入旧路径绕过错误。
 - 关闭功能开关只改变路由，不删除新契约；结果需区分所走路径，不能把旧路径标为“已按契约执行”。
 - 新元数据必须纳入备份、原生导入导出或独立契约包。暂不支持的外部格式转换必须列出丢失字段并拒绝无提示的覆盖导入。
@@ -322,6 +322,8 @@ S0 产物：基线记录、ADR、任务清单、可运行夹具。完成后直�
 #### P1-3 接入现有问答链路
 
 **代码切入：** `auto_ontology/retrieval/text_to_sql/` 的意图、候选检索、语义 SQL 与执行节点；现有 Chat API。
+
+**当前集成实现（2026-11-13）：** 通过 `auto_ontology/server/chat/metrics_flow.py` 接入既有 Chat 路由、worker、SSE 与会话持久化；标准指标模式复用 `server/metrics/` 共享服务，探索模式保留原 Text-to-SQL 路径。模型选择、澄清续问及版本绑定由显式模式和服务端会话上下文承载。实际验证范围以 [实施记录](governed-metrics-progress.md) 为准，仍需独立完成真实 LLM 和生产业务验收。
 
 **实施：**
 
@@ -569,7 +571,7 @@ pnpm openapi
 
 ## 11. 发布、观测与回退
 
-新增受治理查询功能开关；先在开发/测试环境启用，默认不改变已有业务路由。
+受治理查询运行时默认开启；环境变量 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=false` 或 Helm `backend.governedMetricsEnabled=false` 可显式关闭。开启不替代模型认证，也不将探索性查询自动标记为标准指标结果。当前集成验证在本地工作区进行，真实模型服务和生产业务口径的验收须独立记录。
 
 建议启用顺序：
 

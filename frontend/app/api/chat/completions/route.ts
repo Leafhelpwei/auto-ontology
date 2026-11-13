@@ -53,6 +53,27 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 	if (hasConversationId && !userCan(user, { conversation: ['write'] })) {
 		return new Response('Forbidden', { status: 403 });
 	}
+	if (payload.query_mode === 'metrics') {
+		if (!userCan(user, { catalog: ['read'] })) {
+			return Response.json(
+				{ detail: 'Catalog read permission is required for standard metrics.' },
+				{ status: 403 },
+			);
+		}
+		const context = payload.metric_context;
+		if (
+			!context ||
+			typeof context !== 'object' ||
+			!('model_id' in context) ||
+			typeof context.model_id !== 'string' ||
+			!context.model_id.trim()
+		) {
+			return Response.json(
+				{ detail: 'Select an activated metric model before sending.' },
+				{ status: 422 },
+			);
+		}
+	}
 
 	// Forwarded verbatim to FastAPI, which streams the SQL/answer and then the
 	// chart/table bubble on this same connection — see the module docstring.

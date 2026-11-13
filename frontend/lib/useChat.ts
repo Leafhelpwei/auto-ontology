@@ -6,9 +6,22 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { cancelChat, streamChat, watchChat } from '@/api/chat';
-import { conversationsApi, toConversation } from '@/api/conversations';
+import { loadCurrentConversation } from '@/lib/chatHistory';
 import { GENERIC_ANSWER_ERROR, buildSqlAnswerMessage, isResultMessage } from '@/lib/answerMessages';
-import type { ChartsEvent, ChatMessage, GraphStep, ResultEvent, StepEvent } from '@/types/chat';
+import type {
+	ChartsEvent,
+	ChatMessage,
+	ChatQueryContext,
+	ChatSelection,
+	GraphStep,
+	ResultEvent,
+	StepEvent,
+} from '@/types/chat';
+import {
+	contextFromSelection,
+	exploreSelection,
+	metricRequestContext,
+} from '@/lib/chatMetricContext';
 
 let nextId = 0;
 const uid = () => `msg-${Date.now()}-${nextId++}`;
@@ -52,8 +65,18 @@ const applyStepEvent = (prev: GraphStep[], event: StepEvent): GraphStep[] => {
 	];
 };
 
-export const useChat = () => {
+export const useChat = (onQueryContext?: (context: ChatQueryContext) => void) => {
 	const [messages, setMessages] = useState<ChatMessage[]>([]);
+	const [queryContext, setQueryContext] = useState<ChatQueryContext | null>(null);
+	const [requestError, setRequestError] = useState<string | null>(null);
+	const queryContextListener = useRef(onQueryContext);
+	useEffect(() => {
+		queryContextListener.current = onQueryContext;
+	}, [onQueryContext]);
+	const updateQueryContext = useCallback((context: ChatQueryContext) => {
+		setQueryContext(context);
+		queryContextListener.current?.(context);
+	}, []);
 	const [steps, setSteps] = useState<GraphStep[]>([]);
 	// The validated query the running agent is executing, rendered inside the
 	// thinking bubble so the user can read it while it runs instead of only
@@ -101,7 +124,15 @@ export const useChat = () => {
 	// stays correct even if this component unmounts mid-stream), so there is
 	// no DB write to do here.
 	const appendAssistantMessage = useCallback(
-		(content: string, extras?: { sql?: string; sqlResponse?: string; thoughts?: string }) => {
+		(
+			content: string,
+			extras?: {
+				sql?: string;
+				sqlResponse?: string;
+				thoughts?: string;
+				queryContext?: ChatQueryContext | null;
+			},
+		) => {
 			const assistantMsg: ChatMessage = {
 				id: uid(),
 				role: 'assistant',
@@ -109,6 +140,7 @@ export const useChat = () => {
 				sql: extras?.sql,
 				sqlResponse: extras?.sqlResponse,
 				thoughts: extras?.thoughts,
+				queryContext: extras?.queryContext,
 				timestamp: Date.now(),
 			};
 			setMessages((prev) => [...prev, assistantMsg]);
@@ -122,9 +154,15 @@ export const useChat = () => {
 	const appendSqlAnswerMessage = useCallback(
 		(answer: ResultEvent['answer']) => {
 			const msg = buildSqlAnswerMessage(answer);
-			if (msg) appendAssistantMessage(msg.content, { sql: msg.sql, thoughts: msg.thoughts });
+			if (answer.query_context) updateQueryContext(answer.query_context);
+			if (msg)
+				appendAssistantMessage(msg.content, {
+					sql: msg.sql,
+					thoughts: msg.thoughts,
+					queryContext: answer.query_context,
+				});
 		},
-		[appendAssistantMessage],
+		[appendAssistantMessage, updateQueryContext],
 	);
 
 	// Message 2 — the chart, or the fallback result table, that the backend
@@ -138,9 +176,13 @@ export const useChat = () => {
 	const appendChartsMessage = useCallback(
 		(event: ChartsEvent, requestId: number) => {
 			if (requestId !== requestIdRef.current) return;
-			appendAssistantMessage(event.content, { sqlResponse: event.sql_response ?? undefined });
+			if (event.query_context) updateQueryContext(event.query_context);
+			appendAssistantMessage(event.content, {
+				sqlResponse: event.sql_response ?? undefined,
+				queryContext: event.query_context,
+			});
 		},
-		[appendAssistantMessage],
+		[appendAssistantMessage, updateQueryContext],
 	);
 
 	// Picks up the assistant turn a run that finished just before we attached
@@ -151,26 +193,43 @@ export const useChat = () => {
 	// result have no Message 2 at all, and simply run out of attempts with the
 	// transcript already up to date.
 	const pollForPersistedAssistant = useCallback(
-		async (conversationId: string, watchController: AbortController) => {
+		async (conversationId: string, watchController: AbortController, requestId: number) => {
 			for (let attempt = 0; attempt < REFETCH_ATTEMPTS; attempt += 1) {
-				if (watchController.signal.aborted || controllerRef.current) return;
+				if (
+					watchController.signal.aborted ||
+					controllerRef.current ||
+					requestId !== requestIdRef.current
+				)
+					return;
 				await sleep(REFETCH_DELAY_MS);
-				if (watchController.signal.aborted || controllerRef.current) return;
+				if (
+					watchController.signal.aborted ||
+					controllerRef.current ||
+					requestId !== requestIdRef.current
+				)
+					return;
 
 				try {
-					const detail = await conversationsApi.get(conversationId);
-					const conv = toConversation(detail);
+					const conv = await loadCurrentConversation(
+						conversationId,
+						() =>
+							!watchController.signal.aborted &&
+							!controllerRef.current &&
+							requestId === requestIdRef.current,
+					);
+					if (!conv) return;
 					const last = conv.messages[conv.messages.length - 1];
 					if (last?.role !== 'assistant') continue;
 
 					setMessages(conv.messages);
+					updateQueryContext(last.queryContext ?? { version: 1, query_mode: 'explore' });
 					if (isResultMessage(last)) return;
 				} catch {
 					// ignore fetch errors and retry
 				}
 			}
 		},
-		[],
+		[updateQueryContext],
 	);
 
 	useEffect(
@@ -231,7 +290,15 @@ export const useChat = () => {
 			let sawActivity = false;
 
 			const controller = watchChat(conversationId, {
+				onMetricContext(event) {
+					if (requestId !== requestIdRef.current) return;
+					sawActivity = true;
+					updateQueryContext(event.query_context);
+					setIsLoading(true);
+					activeRunConvIdRef.current = conversationId;
+				},
 				onStep(event) {
+					if (requestId !== requestIdRef.current) return;
 					sawActivity = true;
 					activeRunConvIdRef.current = conversationId;
 					setIsLoading(true);
@@ -242,6 +309,7 @@ export const useChat = () => {
 				// tab that reattaches mid-run catches up to whatever SQL the
 				// agent is on right now, exactly like one that watched all along.
 				onSql(event) {
+					if (requestId !== requestIdRef.current) return;
 					updateLiveSql(event.sql);
 				},
 
@@ -261,7 +329,15 @@ export const useChat = () => {
 				// about to rebuild from the live buffer: drop them first so it
 				// doesn't land on top as a duplicate.
 				onResult(event) {
+					if (requestId !== requestIdRef.current) return;
 					setMessages((prev) => {
+						const turnId = event.answer.query_context?.turn_id;
+						if (turnId)
+							return prev.filter(
+								(message) =>
+									message.role !== 'assistant' ||
+									message.queryContext?.turn_id !== turnId,
+							);
 						let cut = prev.length;
 						while (cut > 0 && prev[cut - 1].role === 'assistant') cut -= 1;
 						return cut === prev.length ? prev : prev.slice(0, cut);
@@ -283,7 +359,14 @@ export const useChat = () => {
 
 					setSteps((prev) => [
 						...prev.map((s) => ({ ...s, status: 'completed' as const })),
-						{ node: 'visualize', label: 'Building charts', status: 'active' as const },
+						{
+							node: 'visualize',
+							label:
+								event.answer.query_context?.query_mode === 'metrics'
+									? 'Preparing metric results'
+									: 'Building charts',
+							status: 'active' as const,
+						},
 					]);
 				},
 
@@ -302,6 +385,7 @@ export const useChat = () => {
 				},
 
 				onError(event) {
+					if (requestId !== requestIdRef.current) return;
 					if (resumeControllerRef.current === controller) {
 						activeRunConvIdRef.current = null;
 						resumeControllerRef.current = null;
@@ -320,13 +404,18 @@ export const useChat = () => {
 					// Keep the query that failed attached to the error bubble —
 					// the backend persists it the same way, so a reload shows the
 					// same thing.
-					appendAssistantMessage(message, { sql: liveSqlRef.current ?? undefined });
+					if (event.query_context) updateQueryContext(event.query_context);
+					appendAssistantMessage(message, {
+						sql: liveSqlRef.current ?? undefined,
+						queryContext: event.query_context,
+					});
 					updateLiveSql(null);
 					setSteps((prev) => prev.map((s) => ({ ...s, status: 'completed' as const })));
 					setIsLoading(false);
 				},
 
 				onDone() {
+					if (requestId !== requestIdRef.current) return;
 					if (resumeControllerRef.current === controller) {
 						activeRunConvIdRef.current = null;
 						resumeControllerRef.current = null;
@@ -352,7 +441,7 @@ export const useChat = () => {
 					// row yet — poll briefly before giving up.
 					const last = messagesRef.current[messagesRef.current.length - 1];
 					if (last?.role === 'user') {
-						void pollForPersistedAssistant(conversationId, controller);
+						void pollForPersistedAssistant(conversationId, controller, requestId);
 					}
 				},
 			});
@@ -366,6 +455,7 @@ export const useChat = () => {
 			appendChartsMessage,
 			pollForPersistedAssistant,
 			updateLiveSql,
+			updateQueryContext,
 		],
 	);
 
@@ -373,7 +463,19 @@ export const useChat = () => {
 	// refused before the stream started — the caller uses that to decide
 	// whether the typed text can be discarded.
 	const sendMessage = useCallback(
-		async (text: string, conversationId: string | null): Promise<boolean> => {
+		async (
+			text: string,
+			conversationId: string | null,
+			selection: ChatSelection = exploreSelection(),
+		): Promise<boolean> => {
+			let outgoingContext: ChatQueryContext;
+			try {
+				outgoingContext = contextFromSelection(selection);
+			} catch (error) {
+				setRequestError(error instanceof Error ? error.message : 'Select a metric model.');
+				return false;
+			}
+			setRequestError(null);
 			// A background resume may still be tailing this conversation (its
 			// `isLoading` only flips on the first step, so the input isn't locked).
 			// Drop it — this send supersedes it.
@@ -384,6 +486,7 @@ export const useChat = () => {
 				id: uid(),
 				role: 'user',
 				content: text,
+				queryContext: outgoingContext,
 				timestamp: Date.now(),
 			};
 
@@ -399,6 +502,7 @@ export const useChat = () => {
 			activeRunConvIdRef.current = conversationId;
 
 			const finishRun = () => {
+				if (requestId !== requestIdRef.current) return;
 				setSteps((prev) => prev.map((s) => ({ ...s, status: 'completed' as const })));
 				setIsLoading(false);
 				activeRunConvIdRef.current = null;
@@ -410,28 +514,55 @@ export const useChat = () => {
 			// looking like it never sent).
 			const pendingCancel = cancelInFlightRef.current;
 			if (pendingCancel) await pendingCancel;
+			if (requestId !== requestIdRef.current) return false;
 
 			let settle: (accepted: boolean) => void = () => {};
 			const accepted = new Promise<boolean>((resolve) => {
 				settle = resolve;
 			});
 
+			let streamStarted = false;
 			const controller = streamChat(
-				{ question: text, conversationId },
 				{
+					question: text,
+					conversationId,
+					query_mode: selection.query_mode,
+					metric_context: metricRequestContext(selection),
+				},
+				{
+					onMetricContext(event) {
+						if (requestId !== requestIdRef.current) return;
+						updateQueryContext(event.query_context);
+						setMessages((prev) =>
+							prev.map((message) =>
+								message.id === userMsg.id
+									? { ...message, queryContext: event.query_context }
+									: message,
+							),
+						);
+					},
+
 					onStart() {
+						if (requestId !== requestIdRef.current) {
+							settle(false);
+							return;
+						}
+						streamStarted = true;
 						settle(true);
 					},
 
 					onStep(event) {
+						if (requestId !== requestIdRef.current) return;
 						setSteps((prev) => applyStepEvent(prev, event));
 					},
 
 					onSql(event) {
+						if (requestId !== requestIdRef.current) return;
 						updateLiveSql(event.sql);
 					},
 
 					onResult(event) {
+						if (requestId !== requestIdRef.current) return;
 						appendSqlAnswerMessage(event.answer);
 						// The answer bubble owns the SQL from here on.
 						updateLiveSql(null);
@@ -450,7 +581,10 @@ export const useChat = () => {
 							...prev.map((s) => ({ ...s, status: 'completed' as const })),
 							{
 								node: 'visualize',
-								label: 'Building charts',
+								label:
+									event.answer.query_context?.query_mode === 'metrics'
+										? 'Preparing metric results'
+										: 'Building charts',
 								status: 'active' as const,
 							},
 						]);
@@ -467,12 +601,24 @@ export const useChat = () => {
 					// chart step then failed to produce one — without this, the UI
 					// would be stuck on "Building charts" forever.
 					onDone() {
+						if (requestId !== requestIdRef.current) return;
 						if (requestId === requestIdRef.current) finishRun();
 					},
 
 					onError(event) {
+						if (requestId !== requestIdRef.current) return;
 						const message = event.message.trim() || GENERIC_ANSWER_ERROR;
 						finishRun();
+						if (!streamStarted) {
+							setMessages((prev) =>
+								prev.filter((message) => message.id !== userMsg.id),
+							);
+							setRequestError(message);
+							settle(false);
+							if (message === CONVERSATION_IN_PROGRESS && conversationId)
+								resumeIfRunning(conversationId);
+							return;
+						}
 
 						// Another stream already owns this conversation (a second tab,
 						// or a run we stopped watching but couldn't cancel). Nothing
@@ -489,6 +635,7 @@ export const useChat = () => {
 						// the backend persists it the same way, so a reload matches.
 						appendAssistantMessage(message, {
 							sql: liveSqlRef.current ?? undefined,
+							queryContext: event.query_context ?? outgoingContext,
 						});
 						updateLiveSql(null);
 						settle(true);
@@ -505,6 +652,7 @@ export const useChat = () => {
 			appendChartsMessage,
 			resumeIfRunning,
 			updateLiveSql,
+			updateQueryContext,
 		],
 	);
 
@@ -513,11 +661,15 @@ export const useChat = () => {
 	const clearConversation = useCallback(() => {
 		stopGeneration(false);
 		setMessages([]);
+		setQueryContext(null);
+		setRequestError(null);
 		setSteps([]);
 		updateLiveSql(null);
 	}, [stopGeneration, updateLiveSql]);
 
 	return {
+		queryContext,
+		requestError,
 		messages,
 		setMessages,
 		steps,

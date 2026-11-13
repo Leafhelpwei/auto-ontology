@@ -49,8 +49,8 @@ class CatalogState:
 
 def enabled() -> bool:
     return os.environ.get(
-        "AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED", "false"
-    ).lower() in {"1", "true", "yes"}
+        "AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED", "true"
+    ).strip().lower() in {"1", "true", "yes"}
 
 
 def require_enabled() -> None:
@@ -184,7 +184,7 @@ def catalog_state(
     snapshots: list[dict[str, Any]] = []
     unique_by_source: dict[str, list[list[str]]] = {}
     connectors: dict[str, PostgresDatabase] = {}
-    available = get_connectors() if live else []
+    available = get_connectors() if live else None
     for source in model.sources:
         table = tables.get(source.catalog_table_id)
         _require(
@@ -200,6 +200,23 @@ def catalog_state(
             "BINDING_MISMATCH",
             f"Source {source.source_id}: names/datasource do not match the Catalog IDs",
         )
+        # Older ingests omitted catalog_database.dialect. Resolve that legacy
+        # gap against a unique real connector, never from the submitted model
+        # or a table name. Known non-PostgreSQL dialects remain unsupported.
+        if table["dialect"] is None:
+            if available is None:
+                available = get_connectors()
+            matches = [
+                candidate
+                for candidate in available
+                if candidate.database_name == table["database_name"]
+            ]
+            _require(
+                len(matches) == 1 and isinstance(matches[0], PostgresDatabase),
+                "CONNECTION_UNAVAILABLE",
+                "A unique configured PostgreSQL connection is required to resolve a legacy Catalog dialect",
+            )
+            table = {**table, "dialect": "postgres"}
         _require(
             table["dialect"] in {"postgres", "postgresql"},
             "UNSUPPORTED_DIALECT",
@@ -248,6 +265,7 @@ def catalog_state(
             "columns": source_columns,
         }
         if live:
+            assert available is not None
             matches = [
                 candidate
                 for candidate in available

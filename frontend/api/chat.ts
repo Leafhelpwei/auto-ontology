@@ -10,6 +10,7 @@ import type {
 	ResultEvent,
 	ChartsEvent,
 	ErrorEvent,
+	MetricContextEvent,
 } from '@/types/chat';
 
 const getResponseErrorMessage = async (res: Response): Promise<string> => {
@@ -20,6 +21,13 @@ const getResponseErrorMessage = async (res: Response): Promise<string> => {
 	try {
 		const { detail } = JSON.parse(text) as { detail?: unknown };
 		if (typeof detail === 'string' && detail.trim()) return detail;
+		if (
+			detail &&
+			typeof detail === 'object' &&
+			'message' in detail &&
+			typeof detail.message === 'string'
+		)
+			return detail.message;
 	} catch {}
 	return text;
 };
@@ -30,6 +38,7 @@ export type ChatEventCallbacks = {
 	onSql?: (event: SqlEvent) => void;
 	onResult: (event: ResultEvent) => void;
 	onCharts?: (event: ChartsEvent) => void;
+	onMetricContext?: (event: MetricContextEvent) => void;
 	onError: (event: ErrorEvent) => void;
 	onDone?: () => void;
 };
@@ -99,6 +108,9 @@ const consumeSseStream = async (res: Response, callbacks: ChatEventCallbacks): P
 					case 'charts':
 						callbacks.onCharts?.(event);
 						break;
+					case 'metric_context':
+						callbacks.onMetricContext?.(event);
+						break;
 					case 'error':
 						streamCompleted = true;
 						callbacks.onError(event);
@@ -142,6 +154,8 @@ export const streamChat = (
 		question: payload.question,
 		conversation_id: payload.conversationId ?? undefined,
 		target_db: payload.target_db ?? undefined,
+		query_mode: payload.query_mode ?? 'explore',
+		metric_context: payload.query_mode === 'metrics' ? payload.metric_context : undefined,
 	});
 
 	(async () => {

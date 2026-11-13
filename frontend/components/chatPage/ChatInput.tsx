@@ -21,9 +21,17 @@ type ChatInputProps = {
 	onSend: (text: string) => Promise<boolean>;
 	onStop: () => void;
 	isLoading: boolean;
+	disabled?: boolean;
+	placeholder?: string;
 };
 
-export const ChatInput = ({ onSend, onStop, isLoading }: ChatInputProps) => {
+export const ChatInput = ({
+	onSend,
+	onStop,
+	isLoading,
+	disabled = false,
+	placeholder = 'Ask a Question…',
+}: ChatInputProps) => {
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	// Track whether the textarea currently has any non-whitespace text so the
 	// Send button can be disabled/greyed-out when there's nothing to send.
@@ -49,7 +57,7 @@ export const ChatInput = ({ onSend, onStop, isLoading }: ChatInputProps) => {
 			const el = textareaRef.current;
 			if (!el) return;
 			const text = el.value.trim();
-			if (!text || isLoading) return;
+			if (!text || isLoading || disabled) return;
 
 			// Clear straight away so sending feels immediate, then put the text
 			// back if the backend refused it — a rejected question is never added
@@ -67,7 +75,7 @@ export const ChatInput = ({ onSend, onStop, isLoading }: ChatInputProps) => {
 			resetHeight();
 			setHasText(true);
 		},
-		[onSend, isLoading],
+		[onSend, isLoading, disabled],
 	);
 
 	const handleKeyDown = useCallback(
@@ -97,7 +105,8 @@ export const ChatInput = ({ onSend, onStop, isLoading }: ChatInputProps) => {
 				<textarea
 					ref={textareaRef}
 					rows={1}
-					placeholder="Ask a Question…"
+					placeholder={placeholder}
+					disabled={disabled}
 					onInput={handleInput}
 					onKeyDown={handleKeyDown}
 					className="flex-1 resize-none rounded-xl border border-zinc-300 bg-zinc-50 px-4 py-2.5 text-sm text-heading outline-none transition-colors placeholder:text-secondary focus:border-[#76b900] focus:ring-1 focus:ring-[#76b900] dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-500"
@@ -122,7 +131,7 @@ export const ChatInput = ({ onSend, onStop, isLoading }: ChatInputProps) => {
 						size={Size.LARGE}
 						iconOnly
 						type="submit"
-						disabled={!hasText}
+						disabled={!hasText || disabled}
 						aria-label="Send message"
 					>
 						<Icon name={IconName.Send} className="h-4 w-4" />

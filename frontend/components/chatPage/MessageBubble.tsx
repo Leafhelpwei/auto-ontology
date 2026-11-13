@@ -5,13 +5,14 @@
 'use client';
 
 import { useMemo } from 'react';
-import type { ChatMessage } from '@/types/chat';
+import type { ChatMessage, MetricsQueryContext } from '@/types/chat';
 import { CopyButton } from '@/common/Button';
 import { formatDate } from '@/common/date';
 import { parseSqlResponse, type ParsedTable } from '@/lib/parseSqlResponse';
 import { SqlBlock } from '@/common/SqlBlock';
 import { DynamicTable } from './DynamicTable';
 import { FormattedContent } from './FormattedContent';
+import { MetricAnswerDetails } from './MetricAnswerDetails';
 
 type SingleCellResult = { column: string; value: string };
 
@@ -61,13 +62,17 @@ const QueryResultsSection = ({
 
 type MessageBubbleProps = {
 	message: ChatMessage;
+	onSelectMetric?: (context: MetricsQueryContext, metricId: string) => void;
+	disabled?: boolean;
 };
 
 /** True when the assistant message embeds a ResultChart fence (illumex Message 2). */
 const hasEmbeddedChart = (content: string): boolean =>
 	/(^|\n)```(?:chart|chart-carousel)\b/.test(content);
 
-export const MessageBubble = ({ message }: MessageBubbleProps) => {
+export const MessageBubble = ({ message, onSelectMetric, disabled }: MessageBubbleProps) => {
+	const metricContext =
+		message.queryContext?.query_mode === 'metrics' ? message.queryContext : null;
 	const isUser = message.role === 'user';
 	const parsedTable = useMemo(() => parseSqlResponse(message.sqlResponse), [message.sqlResponse]);
 
@@ -83,12 +88,14 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
 	// Message 2 — charts only, OR table only
 	const showCharts = !isUser && hasEmbeddedChart(message.content);
 	const showSql = !isUser && Boolean(message.sql) && !showCharts;
-	const showQueryResults = !isUser && !showCharts && Boolean(message.sqlResponse);
+	const showQueryResults =
+		!isUser && !metricContext && !showCharts && Boolean(message.sqlResponse);
 	const showText = Boolean(message.content.trim());
 
 	// Stretch assistant bubbles that carry SQL / charts / tables to the same
 	// width so Message 2 matches Message 1's SQL block.
-	const wideAssistant = !isUser && (showSql || showCharts || showQueryResults);
+	const wideAssistant =
+		!isUser && (showSql || showCharts || showQueryResults || Boolean(metricContext));
 
 	return (
 		<div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -99,6 +106,12 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
 						: 'bg-zinc-100 text-heading dark:bg-zinc-800 dark:text-zinc-100'
 				}`}
 			>
+				{isUser && metricContext && (
+					<p className="mb-1 text-[10px] font-medium opacity-80">
+						Standard metrics · {metricContext.model_id}
+						{metricContext.revision != null ? ` · r${metricContext.revision}` : ''}
+					</p>
+				)}
 				{showText && (
 					<FormattedContent
 						content={message.content}
@@ -122,6 +135,15 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
 						parsedTable={parsedTable}
 						singleCell={singleCellResult}
 						className={showText || showSql ? 'mt-3' : undefined}
+					/>
+				)}
+
+				{!isUser && metricContext && (
+					<MetricAnswerDetails
+						context={metricContext}
+						sqlResponse={message.sqlResponse}
+						onSelectMetric={onSelectMetric}
+						disabled={disabled}
 					/>
 				)}
 

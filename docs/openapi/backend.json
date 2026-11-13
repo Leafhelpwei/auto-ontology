@@ -141,6 +141,16 @@
             "description": "Optional authoritative evidence supplied separately from the question.",
             "title": "Evidence"
           },
+          "metric_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MetricChatContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "prediction": {
             "anyOf": [
               {
@@ -151,6 +161,15 @@
               }
             ],
             "title": "Prediction"
+          },
+          "query_mode": {
+            "default": "explore",
+            "enum": [
+              "explore",
+              "metrics"
+            ],
+            "title": "Query Mode",
+            "type": "string"
           },
           "question": {
             "minLength": 1,
@@ -2956,12 +2975,18 @@
             "title": "Revision"
           },
           "selected_metric_ids": {
-            "default": [],
-            "items": {
-              "type": "string"
-            },
-            "title": "Selected Metric Ids",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Metric Ids"
           }
         },
         "required": [
@@ -3422,6 +3447,48 @@
           "source_ids"
         ],
         "title": "Metric",
+        "type": "object"
+      },
+      "MetricChatContext": {
+        "additionalProperties": false,
+        "description": "User selections only; trusted query state comes from owned history.",
+        "properties": {
+          "model_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+            "title": "Model Id",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "selected_metric_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Metric Ids"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "MetricChatContext",
         "type": "object"
       },
       "MetricExpression": {
@@ -7335,7 +7402,7 @@
   "paths": {
     "/api/chat/cancel": {
       "post": {
-        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nKilling the worker makes ``PrewarmedWorker.events()`` return rather\nthan raise, so ``_pump`` appends no error event: the run's buffer ends\nwith whatever steps completed and the stream closes with ``[DONE]``.\nConsumers therefore see a run that stopped without an answer, and the\nconversation keeps its user turn with no assistant reply.",
+        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nThe worker is killed and the route waits briefly for its pump to finish\npersistence. Metric runs record an untrusted cancellation result tied to\ntheir server-generated turn ID; exploratory runs retain their existing\npartial-stream behavior. The slot remains unavailable while terminal\npersistence is unfinished, so a subsequent question cannot consume a late\nassistant result. PostgreSQL 14+ detects the dead client during execution;\nolder versions retain the governed statement-timeout bound.",
         "operationId": "chat_cancel_api_chat_cancel_post",
         "parameters": [
           {
@@ -7379,7 +7446,7 @@
     },
     "/api/chat/completions": {
       "post": {
-        "description": "Run the text-to-SQL agent and stream OpenAI-style SSE frames back.\n\nEmits a ``sql`` event once the agent has a validated query, just before it\nexecutes, so callers can show the SQL while it runs. Emits the final SQL\nand formatted answer as a ``result`` event, then \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\nRequires a compiled semantic layer; without one the request is rejected with\n409 rather than run against a bare schema. ``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
+        "description": "Run the text-to-SQL agent and stream OpenAI-style SSE frames back.\n\nEmits a ``sql`` event once the agent has a validated query, just before it\nexecutes, so callers can show the SQL while it runs. Emits the final SQL\nand formatted answer as a ``result`` event, then \u2014 if that\nanswer has an executed result \u2014 generates and persists the chart/table\nbubble itself and streams it back as a ``charts`` event before the stream\ncloses with ``[DONE]``. Callers that only care about the text/SQL answer\ncan still stop reading after ``result``; the chart step and its\npersistence happen server-side regardless of whether anyone keeps\nlistening (see ``_build_charts_event``).\n\n``query_mode=explore`` (the compatibility default) requires a compiled\nsemantic layer. ``query_mode=metrics`` instead requires ``metric_context``\nselecting an active certified model, authenticates catalog/chat access,\ninterprets a typed request and executes the governed read-only path. It\nnever falls back to exploratory SQL. Clarifications/errors are persisted;\nexact table values and query evidence travel in ``query_context`` JSON.\n``conversation_id`` persists the\nturn and claims that conversation's single run slot \u2014 a second concurrent\nrequest for the same conversation gets 409 too. Omitting ``conversation_id``\nruns the question statelessly: no history, no persisted turn, and no chart\nstep (``_build_charts_event`` needs a conversation to save into).",
         "operationId": "chat_completions_api_chat_completions_post",
         "requestBody": {
           "content": {

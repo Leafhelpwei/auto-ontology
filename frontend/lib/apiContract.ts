@@ -24,7 +24,12 @@ import type {
 	conversationSelect,
 	messageSelect,
 } from './apiSelects';
-import type { acronymSchema, conversationSchema, messageSchema } from './openapiSchemas';
+import type {
+	acronymSchema,
+	conversationSchema,
+	messageSchema,
+	chatQueryContextSchema,
+} from './openapiSchemas';
 
 /**
  * What a row looks like once `NextResponse.json` has been through it: Prisma
@@ -48,10 +53,13 @@ const conversationMatches: Exact<
 	z.infer<typeof conversationSchema>
 > = true;
 
-const messageMatches: Exact<
+// History validates the backend-authored JSON through publishedQueryContext;
+// manual message creation never accepts this field and leaves it null.
+type MessagePublished = Omit<
 	Serialized<Prisma.MessageGetPayload<{ select: typeof messageSelect }>>,
-	z.infer<typeof messageSchema>
-> = true;
+	'query_context'
+> & { query_context: z.infer<typeof chatQueryContextSchema> | null };
+const messageMatches: Exact<MessagePublished, z.infer<typeof messageSchema>> = true;
 
 const acronymMatches: Exact<
 	Serialized<Prisma.AcronymGetPayload<{ select: typeof acronymSelect }>>,

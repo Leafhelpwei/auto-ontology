@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 启用
 
-先获取本次开发分支；仓库通用 README 的 Quickstart 仍指向 NVIDIA 上游，不能用上游 `main` 替代此分支：
+先获取本次开发分支；NVIDIA 上游 `main` 不包含本 fork 的指标治理和 Chat 集成扩展：
 
 ```bash
 git clone --branch feat/governed-metrics https://github.com/Leafhelpwei/auto-ontology.git
@@ -27,10 +27,12 @@ cd auto-ontology
    uv run alembic check
    ```
 
-3. 在后端环境设置 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=true`。直接运行后端时重启进程；Docker Compose 在 `.env` 中设置后，首次按通用说明运行 `docker compose up -d --build`。已有本分支镜像时运行 `docker compose up -d --no-deps --force-recreate auto-ontology` 重新加载环境变量，普通 `docker compose restart` 不会读取新的 `.env`。Helm 使用 `backend.governedMetricsEnabled=true`，同时使用本分支构建的镜像，不能只升级 chart 而继续运行旧镜像。
+   Chat 的模式、模型版本、澄清和查询依据保存在 `frontend` 模式的消息 `query_context` 字段中。还需同步 Prisma schema：在 `frontend` 目录、使用与应用一致的数据库配置运行 `sh prisma/migrate.sh` 和 `pnpm db:generate`。Docker Compose 的 `frontend-migrate` 服务、Helm 的同名迁移 hook 沿用这一同步流程；只运行 Alembic 不会更新前端会话表。
+
+3. 指标运行时默认开启，无需额外设置。沿用旧版配置时，若 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=false`，需改为 `true` 或移除该设置；显式关闭配置仍然生效。修改环境变量后，直接运行的后端需重启；Docker Compose 首次按通用说明运行 `docker compose up -d --build`。已有本分支镜像时运行 `docker compose up -d --no-deps --force-recreate auto-ontology` 重新加载环境变量，普通 `docker compose restart` 不会读取新的 `.env`。Helm 的 `backend.governedMetricsEnabled` 默认 `true`，同时需使用本分支构建的镜像，不能只升级 chart 而继续运行旧镜像。
 4. 使用现有登录方式进入 Auto Ontology，在导航中打开 Metrics 或访问 `/metrics`。
 
-开关默认关闭。关闭时仍可管理模型，编译、草稿预览、自然语言解析和查询执行返回 `FEATURE_DISABLED`。关闭开关不会删除模型或修订版。
+如需停用，设置 `AUTO_ONTOLOGY_GOVERNED_METRICS_ENABLED=false`，或 Helm `backend.governedMetricsEnabled=false`。关闭时仍可管理模型，编译、草稿预览、自然语言解析和查询执行返回 `FEATURE_DISABLED`，模型和修订版不会删除。默认开启不跳过登录、权限、认证、激活或来源结构校验。
 
 新增表为 `governed_model`、`governed_model_revision`、`governed_model_certification`。它们属于现有 public 元数据模式。发布前应在隔离数据库验证迁移；降级会删除这些新增治理数据，日常回滚优先关闭开关并保留数据。
 
@@ -71,7 +73,7 @@ cd auto-ontology
 
 原有 SqlAttribute 的 SQL、业务说明或 Term 关联发生变化时清除旧认证。历史 SQL 提炼保存完整查询；复杂历史查询可作为待审核候选，不自动转换成受限编译器可执行的指标。
 
-## 自然语言查询
+## 工作台自然语言查询
 
 在已激活模型的查询区域输入问题，可先选择具体指标口径，再点击解析。自然语言解释复用现有 LLM 配置；无模型密钥时仍可使用结构化查询。
 
@@ -81,7 +83,16 @@ cd auto-ontology
 - `clarification`：需要补充日期、时间角色、时区或指标口径；指标族歧义会返回可选口径。
 - `rejected`：不支持、定义不一致或模型服务不可用；不会自动进入自由 SQL 流程。
 
-原有 `/chat` 仍使用原本的探索性查询流程。本版本没有将标准指标模式嵌入旧 Chat 的流式会话、追问和历史记录；标准指标查询在工作台完成。
+## 在 Chat 中使用标准指标
+
+Chat 的标准指标模式使用所选的已认证、已激活模型，和工作台共享解释、校验、编译与执行服务。解析为 `ready` 后在同一轮执行查询；`clarification`、`rejected` 或错误不会执行探索性 SQL。探索模式仍使用原有查询流程，用户需要显式切换模式。
+
+1. 在 Chat 选择 **Standard metrics**，在 **Activated metric model** 中选取已激活模型。没有可选模型时，先在 Metrics 完成校验、认证与激活。
+2. 输入指标问题。可在 **Metric variants (optional)** 中明确指标口径，也可留空让解释器识别；有歧义时仍须澄清。
+3. 按提示在同一会话中回答澄清，或基于已执行请求继续追问。点击澄清中的口径选项只更新选择；在输入区补充条件后发送才会继续查询。结果显示模型版本、指标、实际查询和口径依据。
+4. 模型已切换到新激活版本时，显式选择当前版本并重置指标上下文；历史回答仍保存其原版本。切换到 **Explore data** 才会使用探索性查询路径。
+
+同一会话中的澄清回答和追问从服务端保存的结构化请求恢复上下文，绑定具体模型修订版与指纹。模型切换或版本失效不能沿用旧认证；查询仍会重新校验激活状态和来源结构。没有真实 LLM 配置时，自然语言解析不可用，可在工作台使用结构化查询。
 
 ## API 摘要
 
@@ -103,8 +114,11 @@ cd auto-ontology
 | `POST .../{id}/interpret` | `{revision, question, selected_metric_ids}` |
 | `GET .../{id}/export?revision=N` | 导出原生快照和来源信息 |
 | `POST /api/metrics/import` | 导入原生包为新草稿 |
+| `POST /api/chat/completions` | SSE 会话入口，`query_mode="metrics"` 与 `metric_context` 选择标准指标模式 |
 
-成功响应使用 `{ "data": ... }`。语义错误返回结构化 `code/message/path`，前端保留具体原因；完整规范见 [后端 OpenAPI](openapi/backend.json)。
+`/metrics` 接口的成功响应使用 `{ "data": ... }`。语义错误返回结构化 `code/message/path`，前端保留具体原因；完整规范见 [后端 OpenAPI](openapi/backend.json)。
+
+Chat 入口沿用 SSE 响应，并将 `query_context` 随结果及会话历史返回。标准指标请求包含 `question`、`query_mode="metrics"` 和 `metric_context={model_id, revision?, selected_metric_ids}`；携带 `conversation_id` 才会保存并恢复该用户的会话上下文。客户端不能通过该字段提交可信查询、认证指纹或任意 SQL。未指定 `query_mode` 的 API 请求保持 `explore`，运行时默认开启不等于自动改写所有旧请求。
 
 结构化查询示例：
 
@@ -150,3 +164,5 @@ uv run --no-sync python -m dev_tools.generate_backend_openapi
 ```
 
 前端使用项目指定 pnpm 运行 Prettier、lint、类型检查和 build。具体执行结果、全量基线差异与仍未验证的部分记录在 [实施记录](plans/governed-metrics-progress.md)，不可将静态构建成功等同于生产联调完成。
+
+本轮 Chat 集成验收使用真实本地登录、Next/FastAPI HTTP 和 PostgreSQL；只有模型服务使用显式 scripted 本地替身，覆盖澄清、追问、会话恢复、取消、权限、版本及来源变化。这验证了接口与治理流程，不代表真实 LLM 理解质量、浏览器 UI 或生产数据验收完成；正式自然语言使用仍需配置真实模型服务。

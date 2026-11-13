@@ -6,6 +6,7 @@ import { NextResponse } from 'next/server';
 import { getPrisma } from '@/lib/prisma';
 import { withPermission } from '@/auth/with-auth';
 import { conversationSelect, messageSelect } from '@/lib/apiSelects';
+import { publishedQueryContext } from '@/lib/chatConversations';
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -34,7 +35,13 @@ export const GET = withPermission<Ctx>({ conversation: ['read'] })(async (
 		return notFound();
 	}
 
-	return NextResponse.json(conversation);
+	return NextResponse.json({
+		...conversation,
+		messages: conversation.messages.map((message) => ({
+			...message,
+			query_context: publishedQueryContext(message.query_context),
+		})),
+	});
 });
 
 // Rename a conversation the caller owns; 404 when it is not theirs.

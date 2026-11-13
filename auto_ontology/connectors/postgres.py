@@ -155,6 +155,13 @@ class PostgresDatabase(SQLDatabase):
                     conn.execute(
                         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
                     )
+                    # A cancelled Chat run kills its subprocess. PostgreSQL 14+
+                    # checks that dead client while a query runs, instead of
+                    # waiting for the 30-second statement timeout to expire.
+                    if conn.info.server_version >= 140000:
+                        conn.execute(
+                            "SELECT set_config('client_connection_check_interval', '100ms', true)"
+                        )
                     conn.execute(
                         "SELECT set_config('statement_timeout', %s, true)",
                         (f"{max(1, int(timeout_s * 1000))}ms",),
