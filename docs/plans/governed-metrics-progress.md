@@ -8,6 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 
 - 实施日期：2026-11-11
 - 集成更新：2026-11-13，当前工作区本地运行与验证
+- MySQL 5.7 适配：2026-11-15，基于 `9678dd9`
 - 上游：NVIDIA/auto-ontology
 - 基线：`fc43a82600e18b19d159c52023f54f5572f537ac`
 - 本轮集成起点：`a2332d8`
@@ -21,13 +22,14 @@ SPDX-License-Identifier: Apache-2.0
 | --- | --- | --- |
 | 历史 SQL 口径和关联上下文保留 | 已实现 | `auto_ontology/semantic/sql_attribute_suggester.py` |
 | SQLAttribute 语义编辑清除旧认证 | 已实现 | `auto_ontology/server/sql_attributes/service.py` |
-| 闭合契约、校验、参数化 PostgreSQL 编译 | 已实现 | `auto_ontology/semantic/contracts/` |
+| 闭合契约、校验、参数化 PostgreSQL / MySQL 5.7 编译 | 已实现 | `auto_ontology/semantic/contracts/` |
 | 不可变修订版、认证、发布、导入导出 | 已实现 | `auto_ontology/dal/governed_models.py`、`auto_ontology/server/metrics/` |
 | 自然语言转结构化请求与澄清 | 已实现；外部 LLM 待联调 | `auto_ontology/server/metrics/interpretation.py` |
 | 原生指标管理与查询页面 | 已实现；登录浏览器联调待做 | `frontend/app/metrics/` |
 | 默认开启运行时、显式关闭回退 | 已实现并通过默认值及 Helm 渲染验证 | `server/metrics/service.py`、`.env.example`、`helm/auto-ontology/` |
 | Chat 标准指标模式、澄清续问与历史上下文 | 已接入；真实 LLM 与浏览器 UI 验收待做 | `server/chat/metrics_flow.py`、`frontend/components/chatPage/` |
 | PostgreSQL 结果级回归 | 已通过 | `auto_ontology/semantic/contracts/tests/`、`auto_ontology/server/metrics/tests/` |
+| MySQL 5.7 业务来源及原有 Chat 标准指标 | 已实现；真实 5.7.44 回归通过 | `connectors/mysql.py`、`server/metrics/source_adapters.py`、[接入指南](../mysql57.md) |
 
 ## 已确认的环境
 
@@ -90,6 +92,30 @@ Chat 集成覆盖治理发布、缺时间时澄清且不执行 SQL、回答全�
 以上检查使用本地真实 HTTP、Auth 会话与数据库；不是浏览器 UI 端到端验收。Chat 模型替身仅用于确定性集成验收，不是产品内置的无密钥回退。当前没有真实 LLM 密钥，尚未完成外部模型实时调用、生产数据联调或生产部署。Helm 模板渲染也不代表集群部署已验证。
 
 本轮 Next production build 返回 0；构建环境未提供完整 Auth 数据库时仍出现既有 OAuthResource / BetterAuth 配置警告。真实 Auth 登录、会话读取、登出和权限检查已在另行启动的本地完整栈通过 HTTP 验证。
+
+## 2026-11-15 MySQL 5.7 适配验证
+
+原有 MySQL 连接器已经支持业务库接入；此前新增的确定性标准指标编译与执行仅支持 PostgreSQL。本轮把标准指标链路扩展到 MySQL 5.7，复用 `/metrics`、认证发布及原有 Chat，不增加关闭状态的独立功能入口。应用元数据、Catalog、身份和会话仍由 PostgreSQL + pgvector 保存。
+
+MySQL 编译使用派生表、UNION 分组键和 NULL 安全关联，不生成 5.7 不支持的 CTE、窗口函数或 FULL OUTER JOIN。DATETIME 明确声明存储时区，常见上海时区范围通过参数转换执行；无法准确处理的偏移变化和重复墙钟边界会被拒绝。模型和物理来源同时校验，完整唯一键与兼容的关联键比较语义防止 fanout。旧 PostgreSQL 模型指纹保持不变。
+
+真实数据源使用 Oracle MySQL Community **5.7.44** 官方发行包，运行于隔离测试库；未使用 MariaDB 替代。应用账号只有测试业务库的 SELECT 权限，另外的 fixture 账号负责随机表的创建和清理。PostgreSQL **17.11** + pgvector 用于元数据和旧查询回归，Prisma 前端 schema 已同步。测试没有连接生产库。
+
+| 检查 | 结果 |
+| --- | --- |
+| 冻结代码全量后端 `pytest auto_ontology dev_tools -q --durations=10` | **2881 passed、1 skipped、1 failed**；58.16 秒。唯一失败仍为未修改的上游 `CODE_OF_CONDUCT.md` 缺少 SPDX；唯一跳过为外部 Databricks 实例 |
+| PostgreSQL + MySQL 契约回归 | 79 passed，无跳过；包含 5 项真实 MySQL 结果级测试及旧 PostgreSQL 指纹快照 |
+| MySQL 连接器与工作进程定向回归 | 85 passed、1 skipped；包含 8 项真实 5.7 测试，另含原有连接器及 Chat 回归 |
+| MySQL 治理、时间、权限和 Chat 集成 | 7 passed；真实 MySQL、PostgreSQL Catalog、Prisma 历史及 FastAPI TestClient；只有 LLM 解释候选为显式替身 |
+| 前端 Vitest | 37 passed |
+| TypeScript / Prettier / ESLint / Next production build | 通过；ESLint 零错误，原有 UserMenu 警告和无默认 Auth 环境的构建提示保留 |
+| 后端 Ruff / 格式 / `git diff --check` | 通过 |
+| OpenAPI / MCP 镜像 | 后端与公开 schema 已重新生成；公开 API 与 MCP 镜像逐字节一致 |
+| Python CI 配置 | 加入官方 `mysql:5.7.44` 服务、只读账号、PostgreSQL 与 Prisma 初始化及真实数据库测试所需环境；不代表远端 CI 已执行或通过 |
+
+真实 MySQL 回归覆盖中文和四字节字符、Decimal 和 unsigned BIGINT 精度、NULL 分组、指标独立过滤、LEFT ON 过滤、复合指标、DATE/TIMESTAMP/DATETIME 半开边界、空结果类型、结构漂移、前缀唯一索引拒绝、完整复合主键、只读事务、快照一致性、服务器查询与元数据锁等待超时，以及终止 Chat 工作进程后服务端查询消失。非法零日期明确报错，真正的 SQL NULL 保留。数据库异常通过 API/Chat 统一清洗，避免输出连接详情。
+
+Chat 集成验证了澄清、执行、真实角色权限和 PostgreSQL 会话结果保存；本轮使用 TestClient 和服务调用，不声明已完成浏览器 UI、真实外部 LLM、生产数据或生产部署验收。使用及复现方式见 [MySQL 5.7 指南](../mysql57.md)。
 
 ## 交付与继续开发
 

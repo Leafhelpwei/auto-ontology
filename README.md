@@ -47,8 +47,8 @@ To run a text-to-SQL benchmark such as BIRD, refer to the
 ## Governed metrics extension
 
 This development branch adds a native `/metrics` workbench with versioned metric,
-source and relationship contracts, review evidence, deterministic PostgreSQL query
-compilation, and query explanations. Chat also supports an explicit standard
+source and relationship contracts, review evidence, deterministic PostgreSQL and
+MySQL 5.7 query compilation, and query explanations. Chat also supports an explicit standard
 metrics mode with model selection, clarification, follow-up questions and saved
 query context. It uses the same governed compiler and executor; a rejected metric
 request never falls back to exploratory SQL. Historical SQL candidates retain
@@ -59,8 +59,16 @@ require an active, certified model revision. Set
 model management and revision history.
 
 Local integration checks cover authenticated HTTP sessions, clarification and
-follow-ups against PostgreSQL, using a scripted local model substitute. Live LLM,
+follow-ups against PostgreSQL. MySQL 5.7.44 checks use a real read-only datasource,
+FastAPI TestClient, governance lifecycle and persisted metric Chat context. Model
+interpretation uses explicit scripted substitutes in these tests. Live LLM,
 browser UI end-to-end and production-data validation remain outstanding.
+
+MySQL 5.7 business sources use InnoDB tables, explicit datetime storage semantics
+and the same workbench and Chat workflows. The application metadata, authentication,
+Catalog and vector store still require PostgreSQL + pgvector. See the
+[MySQL 5.7 configuration and compatibility guide](docs/mysql57.md) for the supported
+scope and validation record.
 
 See the [setup and usage guide](docs/governed-metrics.md),
 [design decision](docs/plans/adr-001-governed-model-snapshots.md), and
@@ -425,7 +433,9 @@ Auto-Ontology connects to ten engines:
 Add connections under **Settings → Connections**, or list them in
 `CONNECTION_STRINGS`. DuckDB and SQLite are connection-string only. See
 [docs/connections.md](./docs/connections.md) for URL schemes, scoping, and
-credential storage.
+credential storage. The governed metric compiler supports PostgreSQL and
+[MySQL 5.7](docs/mysql57.md); the connector list is broader than the governed
+compiler dialects.
 
 ### Models
 

@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deterministic emission from the closed metric expression/relationship AST.
 
-All data is bound through psycopg named parameters. Only registered identifiers
+All data is bound through the dialect driver's named parameters. Only registered identifiers
 and fixed compiler tokens enter SQL. Each atomic metric aggregates in its own
 scope; grouping keys are unioned and joined with NULL-safe equality afterwards.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time as clock_time
+from datetime import datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -41,21 +41,86 @@ from .validator import (
     numeric_value,
     logical_field_ref,
     resolve_field,
+    storage_timezone,
     validate_query,
 )
 
 
-def quote(identifier: str) -> str:
-    """Quote one PostgreSQL identifier (never a dotted SQL fragment)."""
+def quote(identifier: str, dialect: str = "postgres") -> str:
+    """Quote one identifier using the actual driver's parameter escape rules."""
     if not identifier or "\x00" in identifier:
         fail("INVALID_IDENTIFIER", "An identifier must be nonempty and contain no NUL")
+    if dialect == "mysql":
+        if "%(" in identifier:
+            fail(
+                "INVALID_IDENTIFIER",
+                "MySQL identifiers cannot contain driver placeholders",
+            )
+        # mysql-connector-python substitutes mapping tokens, not bare percent.
+        return "`" + identifier.replace("`", "``") + "`"
     # psycopg's pyformat parser also reads quoted identifiers when parameters
     # are supplied, so a literal percent must be doubled at that boundary.
     return '"' + identifier.replace('"', '""').replace("%", "%%") + '"'
 
 
-def table(source: SourceBinding) -> str:
-    return f"{quote(source.schema_name)}.{quote(source.table_name)}"
+def table(source: SourceBinding, dialect: str = "postgres") -> str:
+    return f"{quote(source.schema_name, dialect)}.{quote(source.table_name, dialect)}"
+
+
+def _mysql_fixed_offset(name: str, start: datetime, end: datetime) -> timedelta:
+    """Reject ambiguous wall clocks or offset transitions in a bounded range.
+
+    MySQL DATETIME cannot distinguish repeated local times. Fixed-offset queries
+    also avoid CONVERT_TZ's timezone-table and 1970/2038 conversion boundaries.
+    The supported IANA range is bounded to 100 years and checked at daily UTC
+    points plus both edges; fold checks cover bounds inside a repeated hour.
+    """
+    zone = storage_timezone(name)
+    start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    if end - start > timedelta(days=36600):
+        fail("UNSUPPORTED_TIMEZONE_RANGE", "MySQL time ranges are limited to 100 years")
+    try:
+        offset = start.astimezone(zone).utcoffset()
+    except (OverflowError, ValueError):
+        fail(
+            "UNSUPPORTED_TIMEZONE_RANGE",
+            "Time conversion exceeds the supported datetime range",
+        )
+    assert offset is not None
+    if offset.total_seconds() % 60:
+        fail(
+            "UNSUPPORTED_TIMEZONE_TRANSITION",
+            "MySQL storage offsets require whole minutes",
+        )
+
+    def check(point: datetime) -> None:
+        try:
+            local = point.astimezone(zone)
+        except (OverflowError, ValueError):
+            fail(
+                "UNSUPPORTED_TIMEZONE_RANGE",
+                "Time conversion exceeds the supported datetime range",
+            )
+        if (
+            local.utcoffset() != offset
+            or local.replace(fold=0).utcoffset() != local.replace(fold=1).utcoffset()
+        ):
+            fail(
+                "UNSUPPORTED_TIMEZONE_TRANSITION",
+                "MySQL DATETIME ranges and time grouping require a fixed offset and unambiguous boundaries; split the range or use UTC storage",
+            )
+
+    point = start
+    while point < end:
+        check(point)
+        point += min(timedelta(days=1), end - point)
+    check(end)
+    return offset
+
+
+def _mysql_datetime(value: datetime, zone_name: str) -> datetime:
+    _mysql_fixed_offset(zone_name, value, value)
+    return value.astimezone(storage_timezone(zone_name)).replace(tzinfo=None)
 
 
 class Parameters:
@@ -98,7 +163,7 @@ class FactScope:
 
     def column(self, ref: FieldRef, alias: str) -> str:
         field = resolve_field(self.model, ref)
-        return f"{alias}.{quote(field.column_name)}"
+        return f"{alias}.{quote(field.column_name, self.model.dialect)}"
 
     def add_path(self, path: tuple[Relationship, ...]) -> str:
         key: tuple[str, ...] = ()
@@ -132,7 +197,7 @@ class FactScope:
             for predicate in (*relation.predicates, *target.required_filters):
                 conditions.append(self.predicate(predicate, endpoint_aliases))
             self.joins.append(
-                f"{relation.join_type.upper()} JOIN {table(target)} {alias} ON "
+                f"{relation.join_type.upper()} JOIN {table(target, self.model.dialect)} {alias} ON "
                 + " AND ".join(f"({item})" for item in conditions)
             )
             self.used_sources.add(target.source_id)
@@ -177,11 +242,18 @@ class FactScope:
         def value_sql(value: Scalar) -> str:
             if field.data_type == "number":
                 value = numeric_value(value)
+            if field.data_type == "datetime" and self.model.dialect == "mysql":
+                value = _mysql_datetime(
+                    datetime.fromisoformat(value), field.datetime_timezone
+                )
             bound = self.parameters.bind(value)
             if field.data_type == "date":
                 return f"CAST({bound} AS DATE)"
             if field.data_type == "datetime":
-                return f"CAST({bound} AS TIMESTAMPTZ)"
+                dtype = (
+                    "DATETIME(6)" if self.model.dialect == "mysql" else "TIMESTAMPTZ"
+                )
+                return f"CAST({bound} AS {dtype})"
             return bound
 
         if predicate.operator in ("in", "not_in"):
@@ -211,6 +283,7 @@ class FactScope:
                 self.row_expression(expression.left),
                 self.row_expression(expression.right),
                 self.metric.zero_division,
+                self.model.dialect,
             )
         fail("INVALID_ATOMIC", "Atomic expressions cannot reference other metrics")
 
@@ -347,6 +420,20 @@ class FactScope:
                     f"CAST({self.parameters.bind(end.date().isoformat())} AS DATE)"
                 )
                 grouping_time = column
+            elif self.model.dialect == "mysql":
+                offset = _mysql_fixed_offset(
+                    field.datetime_timezone, time.start, time.end_exclusive
+                )
+                start_sql = f"CAST({self.parameters.bind(_mysql_datetime(time.start, field.datetime_timezone))} AS DATETIME(6))"
+                end_sql = f"CAST({self.parameters.bind(_mysql_datetime(time.end_exclusive, field.datetime_timezone))} AS DATETIME(6))"
+                grouping_time = column
+                if time.granularity:
+                    target_offset = _mysql_fixed_offset(
+                        time.timezone, time.start, time.end_exclusive
+                    )
+                    minutes = int((target_offset - offset).total_seconds() // 60)
+                    if minutes:
+                        grouping_time = f"DATE_ADD({column}, INTERVAL {self.parameters.bind(minutes)} MINUTE)"
             else:
                 start_sql = f"CAST({self.parameters.bind(time.start)} AS TIMESTAMPTZ)"
                 end_sql = (
@@ -359,9 +446,19 @@ class FactScope:
                 )
             where.extend([f"{column} >= {start_sql}", f"{column} < {end_sql}"])
             if time.granularity:
-                dimension_sql.append(
-                    f"DATE_TRUNC({self.parameters.bind(time.granularity)}, {grouping_time})"
-                )
+                if self.model.dialect == "mysql":
+                    formats = {
+                        "day": "%Y-%m-%d 00:00:00",
+                        "month": "%Y-%m-01 00:00:00",
+                        "year": "%Y-01-01 00:00:00",
+                    }
+                    dimension_sql.append(
+                        f"CAST(DATE_FORMAT({grouping_time}, {self.parameters.bind(formats[time.granularity])}) AS DATETIME)"
+                    )
+                else:
+                    dimension_sql.append(
+                        f"DATE_TRUNC({self.parameters.bind(time.granularity)}, {grouping_time})"
+                    )
                 output_dimensions.append("__time")
         expression = (
             self.row_expression(self.metric.expression)
@@ -375,7 +472,7 @@ class FactScope:
         select = [f"{item} AS d{index}" for index, item in enumerate(dimension_sql)] + [
             f"{aggregate} AS v"
         ]
-        sql = f"SELECT {', '.join(select)} FROM {table(self.source)} f"
+        sql = f"SELECT {', '.join(select)} FROM {table(self.source, self.model.dialect)} f"
         if self.joins:
             sql += " " + " ".join(self.joins)
         if where:
@@ -388,13 +485,18 @@ class FactScope:
 
 
 def binary_sql(
-    expression: BinaryExpression, left: str, right: str, zero_division: str
+    expression: BinaryExpression,
+    left: str,
+    right: str,
+    zero_division: str,
+    dialect: str = "postgres",
 ) -> str:
     if expression.operator == "divide":
         denominator = (
             f"NULLIF(({right}), 0)" if zero_division == "null" else f"({right})"
         )
-        return f"(CAST(({left}) AS NUMERIC) / {denominator})"
+        numerator = f"({left})" if dialect == "mysql" else f"CAST(({left}) AS NUMERIC)"
+        return f"({numerator} / {denominator})"
     operator = {"add": "+", "subtract": "-", "multiply": "*"}[expression.operator]
     return f"(({left}) {operator} ({right}))"
 
@@ -417,6 +519,7 @@ def _compile_source(
         metric.metric_id: f"m{index}" for index, metric in enumerate(atomics)
     }
     ctes: list[str] = []
+    atomic_sql: dict[str, str] = {}
     scopes: list[FactScope] = []
     output_dimensions: list[str] = []
     for metric in atomics:
@@ -424,6 +527,7 @@ def _compile_source(
         sql, output_dimensions = scope.compile()
         scopes.append(scope)
         ctes.append(f"{atomic_aliases[metric.metric_id]} AS ({sql})")
+        atomic_sql[atomic_aliases[metric.metric_id]] = sql
 
     atomic_currencies = {
         scope.metric.metric_id: scope.currency_scope for scope in scopes
@@ -487,6 +591,7 @@ def _compile_source(
                     emit(expression.left),
                     emit(expression.right),
                     metric.zero_division,
+                    model.dialect,
                 )
             fail(
                 "INVALID_COMPOSITE", "Composite expressions cannot reference row fields"
@@ -495,14 +600,34 @@ def _compile_source(
         return emit(metric.expression)
 
     selection = [
-        f"k.d{index} AS {quote(dimension)}"
+        f"k.d{index} AS {quote(dimension, model.dialect)}"
         for index, dimension in enumerate(output_dimensions)
     ]
     selection += [
-        f"{metric_sql(metric_id)} AS {quote(metric_id)}"
+        f"{metric_sql(metric_id)} AS {quote(metric_id, model.dialect)}"
         for metric_id in request.metric_ids
     ]
-    if output_dimensions:
+    if model.dialect == "mysql":
+        if output_dimensions:
+            keys = ", ".join(f"d{index}" for index in range(len(output_dimensions)))
+            # 5.7 has no CTEs. Each aggregate is independently scoped; repeating
+            # derived SQL preserves bound parameter identity without interpolation.
+            group_keys = " UNION ".join(
+                f"SELECT {keys} FROM ({query}) g{index}"
+                for index, query in enumerate(atomic_sql.values())
+            )
+            from_sql = f"({group_keys}) k"
+            for alias, query in atomic_sql.items():
+                condition = " AND ".join(
+                    f"k.d{index} <=> {alias}.d{index}"
+                    for index in range(len(output_dimensions))
+                )
+                from_sql += f" LEFT JOIN ({query}) {alias} ON {condition}"
+        else:
+            from_sql = " CROSS JOIN ".join(
+                f"({query}) {alias}" for alias, query in atomic_sql.items()
+            )
+    elif output_dimensions:
         keys = ", ".join(f"d{index}" for index in range(len(output_dimensions)))
         ctes.append(
             "group_keys AS ("
@@ -520,7 +645,8 @@ def _compile_source(
             from_sql += f" LEFT JOIN {alias} ON {condition}"
     else:
         from_sql = " CROSS JOIN ".join(atomic_aliases.values())
-    sql = "WITH " + ", ".join(ctes) + f" SELECT {', '.join(selection)} FROM {from_sql}"
+    prefix = "WITH " + ", ".join(ctes) + " " if model.dialect == "postgres" else ""
+    sql = prefix + f"SELECT {', '.join(selection)} FROM {from_sql}"
     ordering = [(item.field_id, item.direction.upper()) for item in request.order_by]
     ordered_fields = {item[0] for item in ordering}
     ordering += [
@@ -529,10 +655,16 @@ def _compile_source(
         if dimension not in ordered_fields
     ]
     if ordering:
-        sql += " ORDER BY " + ", ".join(
-            f"{quote(field_id)} {direction} NULLS LAST"
-            for field_id, direction in ordering
-        )
+        if model.dialect == "mysql":
+            sql += " ORDER BY " + ", ".join(
+                f"{quote(field_id, model.dialect)} IS NULL ASC, {quote(field_id, model.dialect)} {direction}"
+                for field_id, direction in ordering
+            )
+        else:
+            sql += " ORDER BY " + ", ".join(
+                f"{quote(field_id)} {direction} NULLS LAST"
+                for field_id, direction in ordering
+            )
     sql += f" LIMIT {parameters.bind(request.limit)}"
     used_sources = tuple(sorted(set().union(*(scope.used_sources for scope in scopes))))
     return Plan(
@@ -570,7 +702,20 @@ def _compile_source(
             if request.time
             else {"all_time": True},
             "group_set": "union",
-            "null_group_match": "is_not_distinct_from",
+            "null_group_match": "<=>"
+            if model.dialect == "mysql"
+            else "is_not_distinct_from",
+            **(
+                {
+                    "mysql_session": {
+                        "time_zone": "+00:00",
+                        "div_precision_increment": 30,
+                        "transaction": "REPEATABLE READ READ ONLY",
+                    }
+                }
+                if model.dialect == "mysql"
+                else {}
+            ),
         },
     )
 

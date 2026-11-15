@@ -16,11 +16,16 @@ import { ButtonTheme } from '@/enums/button';
 import {
 	canTransitionRevision,
 	downloadJson,
+	modelTemplate,
 	newModel,
 	prepareDraftImport,
 } from '@/lib/governedMetrics';
-import exampleModel from '@/lib/examples/ordersMetricModel.json';
-import type { GovernedModel, ModelDetail, ModelRevision } from '@/types/governedMetrics';
+import type {
+	GovernedModel,
+	MetricDialect,
+	ModelDetail,
+	ModelRevision,
+} from '@/types/governedMetrics';
 import { Field, inputClass, panelClass, SelectField } from './MetricFields';
 import { ModelEditor } from './ModelEditor';
 import { MetricQueryPanel } from './MetricQueryPanel';
@@ -423,6 +428,7 @@ export const MetricsWorkspace = () => {
 		: false;
 	const queryClient = useQueryClient();
 	const fileRef = useRef<HTMLInputElement>(null);
+	const [dialect, setDialect] = useState<MetricDialect>('postgres');
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [creating, setCreating] = useState<GovernedModel | null>(null);
 	const [dirty, setDirty] = useState(false);
@@ -490,14 +496,28 @@ export const MetricsWorkspace = () => {
 					<div>
 						<h1 className="text-lg font-semibold">Governed metrics</h1>
 						<p className="mt-1 text-xs text-secondary">
-							Catalog bindings · versioned definitions · certified PostgreSQL queries
+							Catalog bindings · versioned definitions · certified SQL queries
 						</p>
 					</div>
 				</div>
 				<div className="flex flex-wrap gap-2">
+					<SelectField
+						label="New model / template engine"
+						value={dialect}
+						options={[
+							{ value: 'postgres', label: 'PostgreSQL' },
+							{ value: 'mysql', label: 'MySQL 5.7' },
+						]}
+						onChange={(value) => setDialect(value as MetricDialect)}
+					/>
 					<Button
 						theme={ButtonTheme.Secondary}
-						onClick={() => downloadJson('orders-metric-template.json', exampleModel)}
+						onClick={() =>
+							downloadJson(
+								`${dialect}-orders-metric-template.json`,
+								modelTemplate(dialect),
+							)
+						}
 					>
 						Download example template
 					</Button>
@@ -525,7 +545,7 @@ export const MetricsWorkspace = () => {
 							<Button
 								disabled={dirty || importing}
 								onClick={() => {
-									setCreating(newModel());
+									setCreating(newModel(dialect));
 									setSelectedId(null);
 									setDirty(true);
 									setNotice('');
@@ -653,9 +673,9 @@ export const MetricsWorkspace = () => {
 									uses the active revision and parameterized SQL.
 								</p>
 								<p className="text-sm text-secondary">
-									Supported scope: PostgreSQL, one fact source per query, safe
-									dimensional joins, explicit time ranges, and currency-aware
-									metrics.
+									Supported scope: PostgreSQL and MySQL 5.7 (InnoDB), one fact
+									source per query, safe dimensional joins, explicit time ranges,
+									and currency-aware metrics.
 								</p>
 							</div>
 						)}

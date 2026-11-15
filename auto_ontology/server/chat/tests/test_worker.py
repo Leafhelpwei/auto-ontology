@@ -5,7 +5,9 @@
 """Tests for the prewarmed chat worker's request loop."""
 
 from typing import Any
+import signal
 
+import pytest
 from pytest import MonkeyPatch
 
 from auto_ontology.server.chat import worker as worker_module
@@ -122,3 +124,38 @@ def test_worker_forwards_evidence_without_changing_question(
     assert payload["question"] == "q"
     assert payload["processing_question"] == "q"
     assert payload["evidence"] == "status means accounts.status"
+
+
+def test_worker_entrypoint_installs_cleanup_only_in_child(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        worker_module.signal, "signal", lambda *args: calls.append(args)
+    )
+    monkeypatch.setattr(
+        worker_module, "_metrics_worker_loop", lambda *args: calls.append(args)
+    )
+    incoming, outgoing = _FakeQueue(), _FakeQueue()
+    worker_module._worker_entrypoint(incoming, outgoing, "metrics")
+    assert calls == [
+        (signal.SIGTERM, worker_module._terminate_worker),
+        (incoming, outgoing),
+    ]
+
+
+def test_worker_sigterm_cancels_mysql_before_exiting(monkeypatch: MonkeyPatch) -> None:
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        "auto_ontology.connectors.mysql.cancel_active_mysql_queries",
+        lambda: calls.append("cancel"),
+    )
+
+    def exit_worker(code: int) -> None:
+        calls.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(worker_module.os, "_exit", exit_worker)
+    with pytest.raises(SystemExit):
+        worker_module._terminate_worker(signal.SIGTERM, None)
+    assert calls == ["cancel", 128 + signal.SIGTERM]

@@ -849,7 +849,9 @@ async def chat_cancel(conversation_id: UUID, request: Request) -> dict[str, bool
     partial-stream behavior. The slot remains unavailable while terminal
     persistence is unfinished, so a subsequent question cannot consume a late
     assistant result. PostgreSQL 14+ detects the dead client during execution;
-    older versions retain the governed statement-timeout bound.
+    older versions retain the governed statement-timeout bound. MySQL workers
+    request same-account KILL CONNECTION before exiting; the server timeout
+    remains a fallback when cancellation cannot reach the database.
     """
 
     user_id = resolve_internal_user(request, required=True)

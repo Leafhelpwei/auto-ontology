@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
 import json
+import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import (
@@ -83,14 +84,50 @@ def source_semantics(source: SourceBinding) -> tuple[object, ...]:
     return tuple(sorted(source.grain)), tuple(sorted(normalized))
 
 
-def output_identifier(identifier: str) -> None:
+def storage_timezone(name: str) -> tzinfo:
+    """Resolve declared wall-clock storage; never infer a server/session zone."""
+    if re.fullmatch(r"[+-]\d{2}:\d{2}", name):
+        hours, minutes = int(name[1:3]), int(name[4:6])
+        offset = (hours * 60 + minutes) * (-1 if name[0] == "-" else 1)
+        if minutes > 59 or not -779 <= offset <= 780:
+            fail(
+                "INVALID_TIMEZONE",
+                "MySQL 5.7 offsets must be between -12:59 and +13:00",
+            )
+        return timezone(timedelta(minutes=offset))
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        fail("INVALID_TIMEZONE", f"Unknown storage timezone: {name}")
+
+
+def output_identifier(identifier: str, dialect: str = "postgres") -> None:
     # PostgreSQL truncates longer identifiers even when quoted, potentially
     # collapsing distinct metric names into the same result column.
-    if len(identifier.encode("utf-8")) > 63:
+    if (
+        len(identifier) > 64
+        if dialect == "mysql"
+        else len(identifier.encode("utf-8")) > 63
+    ):
         fail(
             "IDENTIFIER_TOO_LONG",
-            f"Output identifier exceeds PostgreSQL's 63-byte limit: {identifier}",
+            f"Output identifier exceeds the {dialect} identifier limit: {identifier}",
         )
+    if dialect == "mysql" and (
+        "%(" in identifier or any(ord(char) > 0xFFFF for char in identifier)
+    ):
+        fail(
+            "INVALID_IDENTIFIER",
+            "MySQL identifiers cannot contain driver placeholders or supplementary Unicode characters",
+        )
+
+
+def _has_division(expression: Expression | None) -> bool:
+    return isinstance(expression, BinaryExpression) and (
+        expression.operator == "divide"
+        or _has_division(expression.left)
+        or _has_division(expression.right)
+    )
 
 
 def metric_closure(model: GovernedModel, metric_ids: tuple[str, ...]) -> list[Metric]:
@@ -385,7 +422,20 @@ def _validate_model(model: GovernedModel) -> None:
             [dimension.dimension_id for dimension in source.dimensions], "Dimension IDs"
         )
         for dimension in source.dimensions:
-            output_identifier(dimension.dimension_id)
+            output_identifier(dimension.dimension_id, model.dialect)
+        for field in source.fields:
+            if field.datetime_timezone is not None:
+                if model.dialect != "mysql" or field.data_type != "datetime":
+                    fail(
+                        "INVALID_STORAGE_TIMEZONE",
+                        "datetime_timezone is only supported for MySQL datetime fields",
+                    )
+                storage_timezone(field.datetime_timezone)
+            elif model.dialect == "mysql" and field.data_type == "datetime":
+                fail(
+                    "DATETIME_TIMEZONE_REQUIRED",
+                    f"Field {field.field_id} requires an explicit datetime_timezone",
+                )
         _unique(list(source.grain), "Grain fields")
         if not source.grain or not set(source.grain) <= fields(source).keys():
             fail(
@@ -400,12 +450,17 @@ def _validate_model(model: GovernedModel) -> None:
             if (
                 not identifier
                 or "\x00" in identifier
-                or len(identifier.encode("utf-8")) > 63
+                or (
+                    len(identifier) > 64
+                    if model.dialect == "mysql"
+                    else len(identifier.encode("utf-8")) > 63
+                )
             ):
                 fail(
                     "INVALID_IDENTIFIER",
-                    "Physical identifiers must be nonempty, at most 63 UTF-8 bytes, and contain no NUL",
+                    "Physical identifiers must be nonempty, fit the dialect's identifier limit, and contain no NUL",
                 )
+            output_identifier(identifier, model.dialect)
         for predicate in source.required_filters:
             if predicate.field.source_id != source.source_id:
                 fail(
@@ -464,7 +519,16 @@ def _validate_model(model: GovernedModel) -> None:
                 )
             validate_predicate(model, predicate)
     for metric in model.metrics:
-        output_identifier(metric.metric_id)
+        output_identifier(metric.metric_id, model.dialect)
+        if (
+            model.dialect == "mysql"
+            and metric.zero_division == "error"
+            and _has_division(metric.expression)
+        ):
+            fail(
+                "UNSUPPORTED_ZERO_DIVISION",
+                "MySQL SELECT division cannot guarantee zero_division=error; use the explicit null policy",
+            )
         if not metric.source_ids or not set(metric.source_ids) <= sources.keys():
             fail("UNKNOWN_SOURCE", f"Invalid sources for {metric.metric_id}")
         _unique(list(metric.source_ids), "Metric source IDs")
@@ -687,6 +751,15 @@ def validate_query(model: GovernedModel, request: MetricQueryRequest) -> list[Me
         fail(
             "OUTPUT_CONFLICT", "Output identifiers must be distinct; __time is reserved"
         )
+    if model.dialect == "mysql":
+        outputs = [
+            item.casefold() for item in (*request.metric_ids, *request.dimensions)
+        ]
+        if len(outputs) != len(set(outputs)) or "__time" in outputs:
+            fail(
+                "OUTPUT_CONFLICT",
+                "MySQL output identifiers must be distinct ignoring case; __time is reserved",
+            )
     closure = metric_closure(model, request.metric_ids)
     for metric in closure:
         if not set(request.dimensions) <= set(metric.supported_dimensions):

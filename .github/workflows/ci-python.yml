@@ -18,6 +18,10 @@ on:
       - 'alembic/**'
       - 'pyproject.toml'
       - 'uv.lock'
+      - 'frontend/prisma/**'
+      - 'frontend/prisma.config.ts'
+      - 'frontend/package.json'
+      - 'frontend/pnpm-lock.yaml'
       - '.github/workflows/ci-python.yml'
 
 jobs:
@@ -94,7 +98,7 @@ jobs:
           provenance: false
 
   tests:
-    name: Pytest (with Postgres fixtures)
+    name: Pytest (with Postgres and MySQL 5.7 fixtures)
     runs-on: ubuntu-latest
 
     # pgvector, not plain postgres: the vector store creates its collections
@@ -115,6 +119,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      mysql57:
+        image: mysql:5.7.44
+        env:
+          MYSQL_ROOT_PASSWORD: fixture_root
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: auto_ontology_mysql57
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pfixture_root"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
 
     env:
       POSTGRES_HOST: localhost
@@ -122,6 +139,15 @@ jobs:
       POSTGRES_USER: auto_ontology
       POSTGRES_PASSWORD: auto_ontology
       POSTGRES_DATABASE: auto_ontology
+      AUTO_ONTOLOGY_GOVERNED_TEST_DSN: postgresql://auto_ontology:auto_ontology@localhost:5432/auto_ontology
+      AUTO_ONTOLOGY_MYSQL57_ADMIN_DSN: mysql://root:fixture_root@127.0.0.1:3306/auto_ontology_mysql57
+      AUTO_ONTOLOGY_MYSQL57_TEST_DSN: mysql://metrics_ro:fixture_read@127.0.0.1:3306/auto_ontology_mysql57
+      AUTO_ONTOLOGY_LIVE_MYSQL: '1'
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: '3306'
+      MYSQL_USER: metrics_ro
+      MYSQL_PASSWORD: fixture_read
+      MYSQL_DATABASE: auto_ontology_mysql57
 
     steps:
       - name: Checkout
@@ -143,6 +169,29 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra kumo
 
+      - name: Prepare a SELECT-only MySQL fixture account
+        run: |
+          uv run --no-sync python - <<'PY'
+          import mysql.connector
+          with mysql.connector.connect(host="127.0.0.1", user="root", password="fixture_root") as conn:
+              cursor = conn.cursor()
+              cursor.execute("ALTER DATABASE auto_ontology_mysql57 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+              cursor.execute("SET GLOBAL time_zone = '+00:00'")
+              cursor.execute("CREATE USER 'metrics_ro'@'%' IDENTIFIED BY 'fixture_read'")
+              cursor.execute("GRANT SELECT ON auto_ontology_mysql57.* TO 'metrics_ro'@'%'")
+              cursor.execute("CREATE TABLE auto_ontology_mysql57.connector_fixture (id BIGINT PRIMARY KEY, label VARCHAR(64)) ENGINE=InnoDB")
+              cursor.close()
+          PY
+
+      - name: Set up Node for the authenticated Chat schema
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install the locked frontend dependencies
+        working-directory: frontend
+        run: npx --yes pnpm@10.34.3 install --frozen-lockfile
+
       # Everything below is the documented local setup from
       # dev_tools/fixtures/sql/README.md, in the same order. No credentials:
       # the fixture SQL is committed, and the graph fixture is hand-authored with embedding
@@ -152,6 +201,10 @@ jobs:
 
       - name: Migrate the Auto Ontology schema
         run: uv run --no-sync alembic upgrade head
+
+      - name: Prepare the Prisma-owned frontend schema
+        working-directory: frontend
+        run: npx --yes pnpm@10.34.3 db:push
 
       - name: Seed the deterministic graph fixture
         env:
@@ -173,17 +226,16 @@ jobs:
         run: uv run --no-sync pytest auto_ontology dev_tools -q --durations=10
 
       # A skip guard naming the wrong dependency turns a suite off silently and
-      # still reports green -- which is how the golden replay and the live
-      # connector tests sat unrun. Only the two live-warehouse tests
-      # (AUTO_ONTOLOGY_LIVE_DATABRICKS / AUTO_ONTOLOGY_LIVE_MYSQL) may skip here.
+      # still reports green. PostgreSQL and real MySQL 5.7 now run here;
+      # only the separately configured live Databricks test may skip.
       - name: Fail if the fixture-backed tests silently skipped
         run: |
           skipped=$(uv run --no-sync pytest auto_ontology dev_tools -q -rs 2>/dev/null \
             | grep -c '^SKIPPED' || true)
           echo "skipped: $skipped"
-          if [ "$skipped" -gt 2 ]; then
-            echo "::error::$skipped tests skipped; expected at most 2 (live" \
-                 "Databricks and MySQL). A fixture is probably unreachable, so" \
+          if [ "$skipped" -gt 1 ]; then
+            echo "::error::$skipped tests skipped; expected at most 1 (live" \
+                 "Databricks). A fixture is probably unreachable, so" \
                  "this run proved less than it appears to."
             uv run --no-sync pytest auto_ontology dev_tools -q -rs 2>/dev/null \
               | grep '^SKIPPED' || true

@@ -10,7 +10,6 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import date, datetime
 from decimal import Decimal
@@ -18,12 +17,10 @@ from uuid import UUID
 import math
 
 import pandas as pd
-from psycopg import sql as pg_sql
 from typing import Any
 
 from sqlalchemy import select
 
-from auto_ontology.connectors.postgres import PostgresDatabase
 from auto_ontology.connectors.registry import get_connectors
 from auto_ontology.dal import governed_models as dal
 from auto_ontology.dal import schema as s
@@ -38,13 +35,22 @@ from auto_ontology.semantic.contracts.models import (
     ValidationReport,
 )
 from auto_ontology.semantic.contracts.validator import validate_model
+from auto_ontology.server.metrics.source_adapters import (
+    MySQLSourceAdapter,
+    SourceConnector,
+    SourceReader,
+    adapter_for,
+    connector_adapter,
+    normalize_dialect,
+    source_transaction,
+)
 
 
 @dataclass
 class CatalogState:
     fingerprint: str
     database_names: dict[str, str]
-    connectors: dict[str, PostgresDatabase]
+    connectors: dict[str, SourceConnector]
 
 
 def enabled() -> bool:
@@ -69,80 +75,26 @@ def _require(condition: bool, code: str, message: str) -> None:
         raise ContractError(code, message)
 
 
-def _data_type(value: str | None) -> str | None:
-    value = (value or "").lower()
-    if "[]" in value:
-        return None
-    if value.startswith(
-        (
-            "numeric",
-            "decimal",
-            "smallint",
-            "integer",
-            "bigint",
-            "real",
-            "double precision",
-            "int2",
-            "int4",
-            "int8",
-            "float",
-        )
-    ):
-        return "number"
-    if value.startswith(("character", "varchar", "text", "name", "uuid")):
-        return "string"
-    if value in {"boolean", "bool"}:
-        return "boolean"
-    if value == "date":
-        return "date"
-    if value == "timestamptz" or (
-        value.startswith("timestamp") and value.endswith(" with time zone")
-    ):
-        return "datetime"
-    return None
-
-
 def _unique(keys: list[str], unique_sets: list[list[str]]) -> bool:
     return any(set(key) == set(keys) and len(key) == len(keys) for key in unique_sets)
-
-
-_COLUMNS_SQL = """
-SELECT a.attname AS name, pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-       NOT a.attnotnull AS nullable
-FROM pg_catalog.pg_attribute a
-JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = %(schema)s AND c.relname = %(table)s
-  AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY a.attnum
-"""
-_UNIQUE_SQL = """
-SELECT array_agg(a.attname ORDER BY k.ordinality) AS columns
-FROM pg_catalog.pg_index i
-JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
-JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-WHERE n.nspname = %(schema)s AND c.relname = %(table)s
-  AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
-  AND k.ordinality <= i.indnkeyatts
-GROUP BY i.indexrelid ORDER BY i.indexrelid
-"""
 
 
 def catalog_state(
     model: GovernedModel,
     *,
     live: bool = False,
-    readers: dict[str, Callable] | None = None,
+    readers: dict[str, SourceReader] | None = None,
 ) -> CatalogState:
-    """Resolve every binding by actual Catalog ID; certification also probes PG.
+    """Resolve Catalog IDs and inspect each supported physical business source.
 
-    A source name is never accepted as authority to choose a database or table.
-    The PG structural fingerprint catches out-of-band DDL before the next ingest.
-    Current Auto Ontology gives catalog readers global catalog visibility; zones
-    are organizational filters, not account grants (see the trusted gateway).
+    MySQL always inspects the real source because Catalog's DATA_TYPE/individual
+    is_unique fields cannot establish full column precision or composite indexes.
+    PostgreSQL keeps its previous static-draft behavior and fingerprint format.
+    Current Auto Ontology grants catalog readers global visibility; zones are
+    organizational filters rather than account grants.
     """
+    adapter = adapter_for(model.dialect)
+    inspect_live = live or model.dialect == "mysql"
     table_ids = [source.catalog_table_id for source in model.sources]
     table_rows = store().query_read(
         select(
@@ -183,8 +135,9 @@ def catalog_state(
     names: dict[str, str] = {}
     snapshots: list[dict[str, Any]] = []
     unique_by_source: dict[str, list[list[str]]] = {}
-    connectors: dict[str, PostgresDatabase] = {}
-    available = get_connectors() if live else None
+    physical_by_source: dict[str, dict[str, dict[str, Any]]] = {}
+    connectors: dict[str, SourceConnector] = {}
+    available = get_connectors() if inspect_live else None
     for source in model.sources:
         table = tables.get(source.catalog_table_id)
         _require(
@@ -200,10 +153,8 @@ def catalog_state(
             "BINDING_MISMATCH",
             f"Source {source.source_id}: names/datasource do not match the Catalog IDs",
         )
-        # Older ingests omitted catalog_database.dialect. Resolve that legacy
-        # gap against a unique real connector, never from the submitted model
-        # or a table name. Known non-PostgreSQL dialects remain unsupported.
-        if table["dialect"] is None:
+        connector = None
+        if inspect_live or table["dialect"] is None:
             if available is None:
                 available = get_connectors()
             matches = [
@@ -212,25 +163,44 @@ def catalog_state(
                 if candidate.database_name == table["database_name"]
             ]
             _require(
-                len(matches) == 1 and isinstance(matches[0], PostgresDatabase),
+                len(matches) == 1,
                 "CONNECTION_UNAVAILABLE",
-                "A unique configured PostgreSQL connection is required to resolve a legacy Catalog dialect",
+                "A unique configured connector must match the Catalog database",
             )
-            table = {**table, "dialect": "postgres"}
+            connector = matches[0]
+            actual_adapter = connector_adapter(connector)
+            _require(
+                actual_adapter.dialect == adapter.dialect,
+                "DIALECT_MISMATCH",
+                "The governed model dialect does not match the real database connector",
+            )
+            if table["dialect"] is None:
+                # Preserve the legacy PG fallback's exact fingerprint shape.
+                table = {**table, "dialect": actual_adapter.dialect}
         _require(
-            table["dialect"] in {"postgres", "postgresql"},
-            "UNSUPPORTED_DIALECT",
-            "Governed queries currently require PostgreSQL",
+            normalize_dialect(table["dialect"]) == adapter.dialect,
+            "DIALECT_MISMATCH",
+            "The governed model dialect does not match the Catalog database",
         )
+        if adapter.dialect == "mysql":
+            _require(
+                source.schema_name == table["database_name"],
+                "BINDING_MISMATCH",
+                "MySQL schema_name must identify the configured business database",
+            )
         names[source.datasource_id] = table["database_name"]
         source_columns = sorted(
-            (row for row in columns if row["table_id"] == source.catalog_table_id),
+            (
+                column
+                for column in columns
+                if column["table_id"] == source.catalog_table_id
+            ),
             key=lambda row: row["id"],
         )
-        by_id = {row["id"]: row for row in source_columns}
+        by_id = {column["id"]: column for column in source_columns}
         unique_sets = [table["pk"]] if table["pk"] else []
         unique_sets.extend(
-            [[row["name"]] for row in source_columns if row["is_unique"]]
+            [[column["name"]] for column in source_columns if column["is_unique"]]
         )
         for field in source.fields:
             column = by_id.get(field.catalog_column_id)
@@ -240,20 +210,7 @@ def catalog_state(
                 f"Source {source.source_id}: field {field.field_id} does not match its Catalog column",
             )
             assert column is not None
-            _require(
-                not (
-                    field.data_type == "datetime"
-                    and (column["data_type"] or "").lower().startswith("timestamp")
-                    and _data_type(column["data_type"]) is None
-                ),
-                "NAIVE_TIMESTAMP_UNSUPPORTED",
-                f"Field {field.field_id}: datetime requires PostgreSQL timestamp with time zone; naive timestamps need explicit source-timezone support",
-            )
-            _require(
-                _data_type(column["data_type"]) == field.data_type,
-                "TYPE_MISMATCH",
-                f"Source {source.source_id}: field {field.field_id} type differs from Catalog",
-            )
+            adapter.validate_field(field, column["data_type"])
             _require(
                 field.nullable or column["is_nullable"] is False,
                 "NULLABILITY_MISMATCH",
@@ -264,58 +221,55 @@ def catalog_state(
             "table": table,
             "columns": source_columns,
         }
-        if live:
-            assert available is not None
-            matches = [
-                candidate
-                for candidate in available
-                if candidate.database_name == table["database_name"]
-            ]
-            _require(
-                len(matches) == 1 and isinstance(matches[0], PostgresDatabase),
-                "CONNECTION_UNAVAILABLE",
-                "A unique configured PostgreSQL connection must match the Catalog database",
-            )
-            connector = matches[0]
+        nullable_by_name = {
+            column["name"]: column["is_nullable"] is not False
+            for column in source_columns
+        }
+        if inspect_live:
+            assert connector is not None
             connectors[source.datasource_id] = connector
-            parameters = {"schema": source.schema_name, "table": source.table_name}
-            execute_source = (readers or {}).get(source.datasource_id)
-            live_frame = (
-                execute_source(_COLUMNS_SQL, parameters)
-                if execute_source
-                else connector.execute(_COLUMNS_SQL, parameters, timeout_s=10)
-            )
-            live_columns = live_frame.to_dict("records")
+            read = (readers or {}).get(source.datasource_id)
+            if read is None:
+                with source_transaction(connector, timeout_s=10) as scoped_read:
+                    adapter.lock(scoped_read, source)
+                    structure = adapter.inspect(scoped_read, source)
+            else:
+                structure = adapter.inspect(read, source)
             _require(
-                bool(live_columns),
+                bool(structure.columns),
                 "SOURCE_CHANGED",
                 f"Source {source.source_id}: physical table does not exist",
             )
-            live_by_name = {row["name"]: row for row in live_columns}
+            live_by_name = {column["name"]: column for column in structure.columns}
+            physical_by_source[source.source_id] = live_by_name
             for field in source.fields:
                 physical = live_by_name.get(field.column_name)
                 _require(
-                    physical is not None
-                    and _data_type(physical["data_type"]) == field.data_type,
+                    physical is not None,
                     "SOURCE_CHANGED",
-                    f"Source {source.source_id}: physical column/type changed",
+                    f"Source {source.source_id}: physical column disappeared",
                 )
                 assert physical is not None
+                adapter.validate_field(field, physical["data_type"], physical=True)
                 _require(
                     field.nullable or not physical["nullable"],
                     "SOURCE_CHANGED",
                     f"Source {source.source_id}: non-null guarantee changed",
                 )
-            unique_frame = (
-                execute_source(_UNIQUE_SQL, parameters)
-                if execute_source
-                else connector.execute(_UNIQUE_SQL, parameters, timeout_s=10)
-            )
-            unique_sets = [
-                list(row["columns"]) for row in unique_frame.to_dict("records")
-            ]
-            snapshot["physical_columns"] = live_columns
+            unique_sets = structure.unique_keys
+            nullable_by_name = {
+                column["name"]: column["nullable"] for column in structure.columns
+            }
+            snapshot["physical_columns"] = structure.columns
             snapshot["physical_unique_keys"] = sorted(unique_sets)
+            if structure.properties is not None:
+                snapshot["physical_properties"] = structure.properties
+            _require(
+                not source.structure_fingerprint
+                or source.structure_fingerprint == _hash(snapshot),
+                "SOURCE_CHANGED",
+                f"Source {source.source_id}: supplied structure fingerprint does not match its physical database",
+            )
         by_field = {field.field_id: field.column_name for field in source.fields}
         grain = [by_field.get(field_id, "") for field_id in source.grain]
         _require(
@@ -323,20 +277,6 @@ def catalog_state(
             "UNPROVEN_GRAIN",
             f"Source {source.source_id}: grain must match a complete physical unique key",
         )
-        nullable_by_name = {
-            column["name"]: column["is_nullable"] is not False
-            for column in source_columns
-        }
-        if live:
-            nullable_by_name = {
-                column["name"]: column["nullable"] for column in live_columns
-            }
-            _require(
-                not source.structure_fingerprint
-                or source.structure_fingerprint == _hash(snapshot),
-                "SOURCE_CHANGED",
-                f"Source {source.source_id}: supplied structure fingerprint does not match PostgreSQL",
-            )
         _require(
             all(not nullable_by_name.get(name, True) for name in grain),
             "UNPROVEN_GRAIN",
@@ -351,6 +291,32 @@ def catalog_state(
             target is not None, "UNKNOWN_SOURCE", "Relationship target does not exist"
         )
         assert target is not None
+        if model.dialect == "mysql":
+            assert isinstance(adapter, MySQLSourceAdapter)
+            origin = sources.get(relationship.source_id)
+            _require(
+                origin is not None,
+                "UNKNOWN_SOURCE",
+                "Relationship source does not exist",
+            )
+            assert origin is not None
+            origin_fields = {field.field_id: field for field in origin.fields}
+            target_fields = {field.field_id: field for field in target.fields}
+            for key in relationship.keys:
+                left = origin_fields.get(key.source_field_id)
+                right = target_fields.get(key.target_field_id)
+                _require(
+                    left is not None and right is not None,
+                    "UNKNOWN_FIELD",
+                    "Relationship join fields must be registered",
+                )
+                assert left is not None and right is not None
+                adapter.validate_join_key(
+                    physical_by_source[origin.source_id][left.column_name],
+                    physical_by_source[target.source_id][right.column_name],
+                    left,
+                    right,
+                )
         fields = {field.field_id: field.column_name for field in target.fields}
         keys = [fields.get(key.target_field_id, "") for key in relationship.keys]
         _require(
@@ -514,7 +480,7 @@ def _check_certificate(
     model: GovernedModel,
     row: dict[str, Any],
     *,
-    readers: dict[str, Callable] | None = None,
+    readers: dict[str, SourceReader] | None = None,
 ) -> CatalogState:
     certificate = row.get("certification")
     _require(
@@ -613,6 +579,8 @@ def serialize_frame(frame: pd.DataFrame) -> dict[str, Any]:
         encoding = (
             "decimal-string"
             if any(isinstance(value, Decimal) for value in values)
+            or frame.attrs.get("postgres_types", {}).get(column) == 1700
+            or frame.attrs.get("mysql_types", {}).get(column) in {0, 246}
             else "integer-string"
             if any(
                 isinstance(value, int)
@@ -626,6 +594,8 @@ def serialize_frame(frame: pd.DataFrame) -> dict[str, Any]:
             {
                 "name": column,
                 "postgres_type_oid": frame.attrs.get("postgres_types", {}).get(column),
+                "dialect": frame.attrs.get("dialect", "postgres"),
+                "mysql_type_code": frame.attrs.get("mysql_types", {}).get(column),
                 "json_encoding": encoding,
             }
         )
@@ -650,7 +620,7 @@ def execute(
         with ExitStack() as stack:
             readers = {
                 datasource_id: stack.enter_context(
-                    connector.read_transaction(timeout_s=30)
+                    source_transaction(connector, timeout_s=30)
                 )
                 for datasource_id, connector in sorted(state.connectors.items())
             }
@@ -666,12 +636,7 @@ def execute(
                     source.table_name,
                 ),
             ):
-                lock = (
-                    pg_sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE")
-                    .format(pg_sql.Identifier(source.schema_name, source.table_name))
-                    .as_string()
-                )
-                readers[source.datasource_id](lock, None)
+                adapter_for(model.dialect).lock(readers[source.datasource_id], source)
             _check_certificate(model, row, readers=readers)
             frame = readers[plan.datasource_id](plan.sql, plan.params)
         return {

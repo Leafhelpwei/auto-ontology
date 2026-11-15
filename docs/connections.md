@@ -57,6 +57,24 @@ The URL scheme selects the connector:
 The registry lives in
 [`auto_ontology/connectors/registry.py`](../auto_ontology/connectors/registry.py).
 
+## MySQL 5.7 business sources
+
+Choose **MySQL** in Settings → Connections and enter host, port (usually `3306`),
+user, password and the business database. Alternatively, set a URL such as
+`mysql://ontology_reader:ENCODED_PASSWORD@mysql-host:3306/sales` in
+`CONNECTION_STRINGS`. Percent-encode reserved characters in URL credentials.
+The MySQL connector extracts tables from the selected database; in metric source
+bindings `schema_name` is that database name, and `datasource_id` is the Catalog
+**database ID**, not its name or connection URL.
+
+Governed metrics support MySQL 5.7 InnoDB base tables with validated complete
+unique keys. Use a read-only business account; the service also establishes a
+read-only transaction, session UTC timezone and query timeout. DATETIME storage
+timezones must be declared in the model. See [the MySQL 5.7 guide](mysql57.md)
+for permissions, time semantics, supported SQL and verification commands.
+The application store, Catalog, authentication and pgvector continue to use
+PostgreSQL; `DATABASE_URL` / `POSTGRES_*` do not become MySQL settings.
+
 ## Vault
 
 Vault is off by default. It turns on only when all four of these are set:

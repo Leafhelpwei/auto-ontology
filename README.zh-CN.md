@@ -60,7 +60,7 @@ Agent 已经能够检索文档、查询数据库，但数据分析的价值取�
 
 - **结构化定义**：定义指标、数据来源和关联关系，明确计算表达式、过滤条件、维度、时间口径、粒度和币种。
 - **版本与认证**：保存不可变修订版，记录审核依据，经过校验、认证后激活。首版以整个模型快照为认证和发布单元。
-- **确定性 PostgreSQL 查询**：从结构化请求生成参数化 SQL，返回来源、过滤、关联和指标口径等查询依据，并执行只读查询。
+- **确定性 PostgreSQL / MySQL 5.7 查询**：从结构化请求生成参数化 SQL，返回来源、过滤、关联和指标口径等查询依据，并执行只读查询。
 - **自然语言解析与澄清**：将问题解析为受约束的结构化请求；信息不足时要求澄清，工作台解析成功后由用户执行。
 - **Chat 标准指标模式**：选择已激活模型后，可连续提问、回答澄清并查看结果与查询依据。会话保留指标请求及模型版本，复用同一校验、编译和执行服务；拒绝时不会自动转为探索性 SQL。
 - **历史 SQL 上下文保留**：保留候选 SQL 的完整查询上下文；修改 SQLAttribute 的语义内容后清除旧认证。
@@ -80,7 +80,9 @@ docker compose up -d --no-deps --force-recreate auto-ontology
 
 普通 `docker compose restart` 不会加载新的环境变量。首次安装使用下文的完整构建流程；从旧版本升级时，应先按指南备份元数据、执行迁移，并构建本分支镜像。Helm 的 `backend.governedMetricsEnabled` 同样默认 `true`，显式设为 `false` 可关闭。
 
-标准指标查询可在 `/metrics` 工作台或 Chat 的标准指标模式中进行，探索模式继续提供原有查询流程。该扩展首版支持 PostgreSQL，不支持跨事实来源联合计算、自动预聚合改写或未定义汇率的跨币种汇总；不要将下文原有数据源连接能力等同于指标编译器的方言支持。当前验证使用本地环境，没有真实 LLM 密钥或生产数据，不能将集成测试等同于真实模型和业务验收。
+标准指标查询可在 `/metrics` 工作台或 Chat 的标准指标模式中进行，探索模式继续提供原有查询流程。该扩展支持 PostgreSQL 和 MySQL 5.7 InnoDB 业务数据源，不支持跨事实来源联合计算、自动预聚合改写或未定义汇率的跨币种汇总；不要将下文原有数据源连接能力等同于指标编译器的方言支持。当前验证使用本地环境，没有真实 LLM 密钥或生产数据，不能将集成测试等同于真实模型和业务验收。
+
+MySQL 5.7 可用于现有业务数据库；应用元数据、登录会话、Catalog 与向量存储仍使用 PostgreSQL + pgvector，不需要迁移业务数据到 PostgreSQL。接入步骤、只读权限、DATETIME/TIMESTAMP 语义和验收范围见 [MySQL 5.7 指南](./docs/mysql57.md)。
 
 详见 [安装与使用指南](./docs/governed-metrics.md)、[模型快照设计决策](./docs/plans/adr-001-governed-model-snapshots.md) 和 [实施与验证记录](./docs/plans/governed-metrics-progress.md)。
 
@@ -382,7 +384,7 @@ Auto Ontology 支持连接以下十种数据库或查询引擎：
 - DuckDB
 - SQLite
 
-可在 **Settings → Connections** 中添加连接，也可通过 `CONNECTION_STRINGS` 配置。DuckDB 和 SQLite 仅支持连接字符串方式。URL 格式、数据范围与凭据存储见 [连接文档](./docs/connections.md)。新增指标编译与执行目前仅支持 PostgreSQL。
+可在 **Settings → Connections** 中添加连接，也可通过 `CONNECTION_STRINGS` 配置。DuckDB 和 SQLite 仅支持连接字符串方式。URL 格式、数据范围与凭据存储见 [连接文档](./docs/connections.md)。新增指标编译与执行支持 PostgreSQL 和 [MySQL 5.7](./docs/mysql57.md)，不代表全部连接器都具备标准指标方言支持。
 
 ### 模型
 
@@ -421,6 +423,7 @@ NVIDIA 上游团队维护原项目，目前不接受外部 Pull Request，但欢
 | 本分支实施与验证记录 | [实施记录](./docs/plans/governed-metrics-progress.md) |
 | Helm / Kubernetes 部署 | [DEPLOYMENT.md](./DEPLOYMENT.md) |
 | 数据连接、范围与 Vault | [docs/connections.md](./docs/connections.md) |
+| MySQL 5.7 业务数据源 | [docs/mysql57.md](./docs/mysql57.md) |
 | 身份认证、SSO 与 API 令牌 | [docs/authentication.md](./docs/authentication.md) |
 | 对话 API | [docs/conversation-api.md](./docs/conversation-api.md) |
 | MCP 服务 | [docs/mcp.md](./docs/mcp.md) |

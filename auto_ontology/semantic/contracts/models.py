@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Closed, versionable DTOs for the governed PostgreSQL metric query path.
+"""Closed, versionable DTOs for governed PostgreSQL and MySQL metric queries.
 
 Certification and access checks belong to the server. These immutable value objects
 describe a complete model snapshot; no client-supplied SQL is executable input.
@@ -33,6 +33,11 @@ class FieldBinding(Contract):
     column_name: str
     data_type: Literal["number", "string", "boolean", "date", "datetime"]
     nullable: bool = True
+    # MySQL DATETIME wall-clock storage semantics; TIMESTAMP uses UTC sessions.
+    # Omit unset values so pre-existing PostgreSQL model fingerprints stay valid.
+    datetime_timezone: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 # Decimal remains exact for Python callers. JSON callers can send numeric filter
@@ -147,7 +152,7 @@ class Metric(Contract):
 class GovernedModel(Contract):
     model_id: str
     name: str
-    dialect: Literal["postgres"] = "postgres"
+    dialect: Literal["postgres", "mysql"] = "postgres"
     sources: tuple[SourceBinding, ...]
     relationships: tuple[Relationship, ...] = ()
     metrics: tuple[Metric, ...]

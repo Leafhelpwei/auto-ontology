@@ -2,6 +2,7 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+export type MetricDialect = 'postgres' | 'mysql';
 export type Scalar = string | number | boolean | null;
 export type FieldRef = { source_id: string; field_id: string };
 export type Predicate = {
@@ -25,6 +26,7 @@ export type FieldBinding = {
 	column_name: string;
 	data_type: 'number' | 'string' | 'boolean' | 'date' | 'datetime';
 	nullable: boolean;
+	datetime_timezone?: string | null;
 };
 export type DimensionBinding = {
 	dimension_id: string;
@@ -93,7 +95,7 @@ export type Metric = {
 export type GovernedModel = {
 	model_id: string;
 	name: string;
-	dialect: 'postgres';
+	dialect: MetricDialect;
 	sources: SourceBinding[];
 	relationships: Relationship[];
 	metrics: Metric[];
@@ -152,7 +154,9 @@ export type MetricQueryResult = {
 	columns?: string[];
 	column_metadata?: {
 		name: string;
-		postgres_type_oid: number;
+		postgres_type_oid: number | null;
+		dialect?: MetricDialect;
+		mysql_type_code?: number | null;
 		json_encoding: 'decimal-string' | 'integer-string' | 'native';
 	}[];
 	rows?: unknown[][] | Record<string, unknown>[];

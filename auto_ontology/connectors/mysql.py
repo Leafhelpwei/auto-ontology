@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import Any, Callable, Optional
+from contextlib import contextmanager
+from datetime import date, datetime
+from typing import Any, Callable, Iterator
 from urllib.parse import unquote, urlparse
 
 import mysql.connector
+from mysql.connector.conversion import MySQLConverter
 import pandas as pd
 
 from auto_ontology.catalog.constants import TableTypes
@@ -24,12 +28,77 @@ logger = logging.getLogger(__name__)
 # (``max_statement_time``).
 _TIMEOUT_ERRNOS = frozenset({3024, 1969})
 
+QueryParameters = list[Any] | dict[str, Any] | None
+ScopedReader = Callable[[str, QueryParameters], pd.DataFrame]
+
+# Only live connections owned by this process are eligible for worker cleanup.
+# Taking a tuple snapshot is atomic under the GIL; the SIGTERM handler must not
+# acquire a lock that the interrupted thread could itself be holding.
+_ACTIVE_CONNECTIONS: dict[int, tuple[dict[str, Any], int]] = {}
+
+
+class _GovernedMySQLConverter(MySQLConverter):
+    """Do not silently turn legacy zero/invalid dates into SQL NULL results."""
+
+    invalid_temporal = False
+
+    def _date_to_python(self, value: Any, dsc: Any = None) -> date | None:
+        result = MySQLConverter._date_to_python(value, dsc)
+        if result is None:
+            self.invalid_temporal = True
+        return result
+
+    def _datetime_to_python(self, value: Any, dsc: Any = None) -> datetime | None:
+        result = MySQLConverter._datetime_to_python(value, dsc)
+        if result is None:
+            self.invalid_temporal = True
+        return result
+
+    _timestamp_to_python = _datetime_to_python
+
+
+@contextmanager
+def _registered_connection(connection: Any, kwargs: dict[str, Any]) -> Iterator[None]:
+    connection_id = getattr(connection, "connection_id", None)
+    token = id(connection)
+    if isinstance(connection_id, int) and not isinstance(connection_id, bool):
+        _ACTIVE_CONNECTIONS[token] = (kwargs, connection_id)
+    try:
+        yield
+    finally:
+        _ACTIVE_CONNECTIONS.pop(token, None)
+
+
+def cancel_active_mysql_queries() -> None:
+    """Best-effort worker shutdown: kill its own live server connections.
+
+    MySQL 5.7 can keep computing after a client disappears. KILL CONNECTION
+    also ends its transaction and releases locks. Killing one's own sessions
+    needs no SUPER or PROCESS privilege. The worker's SIGKILL grace period is
+    the outer bound if the server or network cannot accept this cleanup.
+    """
+    for kwargs, connection_id in tuple(_ACTIVE_CONNECTIONS.values()):
+        try:
+            connection = mysql.connector.connect(
+                **kwargs, connection_timeout=1, read_timeout=1, write_timeout=1
+            )
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute("KILL CONNECTION %s", (connection_id,))
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+        except Exception:  # noqa: BLE001 — termination must continue on failure
+            logger.warning("Could not cancel an active MySQL connection")
+
 
 def _parse_connection_string(connection_string: str) -> dict[str, Any]:
     """Convert a MySQL URI into ``mysql.connector.connect`` keyword arguments."""
     parsed = urlparse(connection_string)
     if parsed.scheme.split("+", 1)[0].lower() != "mysql":
-        raise ValueError(f"Invalid MySQL connection string: {connection_string!r}")
+        raise ValueError("Invalid MySQL connection string scheme")
     if not parsed.hostname:
         raise ValueError("MySQL connection string is missing a host")
     database = unquote(parsed.path.lstrip("/"))
@@ -67,6 +136,13 @@ class MySQLDatabase(SQLDatabase):
     def __init__(self, connection_string: str) -> None:
         self._connection_string = connection_string
         self._connect_kwargs = _parse_connection_string(connection_string)
+        # New connector releases default to an 8.0-only collation. Both of
+        # these settings work on 5.7 and preserve supplementary Unicode.
+        # Pure Python socket I/O also lets the worker's SIGTERM handler run
+        # while a query is waiting for its first server result.
+        self._connect_kwargs.update(
+            charset="utf8mb4", collation="utf8mb4_unicode_ci", use_pure=True
+        )
         self._database_name = str(self._connect_kwargs["database"])
         # Which of _TIMEOUT_VARIABLES this server accepts, learned on the first
         # capped statement so later ones skip the variants it rejected. None
@@ -116,7 +192,7 @@ class MySQLDatabase(SQLDatabase):
     def execute(
         self,
         sql: str,
-        parameters: Optional[list] = None,
+        parameters: QueryParameters = None,
         *,
         timeout_s: float | None = None,
     ) -> pd.DataFrame:
@@ -131,23 +207,117 @@ class MySQLDatabase(SQLDatabase):
         """
         connection = mysql.connector.connect(**self._connect_kwargs)
         try:
-            cursor = connection.cursor(dictionary=True)
-            started = time.monotonic()
-            try:
-                if timeout_s is not None:
+            with _registered_connection(connection, self._connect_kwargs):
+                cursor = connection.cursor(dictionary=True)
+                started = time.monotonic()
+                try:
+                    if timeout_s is not None:
+                        self._set_statement_timeout(cursor, timeout_s)
+                    cursor.execute(sql, parameters)
+                    if cursor.description is None:
+                        return pd.DataFrame()
+                    rows = cursor.fetchall()
+                    columns = [description[0] for description in cursor.description]
+                    return pd.DataFrame(rows, columns=columns)
+                except mysql.connector.Error as exc:
+                    if timeout_s is not None and exc.errno in _TIMEOUT_ERRNOS:
+                        raise StatementTimeout.since(timeout_s, started) from exc
+                    raise
+                finally:
+                    cursor.close()
+        finally:
+            connection.close()
+
+    @contextmanager
+    def read_transaction(self, *, timeout_s: float = 30) -> Iterator[ScopedReader]:
+        """Pin governed validation and execution to one capped read snapshot.
+
+        Unlike legacy execute(), this path requires a server-side timeout.
+        The service additionally restricts reads to physical InnoDB tables and
+        validates generated SQL; READ ONLY alone permits temporary-table writes.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("A finite positive statement timeout is required")
+        connection = mysql.connector.connect(
+            **self._connect_kwargs,
+            raise_on_warnings=True,
+            converter_class=_GovernedMySQLConverter,
+            connection_timeout=min(10, math.ceil(timeout_s)),
+            read_timeout=math.ceil(timeout_s) + 1,
+            write_timeout=math.ceil(timeout_s) + 1,
+        )
+        try:
+            with _registered_connection(connection, self._connect_kwargs):
+                cursor = connection.cursor()
+                try:
                     self._set_statement_timeout(cursor, timeout_s)
-                cursor.execute(sql, parameters)
-                if cursor.description is None:
-                    return pd.DataFrame()
-                rows = cursor.fetchall()
-                columns = [description[0] for description in cursor.description]
-                return pd.DataFrame(rows, columns=columns)
-            except mysql.connector.Error as exc:
-                if timeout_s is not None and exc.errno in _TIMEOUT_ERRNOS:
-                    raise StatementTimeout.since(timeout_s, started) from exc
-                raise
-            finally:
-                cursor.close()
+                    if self._timeout_variable is None:
+                        raise ValueError(
+                            "Governed MySQL reads require statement timeout support"
+                        )
+                    cursor.execute("SET SESSION time_zone = '+00:00'")
+                    cursor.execute(
+                        "SET SESSION lock_wait_timeout = %s", (math.ceil(timeout_s),)
+                    )
+                    cursor.execute("SET SESSION div_precision_increment = 30")
+                    try:
+                        cursor.execute(
+                            "SET SESSION sql_mode = "
+                            "'ONLY_FULL_GROUP_BY,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,"
+                            "NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'"
+                        )
+                    except mysql.connector.Error as exc:
+                        # 5.7 warns when its default NO_AUTO_CREATE_USER is
+                        # removed. The assignment succeeded; this deprecation
+                        # is unrelated to query data or numeric conversion.
+                        if exc.errno != 3090:
+                            raise
+                finally:
+                    cursor.close()
+                connection.start_transaction(
+                    consistent_snapshot=True,
+                    isolation_level="REPEATABLE READ",
+                    readonly=True,
+                )
+                active = True
+
+                def read(sql: str, parameters: QueryParameters = None) -> pd.DataFrame:
+                    if not active:
+                        raise RuntimeError("MySQL read transaction is closed")
+                    started = time.monotonic()
+                    cursor = connection.cursor(dictionary=True)
+                    try:
+                        converter = connection.converter
+                        converter.invalid_temporal = False
+                        cursor.execute(sql, parameters)
+                        description = cursor.description or ()
+                        columns = [item[0] for item in description]
+                        rows = cursor.fetchall() if description else []
+                        # Raise only after the driver consumes the result EOF.
+                        # Raising inside row conversion leaves its unread flag
+                        # set and can make rollback wait for that EOF again.
+                        if converter.invalid_temporal:
+                            raise mysql.connector.DataError(
+                                "Invalid MySQL date or datetime result", errno=1292
+                            )
+                        frame = pd.DataFrame(rows, columns=columns, dtype=object)
+                        frame.attrs["dialect"] = "mysql"
+                        frame.attrs["mysql_types"] = {
+                            item[0]: item[1] for item in description
+                        }
+                        return frame
+                    except mysql.connector.Error as exc:
+                        if exc.errno in _TIMEOUT_ERRNOS or exc.errno == 1205:
+                            raise StatementTimeout.since(timeout_s, started) from exc
+                        raise
+                    finally:
+                        cursor.close()
+
+                try:
+                    yield read
+                finally:
+                    active = False
+                    connection.rollback()
         finally:
             connection.close()
 

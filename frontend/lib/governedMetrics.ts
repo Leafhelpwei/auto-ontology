@@ -3,7 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { z } from 'zod';
-import type { Expression, GovernedModel, Metric, SourceBinding } from '@/types/governedMetrics';
+import exampleModel from './examples/ordersMetricModel.json';
+import type {
+	Expression,
+	GovernedModel,
+	Metric,
+	MetricDialect,
+	SourceBinding,
+} from '@/types/governedMetrics';
 
 const scalar = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
 const fieldRef = z.object({ source_id: z.string(), field_id: z.string() }).strict();
@@ -51,7 +58,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 	.object({
 		model_id: z.string(),
 		name: z.string(),
-		dialect: z.literal('postgres').default('postgres'),
+		dialect: z.enum(['postgres', 'mysql']).default('postgres'),
 		sources: z.array(
 			z
 				.object({
@@ -76,6 +83,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 									'datetime',
 								]),
 								nullable: z.boolean().default(true),
+								datetime_timezone: z.string().nullable().optional(),
 							})
 							.strict(),
 					),
@@ -215,12 +223,12 @@ export const parseExpression = (text: string): Expression | null => {
 };
 export const splitIds = (value: string): string[] =>
 	value === '' ? [] : value.split(',').map((part) => part.trim());
-export const newSource = (index: number): SourceBinding => ({
+export const newSource = (index: number, dialect: MetricDialect = 'postgres'): SourceBinding => ({
 	source_id: `source_${index}`,
 	datasource_id: '',
 	catalog_table_id: '',
 	owner_term_id: '',
-	schema_name: 'public',
+	schema_name: dialect === 'mysql' ? '' : 'public',
 	table_name: '',
 	grain: [],
 	fields: [],
@@ -253,14 +261,35 @@ export const newMetric = (index: number, sourceId = ''): Metric => ({
 	default_of_family: false,
 	evidence: [],
 });
-export const newModel = (): GovernedModel => ({
+export const newModel = (dialect: MetricDialect = 'postgres'): GovernedModel => ({
 	model_id: crypto.randomUUID(),
 	name: 'New metric model',
-	dialect: 'postgres',
-	sources: [newSource(1)],
+	dialect,
+	sources: [newSource(1, dialect)],
 	relationships: [],
 	metrics: [newMetric(1, 'source_1')],
 });
+
+/** Templates contain fixture identifiers and always require rebinding and review. */
+export const modelTemplate = (dialect: MetricDialect): GovernedModel => {
+	const model = parseModel(JSON.stringify(exampleModel));
+	if (dialect === 'postgres') return model;
+	return {
+		...model,
+		model_id: 'mysql-orders-example',
+		name: 'MySQL orders example (rebind Catalog IDs)',
+		dialect,
+		sources: model.sources.map((source) => ({
+			...source,
+			datasource_id: 'replace-with-mysql-catalog-database-id',
+			schema_name: 'sales',
+			structure_fingerprint: '',
+		})),
+	};
+};
+
+export const dialectLabel = (dialect: MetricDialect) =>
+	dialect === 'mysql' ? 'MySQL 5.7' : 'PostgreSQL';
 
 export const downloadJson = (name: string, value: unknown) => {
 	const url = URL.createObjectURL(

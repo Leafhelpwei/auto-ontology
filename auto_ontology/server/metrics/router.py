@@ -9,6 +9,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 import psycopg
+import mysql.connector
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
@@ -70,13 +71,13 @@ class MetricsRoute(APIRoute):
                         "message": "The governed query exceeded its time limit",
                     },
                 ) from exc
-            except psycopg.Error as exc:
+            except (psycopg.Error, mysql.connector.Error) as exc:
                 # Database exception text can contain SQL and connection details.
                 raise HTTPException(
                     502,
                     detail={
                         "code": "SOURCE_QUERY_FAILED",
-                        "message": "PostgreSQL could not validate or execute this query",
+                        "message": "The source database could not validate or execute this query",
                     },
                 ) from exc
 

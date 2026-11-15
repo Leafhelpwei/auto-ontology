@@ -1247,9 +1247,32 @@
                                   "type": "string"
                                 },
                                 "postgres_type_oid": {
-                                  "type": "integer",
-                                  "minimum": -9007199254740991,
-                                  "maximum": 9007199254740991
+                                  "anyOf": [
+                                    {
+                                      "type": "integer",
+                                      "minimum": -9007199254740991,
+                                      "maximum": 9007199254740991
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "dialect": {
+                                  "type": "string",
+                                  "enum": ["postgres", "mysql"]
+                                },
+                                "mysql_type_code": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer",
+                                      "minimum": -9007199254740991,
+                                      "maximum": 9007199254740991
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
                                 },
                                 "json_encoding": {
                                   "type": "string",
@@ -2928,9 +2951,32 @@
                                               "type": "string"
                                             },
                                             "postgres_type_oid": {
-                                              "type": "integer",
-                                              "minimum": -9007199254740991,
-                                              "maximum": 9007199254740991
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer",
+                                                  "minimum": -9007199254740991,
+                                                  "maximum": 9007199254740991
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "dialect": {
+                                              "type": "string",
+                                              "enum": ["postgres", "mysql"]
+                                            },
+                                            "mysql_type_code": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer",
+                                                  "minimum": -9007199254740991,
+                                                  "maximum": 9007199254740991
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
                                             },
                                             "json_encoding": {
                                               "type": "string",
@@ -3449,9 +3495,32 @@
                                         "type": "string"
                                       },
                                       "postgres_type_oid": {
-                                        "type": "integer",
-                                        "minimum": -9007199254740991,
-                                        "maximum": 9007199254740991
+                                        "anyOf": [
+                                          {
+                                            "type": "integer",
+                                            "minimum": -9007199254740991,
+                                            "maximum": 9007199254740991
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "dialect": {
+                                        "type": "string",
+                                        "enum": ["postgres", "mysql"]
+                                      },
+                                      "mysql_type_code": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer",
+                                            "minimum": -9007199254740991,
+                                            "maximum": 9007199254740991
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
                                       },
                                       "json_encoding": {
                                         "type": "string",
@@ -12022,6 +12091,17 @@
             "title": "Data Type",
             "type": "string"
           },
+          "datetime_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datetime Timezone"
+          },
           "field_id": {
             "title": "Field Id",
             "type": "string"
@@ -12333,8 +12413,8 @@
         "additionalProperties": false,
         "properties": {
           "dialect": {
-            "const": "postgres",
             "default": "postgres",
+            "enum": ["postgres", "mysql"],
             "title": "Dialect",
             "type": "string"
           },

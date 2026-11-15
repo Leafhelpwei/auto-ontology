@@ -6,6 +6,7 @@ import type { MetricsQueryContext } from '@/types/chat';
 import { metricResultTable } from '@/lib/chatMetricContext';
 import { Button } from '@/common/Button';
 import { ButtonTheme, Size } from '@/enums/button';
+import { ResultColumnDetails } from '@/components/metricsPage/ResultColumnDetails';
 import { DynamicTable } from './DynamicTable';
 
 export const MetricAnswerDetails = ({
@@ -121,6 +122,7 @@ export const MetricAnswerDetails = ({
 					)}
 				</div>
 			)}
+			<ResultColumnDetails columns={context.column_metadata} />
 			{(context.plan || context.query || context.model_fingerprint) && (
 				<details>
 					<summary className="cursor-pointer text-xs font-medium">

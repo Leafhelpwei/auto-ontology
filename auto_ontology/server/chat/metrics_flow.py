@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 import psycopg
+import mysql.connector
 
 from auto_ontology.connectors.base import StatementTimeout
 from auto_ontology.dal.governed_models import ModelNotFound
@@ -247,7 +248,7 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
             },
         )
         yield _answer(context, "The selected metric model is unavailable")
-    except (psycopg.Error, StatementTimeout) as exc:
+    except (psycopg.Error, mysql.connector.Error, StatementTimeout) as exc:
         code = (
             "QUERY_TIMEOUT"
             if isinstance(exc, StatementTimeout)

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useState } from 'react';
+import { ResultColumnDetails } from './ResultColumnDetails';
 import { governedMetricsApi } from '@/api/governedMetrics';
 import { Button } from '@/common/Button';
 import { ButtonTheme } from '@/enums/button';
@@ -39,7 +40,9 @@ const cellText = (value: unknown) =>
 const QueryResult = ({ result, executed }: { result: MetricQueryResult; executed: boolean }) => {
 	const rows = result.rows ?? [];
 	const columns =
-		result.columns ?? (rows[0] && !Array.isArray(rows[0]) ? Object.keys(rows[0]) : []);
+		result.columns ??
+		result.column_metadata?.map((column) => column.name) ??
+		(rows[0] && !Array.isArray(rows[0]) ? Object.keys(rows[0]) : []);
 	return (
 		<section className={`${panelClass} space-y-4`} aria-label="Query result">
 			<div className="flex flex-wrap items-center gap-3">
@@ -106,6 +109,7 @@ const QueryResult = ({ result, executed }: { result: MetricQueryResult; executed
 					)}
 				</div>
 			)}
+			<ResultColumnDetails columns={result.column_metadata} />
 			<details open>
 				<summary className="cursor-pointer text-sm font-medium">Compiled SQL</summary>
 				<pre className="mt-2 max-h-80 overflow-auto rounded-lg bg-zinc-950 p-4 font-mono text-xs text-zinc-100">
@@ -241,6 +245,14 @@ export const MetricQueryPanel = ({
 	};
 	return (
 		<div className="space-y-5">
+			{model.dialect === 'mysql' && (
+				<p className="text-sm text-secondary">
+					MySQL 5.7: DATETIME ranges and datetime grouping require a constant timezone
+					offset throughout the range. Split ranges across daylight saving transitions.
+					UTC TIMESTAMP range filtering may span them.
+				</p>
+			)}
+
 			<div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm dark:border-zinc-700 dark:bg-zinc-900">
 				{active
 					? `Queries use saved, certified active revision ${revision}.`

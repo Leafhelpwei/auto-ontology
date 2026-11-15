@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Legacy catalog rows need verified PostgreSQL connections, not guessed types."""
+"""Legacy dialects need verified connectors; a model cannot relabel a source."""
 
 from types import SimpleNamespace
 
@@ -40,7 +40,7 @@ def test_legacy_catalog_can_publish_and_execute_with_real_postgres(catalog) -> N
         _set_dialect(model, "postgres")
 
 
-@pytest.mark.parametrize("mode", ["missing", "non_postgres", "ambiguous"])
+@pytest.mark.parametrize("mode", ["missing", "unverified", "ambiguous"])
 def test_legacy_catalog_rejects_unproven_connection(
     catalog, monkeypatch, mode: str
 ) -> None:
@@ -49,22 +49,24 @@ def test_legacy_catalog_rejects_unproven_connection(
     fake = SimpleNamespace(database_name=connector.database_name, dialect="postgres")
     connections = {
         "missing": [],
-        "non_postgres": [fake],
+        "unverified": [fake],
         "ambiguous": [connector, fake],
     }
     monkeypatch.setattr(service, "get_connectors", lambda: connections[mode])
     try:
-        with pytest.raises(ContractError, match="unique configured PostgreSQL"):
+        with pytest.raises(ContractError) as rejected:
             service.create(model, user_id="reviewer", owner_id=None)
+        assert rejected.value.code == "CONNECTION_UNAVAILABLE"
     finally:
         _set_dialect(model, "postgres")
 
 
-def test_known_non_postgres_catalog_is_not_reinterpreted(catalog) -> None:
+def test_postgres_model_cannot_reinterpret_a_mysql_catalog(catalog) -> None:
     model, _, _, _ = catalog
     _set_dialect(model, "mysql")
     try:
-        with pytest.raises(ContractError, match="require PostgreSQL"):
+        with pytest.raises(ContractError) as rejected:
             service.create(model, user_id="reviewer", owner_id=None)
+        assert rejected.value.code == "DIALECT_MISMATCH"
     finally:
         _set_dialect(model, "postgres")

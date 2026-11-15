@@ -2261,6 +2261,17 @@
             "title": "Data Type",
             "type": "string"
           },
+          "datetime_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datetime Timezone"
+          },
           "field_id": {
             "title": "Field Id",
             "type": "string"
@@ -2585,8 +2596,11 @@
         "additionalProperties": false,
         "properties": {
           "dialect": {
-            "const": "postgres",
             "default": "postgres",
+            "enum": [
+              "postgres",
+              "mysql"
+            ],
             "title": "Dialect",
             "type": "string"
           },
@@ -7402,7 +7416,7 @@
   "paths": {
     "/api/chat/cancel": {
       "post": {
-        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nThe worker is killed and the route waits briefly for its pump to finish\npersistence. Metric runs record an untrusted cancellation result tied to\ntheir server-generated turn ID; exploratory runs retain their existing\npartial-stream behavior. The slot remains unavailable while terminal\npersistence is unfinished, so a subsequent question cannot consume a late\nassistant result. PostgreSQL 14+ detects the dead client during execution;\nolder versions retain the governed statement-timeout bound.",
+        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nThe worker is killed and the route waits briefly for its pump to finish\npersistence. Metric runs record an untrusted cancellation result tied to\ntheir server-generated turn ID; exploratory runs retain their existing\npartial-stream behavior. The slot remains unavailable while terminal\npersistence is unfinished, so a subsequent question cannot consume a late\nassistant result. PostgreSQL 14+ detects the dead client during execution;\nolder versions retain the governed statement-timeout bound. MySQL workers\nrequest same-account KILL CONNECTION before exiting; the server timeout\nremains a fallback when cancellation cannot reach the database.",
         "operationId": "chat_cancel_api_chat_cancel_post",
         "parameters": [
           {

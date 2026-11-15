@@ -7,6 +7,9 @@ import {
 	assertExactJsonNumbers,
 	canTransitionRevision,
 	parseModel,
+	modelTemplate,
+	newModel,
+	newSource,
 	predicateScalar,
 	prepareDraftImport,
 	splitIds,
@@ -110,5 +113,53 @@ describe('exact numeric input', () => {
 	it('preserves a trailing separator while typing a composite grain key', () => {
 		expect(splitIds('tenant_id,').join(', ')).toBe('tenant_id, ');
 		expect(splitIds('tenant_id, order_id')).toEqual(['tenant_id', 'order_id']);
+	});
+});
+
+describe('MySQL model editing and import', () => {
+	it('creates MySQL drafts without inventing a PostgreSQL schema or a storage timezone', () => {
+		const model = newModel('mysql');
+		expect(model.dialect).toBe('mysql');
+		expect(model.sources[0].schema_name).toBe('');
+		expect(newSource(2, model.dialect).schema_name).toBe('');
+		expect(newModel().sources[0].schema_name).toBe('public');
+	});
+	it('imports explicit MySQL datetime interpretation without changing legacy PostgreSQL bytes', () => {
+		const legacy = parseModel(JSON.stringify(example));
+		expect(
+			legacy.sources
+				.flatMap((source) => source.fields)
+				.every((field) => !Object.hasOwn(field, 'datetime_timezone')),
+		).toBe(true);
+		const mysql = modelTemplate('mysql');
+		mysql.sources[0].fields.push({
+			field_id: 'created_at',
+			catalog_column_id: 'replace-column-id',
+			column_name: 'created_at',
+			data_type: 'datetime',
+			nullable: false,
+			datetime_timezone: 'Asia/Shanghai',
+		});
+		const imported = prepareDraftImport(
+			JSON.stringify({ model: mysql, provenance: { status: 'certified' } }),
+		);
+		expect(imported.dialect).toBe('mysql');
+		expect(imported.sources[0].schema_name).toBe('sales');
+		expect(imported.sources[0].fields.at(-1)?.datetime_timezone).toBe('Asia/Shanghai');
+		expect(imported).not.toHaveProperty('provenance');
+		expect(imported.model_id).not.toBe(mysql.model_id);
+	});
+	it('keeps downloadable dialect templates isolated and rejects unsupported dialects', () => {
+		const mysql = modelTemplate('mysql');
+		mysql.sources[0].fields[0].column_name = 'changed';
+		expect(modelTemplate('postgres').sources[0].fields[0].column_name).toBe(
+			example.sources[0].fields[0].column_name,
+		);
+		expect(
+			modelTemplate('mysql').sources.every((source) => source.schema_name === 'sales'),
+		).toBe(true);
+		expect(() => parseModel(JSON.stringify({ ...example, dialect: 'sqlite' }))).toThrow(
+			'dialect',
+		);
 	});
 });

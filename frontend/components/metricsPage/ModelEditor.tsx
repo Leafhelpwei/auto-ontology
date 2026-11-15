@@ -5,7 +5,7 @@
 import { useState } from 'react';
 import { Button } from '@/common/Button';
 import { ButtonTheme, Size } from '@/enums/button';
-import { newMetric, newSource, parseModel, splitIds } from '@/lib/governedMetrics';
+import { dialectLabel, newMetric, newSource, parseModel, splitIds } from '@/lib/governedMetrics';
 import type { GovernedModel, Metric, Relationship, SourceBinding } from '@/types/governedMetrics';
 import {
 	CheckField,
@@ -66,7 +66,12 @@ const SourceEditor = ({
 						onChange={(catalog_table_id) => patch({ catalog_table_id })}
 					/>
 					<TextField
-						label="Schema"
+						label={model.dialect === 'mysql' ? 'Database / schema' : 'Schema'}
+						hint={
+							model.dialect === 'mysql'
+								? 'Business database selected in the MySQL connection'
+								: undefined
+						}
 						value={source.schema_name}
 						onChange={(schema_name) => patch({ schema_name })}
 					/>
@@ -146,12 +151,39 @@ const SourceEditor = ({
 														...item,
 														data_type:
 															data_type as typeof field.data_type,
+														datetime_timezone:
+															data_type === 'datetime'
+																? item.datetime_timezone
+																: undefined,
 													}
 												: item,
 										),
 									})
 								}
 							/>
+							{field.data_type === 'datetime' && (
+								<TextField
+									label="Stored datetime timezone"
+									value={field.datetime_timezone ?? ''}
+									hint={
+										model.dialect === 'mysql'
+											? 'Required. TIMESTAMP: UTC. DATETIME: its actual stored zone (UTC, +08:00, or Asia/Shanghai). Never guess.'
+											: 'Leave empty for PostgreSQL timestamptz.'
+									}
+									onChange={(value) =>
+										patch({
+											fields: source.fields.map((item, at) =>
+												at === index
+													? {
+															...item,
+															datetime_timezone: value || undefined,
+														}
+													: item,
+											),
+										})
+									}
+								/>
+							)}
 							<CheckField
 								label="Nullable"
 								checked={field.nullable}
@@ -690,6 +722,11 @@ const MetricEditor = ({
 					/>
 					<SelectField
 						label="Division by zero"
+						hint={
+							model.dialect === 'mysql'
+								? 'MySQL division expressions require null; error is not supported.'
+								: undefined
+						}
 						value={metric.zero_division}
 						options={options(['null', 'error'])}
 						onChange={(zero_division) =>
@@ -770,6 +807,12 @@ export const ModelEditor = ({
 						onChange={() => {}}
 					/>
 				</div>
+				<p className="text-sm text-secondary">
+					SQL engine: {dialectLabel(model.dialect)}.{' '}
+					{model.dialect === 'mysql'
+						? 'Bind sources to InnoDB base tables with complete unique keys. DATETIME bindings require the stored timezone; TIMESTAMP bindings require UTC.'
+						: 'Datetime bindings require timestamptz.'}
+				</p>
 				<div className="flex flex-wrap gap-2" aria-label="Model sections">
 					{[
 						['metrics', `Metrics (${model.metrics.length})`],
@@ -820,7 +863,7 @@ export const ModelEditor = ({
 									...model,
 									sources: [
 										...model.sources,
-										newSource(model.sources.length + 1),
+										newSource(model.sources.length + 1, model.dialect),
 									],
 								})
 							}

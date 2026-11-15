@@ -78,7 +78,9 @@ export const chatQueryContextSchema = z.union([
 			.array(
 				z.object({
 					name: z.string(),
-					postgres_type_oid: z.number().int(),
+					postgres_type_oid: z.number().int().nullable(),
+					dialect: z.enum(['postgres', 'mysql']).optional(),
+					mysql_type_code: z.number().int().nullish(),
 					json_encoding: z.enum(['native', 'decimal-string', 'integer-string']),
 				}),
 			)

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
+import signal
 import threading
 from queue import Empty
 from typing import Any, Generator
@@ -52,8 +54,31 @@ _MSG_ASK = "ask"
 # cadence the router uses to write SSE comments.
 _QUEUE_POLL_S = 0.25
 
-# Grace window between SIGTERM and SIGKILL.
-_TERMINATE_GRACE_S = 1.0
+# Allows a one-second MySQL control-connection timeout before hard termination.
+_TERMINATE_GRACE_S = 2.0
+
+
+def _terminate_worker(signum: int, _frame: Any) -> None:
+    """Stop owned MySQL server work before the worker loses its sockets."""
+    try:
+        from auto_ontology.connectors.mysql import cancel_active_mysql_queries
+
+        cancel_active_mysql_queries()
+    finally:
+        # Worker loops intentionally catch BaseException. SystemExit here
+        # would therefore resume the loop instead of actually terminating.
+        os._exit(128 + signum)
+
+
+def _worker_entrypoint(
+    in_q: "mp.Queue[tuple[str, Any]]",
+    out_q: "mp.Queue[tuple[str, Any]]",
+    mode: str,
+) -> None:
+    # Install only inside the subprocess, never in the server or test caller.
+    signal.signal(signal.SIGTERM, _terminate_worker)
+    loop = _metrics_worker_loop if mode == "metrics" else _worker_loop
+    loop(in_q, out_q)
 
 
 def _worker_loop(
@@ -261,8 +286,8 @@ class PrewarmedWorker:
         self._in_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
         self._out_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
         self._proc = self._ctx.Process(
-            target=_metrics_worker_loop if mode == "metrics" else _worker_loop,
-            args=(self._in_q, self._out_q),
+            target=_worker_entrypoint,
+            args=(self._in_q, self._out_q, mode),
             daemon=True,
         )
         self._proc.start()

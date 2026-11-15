@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # 指标工作台：安装、使用与开发
 
-本分支在 Auto Ontology 内增加 `/metrics` 工作台，将指标、来源和关系定义保存为版本化契约，并生成可解释、带参数的 PostgreSQL 查询。设计参考 Ontology Playground；数据接入、权限、存储和执行继续使用 Auto Ontology。
+本分支在 Auto Ontology 内增加 `/metrics` 工作台，将指标、来源和关系定义保存为版本化契约，并生成可解释、带参数的 PostgreSQL / MySQL 5.7 查询。设计参考 Ontology Playground；数据接入、权限、存储和执行继续使用 Auto Ontology。
 
 ## 启用
 
@@ -19,7 +19,7 @@ cd auto-ontology
 
 已有此 fork 的本地工作区可执行 `git fetch origin` 后切换到 `feat/governed-metrics`；切换前先保存自己的未提交修改。
 
-1. 按仓库现有说明安装后端和前端依赖，配置应用元数据库与 PostgreSQL 业务数据源。
+1. 按仓库现有说明安装后端和前端依赖，配置 PostgreSQL 应用元数据库与 PostgreSQL 或 MySQL 5.7 业务数据源。
 2. 备份元数据后执行新增迁移：
 
    ```bash
@@ -39,7 +39,7 @@ cd auto-ontology
 ## 建立一个可查询模型
 
 1. 先通过现有数据源功能完成 Catalog 接入，创建对应的业务 Term。
-2. 新建模型。模型 ID 使用 1–128 个英文字母、数字、下划线、点或连字符，以字母/数字开头；展示名称可用中文。在来源编辑器中填写真实 `datasource_id`、`catalog_table_id`、`owner_term_id`、schema/table 名称与字段的 `catalog_column_id`。名称必须与这些 ID 指向的资产一致。
+2. 在 **New model / template engine** 选择 PostgreSQL 或 MySQL 5.7，再点击 **New model**；下载示例也使用同一方言选择。MySQL 的 schema 是连接所选业务数据库名，字段 `datetime_timezone` 必须反映真实存储语义，详见 [MySQL 5.7 指南](mysql57.md)。模型 ID 使用 1–128 个英文字母、数字、下划线、点或连字符，以字母/数字开头；展示名称可用中文。在来源编辑器中填写真实 `datasource_id`、`catalog_table_id`、`owner_term_id`、schema/table 名称与字段的 `catalog_column_id`。名称必须与这些 ID 指向的资产一致。
 3. 定义完整行粒度。粒度必须有真实唯一键支持；定义关系时列出全部复合键，声明方向、业务角色、基数和 INNER/LEFT 语义。
 4. 添加原子指标：聚合方式、表达式 AST、必带过滤、允许维度、时间字段/角色和单位。金额须声明币种字段或固定币种。复合指标引用同一快照内的原子指标。
 5. 保存草稿，查看校验报告并修复问题。结构校验通过后，提交业务审核和结果核对依据以认证该修订版，再激活。
@@ -67,7 +67,7 @@ cd auto-ontology
 
 状态流转为 `draft → validated → certified`；`active_revision` 指向用于标准查询的已认证版本。弃用当前版本会清除激活指针。写操作携带 `expected_version`，过期编辑返回 `409 VERSION_CONFLICT`，不会覆盖其他人的修改。
 
-认证时服务端记录审核者、证据、模型指纹和来源结构指纹。标准查询会重新核对真实 Catalog 和 PostgreSQL 列/唯一索引结构；不匹配时返回 `SOURCE_CHANGED`。认证只覆盖该快照，后续编辑必须重新校验认证。
+认证时服务端记录审核者、证据、模型指纹和来源结构指纹。标准查询会重新核对真实 Catalog 和业务数据库的列/唯一索引结构；不匹配时返回 `SOURCE_CHANGED`。认证只覆盖该快照，后续编辑必须重新校验认证。
 
 草稿预览需要编辑权限，只生成计划并标记 `trusted=false`，不能经标准执行接口运行。正式执行只使用当前激活且认证有效的版本，并在服务端重新编译，客户端无法提交自制 SQL 或替换计划。
 
@@ -136,15 +136,15 @@ Chat 入口沿用 SSE 响应，并将 `query_context` 随结果及会话历史�
 
 时间查询使用 `time.start`、`time.end_exclusive`、`time.timezone`、`time.time_role`，可加 `granularity`。边界为 `[start, end_exclusive)`，不同时设置 `all_time=true`。查询返回 SQL、独立参数、实际来源、排除来源原因、过滤和关联依据、时间口径、模型与指标指纹。
 
-首版 `datetime` 绑定要求 PostgreSQL `timestamp with time zone`（`timestamptz`）；不将无时区 timestamp 猜测为服务器或用户所在时区。`date` 字段的范围要求所选时区的午夜边界。
+PostgreSQL 的 `datetime` 绑定仍要求 `timestamp with time zone`（`timestamptz`）；不将无时区 timestamp 猜测为服务器或用户所在时区。MySQL 的 `datetime` 绑定必须声明 `datetime_timezone`：DATETIME 使用实际存储时区，TIMESTAMP 使用 UTC。跨夏令时转换的范围和分组限制见 [MySQL 时间语义](mysql57.md#时间字段与查询边界)。`date` 字段的范围要求所选时区的午夜边界。
 
-精确数值过滤和表达式常量可使用十进制字符串，例如 `"9007199254740993.01"`，服务端按已绑定字段类型解析并保留精度。结果中的 PostgreSQL NUMERIC 和超过 JavaScript 安全整数范围的值以字符串传输，前端不得再无条件转为 `Number`。`column_metadata` 给出列名、PostgreSQL 类型 OID 和 JSON 编码方式；空结果也保留列信息。
+精确数值过滤和表达式常量可使用十进制字符串，例如 `"9007199254740993.01"`，服务端按已绑定字段类型解析并保留精度。结果中的 PostgreSQL NUMERIC、MySQL DECIMAL 和超过 JavaScript 安全整数范围的值以字符串传输，前端不得再无条件转为 `Number`。`column_metadata` 给出列名、数据库方言、PostgreSQL 类型 OID 或 MySQL 类型码及 JSON 编码方式；MySQL 的 `postgres_type_oid` 为 null。旧 PostgreSQL 会话没有方言字段时仍可显示；空结果也保留列信息。
 
 原生导出格式为 `auto-ontology-governed-model-v1`。导出的认证信息仅供追溯，普通导入总是草稿。导入已存在 ID 会报冲突，修改定义应使用新增草稿接口。现有 Ossie/RDF 导出不会自动携带本扩展，不能替代原生契约备份。
 
 ## 已支持的边界
 
-- PostgreSQL；原子 `sum/count/count_distinct` 及受限四则表达式。
+- PostgreSQL 和 MySQL 5.7 InnoDB；原子 `sum/count/count_distinct` 及受限四则表达式。MySQL 使用派生表和 UNION 分组键，避免 CTE、窗口函数、FILTER 和 FULL OUTER JOIN；含除法的 MySQL 指标仅支持零分母返回 NULL。
 - 同一事实来源上的多个指标分别过滤、分别聚合，再按 NULL 安全的分组键对齐。
 - 完整复合键；many-to-one/one-to-one；LEFT 关联的目标过滤保留在 ON 范围。
 - 依赖指标先聚合再计算比值；零分母策略明确。
@@ -163,6 +163,6 @@ uv run --no-sync ruff format --check auto_ontology/
 uv run --no-sync python -m dev_tools.generate_backend_openapi
 ```
 
-前端使用项目指定 pnpm 运行 Prettier、lint、类型检查和 build。具体执行结果、全量基线差异与仍未验证的部分记录在 [实施记录](plans/governed-metrics-progress.md)，不可将静态构建成功等同于生产联调完成。
+前端使用项目指定 pnpm 运行 Prettier、lint、类型检查和 build。MySQL 5.7 的独立配置与测试命令见 [专用指南](mysql57.md)。具体执行结果、全量基线差异与仍未验证的部分记录在 [实施记录](plans/governed-metrics-progress.md)，不可将静态构建成功等同于生产联调完成。
 
 本轮 Chat 集成验收使用真实本地登录、Next/FastAPI HTTP 和 PostgreSQL；只有模型服务使用显式 scripted 本地替身，覆盖澄清、追问、会话恢复、取消、权限、版本及来源变化。这验证了接口与治理流程，不代表真实 LLM 理解质量、浏览器 UI 或生产数据验收完成；正式自然语言使用仍需配置真实模型服务。

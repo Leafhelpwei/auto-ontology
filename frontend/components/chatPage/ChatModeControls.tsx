@@ -4,6 +4,7 @@
 
 import type { ChatSelection } from '@/types/chat';
 import type { useMetricChatModels } from '@/lib/useMetricChatModels';
+import { dialectLabel } from '@/lib/governedMetrics';
 import { Button } from '@/common/Button';
 import { ButtonTheme, Size } from '@/enums/button';
 import { CheckField, SelectField } from '@/components/metricsPage/MetricFields';
@@ -152,7 +153,8 @@ export const ChatModeControls = ({
 							<details>
 								<summary className="cursor-pointer text-xs font-medium">
 									Metric variants (optional) · revision{' '}
-									{metrics.revision.revision}
+									{metrics.revision.revision} ·{' '}
+									{dialectLabel(metrics.revision.payload.dialect)}
 									{(context.selected_metric_ids ?? []).length
 										? ` · ${(context.selected_metric_ids ?? []).join(', ')}`
 										: ''}
