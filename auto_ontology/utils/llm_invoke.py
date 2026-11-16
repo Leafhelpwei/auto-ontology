@@ -5,6 +5,10 @@
 """LLM client construction and structured-output invocation wrappers."""
 
 import contextlib
+import json
+from contextvars import ContextVar
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 import logging
 import os
 import random
@@ -15,10 +19,11 @@ from typing import Iterator, Type, TypeVar
 
 import requests as _requests
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from auto_ontology.utils.model_config import resolve
+from auto_ontology.utils.chat_protocol import normalize_messages, text_content
 
 logger = logging.getLogger(__name__)
 
@@ -132,55 +137,60 @@ def limit_inflight(max_inflight: int) -> Iterator[None]:
             _refresh_inflight()
 
 
-def _inflight_guard() -> "contextlib.AbstractContextManager[object]":
-    """The active concurrency bound, or a no-op when unbounded."""
+@contextlib.contextmanager
+def _inflight_guard(timeout: float | None = None) -> Iterator[None]:
+    """Include waiting for concurrency capacity in the request deadline."""
     semaphore = _INFLIGHT
-    return semaphore if semaphore is not None else contextlib.nullcontext()
+    if semaphore is None:
+        yield
+        return
+    acquired = (
+        semaphore.acquire(timeout=timeout)
+        if timeout is not None
+        else semaphore.acquire()
+    )
+    if not acquired:
+        raise TimeoutError("LLM concurrency deadline exceeded")
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
-# Substrings that indicate a transient, retryable server condition.
-_RETRYABLE_TOKENS = (
-    "429",
-    "Too Many Requests",
-    "503",
-    "ResourceExhausted",
-    "Service Unavailable",
-    "timed out",
-    "APITimeoutError",
-    "ReadTimeout",
-    # Azure / LiteLLM connection failures
-    "Connection error",
-    "APIConnectionError",
-    "AzureException",
-    "InternalServerError",
-    "litellm",
-)
+class LLMOutputError(ValueError):
+    """The provider did not return a usable structured response."""
 
-# Exception *type* names that are always transient/retryable regardless of
-# message text. Needed because str(exception) for openai's typed errors
-# (e.g. openai.InternalServerError) returns only the message body — never
-# the class name — so a message like "upstream connect error or
-# disconnect/reset before headers... Connection refused" silently fails
-# every _RETRYABLE_TOKENS substring check above even though
-# "InternalServerError" is right there in the token list. Matching on
-# type(e).__name__ catches these regardless of how the provider phrases
-# the underlying message.
-_RETRYABLE_EXCEPTION_TYPES = frozenset(
-    {
-        "InternalServerError",
+
+class LLMRefusalError(LLMOutputError):
+    """A refusal must never trigger a second provider."""
+
+
+@dataclass
+class _Budget:
+    deadline: float
+    remaining: int = RETRY_MAX_ATTEMPTS
+
+
+_BUDGET: ContextVar[_Budget | None] = ContextVar("llm_budget", default=None)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return status in {408, 429, 500, 502, 503, 504}
+    return isinstance(exc, (_requests.exceptions.Timeout, TimeoutError)) or type(
+        exc
+    ).__name__ in {
         "APIConnectionError",
         "APITimeoutError",
         "RateLimitError",
+        "InternalServerError",
         "ServiceUnavailableError",
+        "ConnectTimeout",
+        "ReadTimeout",
     }
-)
-
-
-def _is_retryable(e: Exception) -> bool:
-    """Whether *e* signals a transient, retryable server condition."""
-    return any(tok in str(e) for tok in _RETRYABLE_TOKENS) or (
-        type(e).__name__ in _RETRYABLE_EXCEPTION_TYPES
-    )
 
 
 class _TimeoutSession(_requests.Session):
@@ -191,7 +201,13 @@ class _TimeoutSession(_requests.Session):
         self._default_timeout = timeout
 
     def request(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", self._default_timeout)
+        budget = _BUDGET.get()
+        remaining = (
+            max(0.001, budget.deadline - time.monotonic())
+            if budget
+            else self._default_timeout
+        )
+        kwargs["timeout"] = min(self._default_timeout, remaining)
         return super().request(method, url, **kwargs)
 
 
@@ -211,6 +227,43 @@ _NON_REASONING_MODEL_NAME = resolve("NON_REASONING", "MODEL")
 _NON_REASONING_API_KEY = resolve("NON_REASONING", "API_KEY")
 
 
+def _capabilities(llm: object) -> dict:
+    profiles = json.loads(os.getenv("LLM_MODEL_CAPABILITIES", "{}"))
+    if not isinstance(profiles, dict):
+        raise ValueError("LLM_MODEL_CAPABILITIES must be an object")
+    model = getattr(llm, "model_name", None) or getattr(llm, "model", "")
+    profile = profiles.get(model, {}) if isinstance(model, str) else {}
+    if not isinstance(profile, dict):
+        raise ValueError("Model capabilities must be an object")
+    allowed = {
+        "temperature",
+        "structured_output_method",
+        "tool_choice",
+        "strict",
+        "structured_output_format",
+    }
+    if set(profile) - allowed:
+        raise ValueError("Unknown model capability")
+    if "temperature" in profile and not isinstance(profile["temperature"], bool):
+        raise ValueError("temperature capability must be boolean")
+    if "strict" in profile and not isinstance(profile["strict"], bool):
+        raise ValueError("strict capability must be boolean")
+    return profile
+
+
+def _provider(base_url: str, explicit: str) -> str:
+    if explicit not in {"auto", "openai_compatible", "nvidia"}:
+        raise ValueError("Invalid chat provider")
+    if explicit != "auto":
+        return explicit
+    return (
+        "nvidia"
+        if urlsplit(base_url).hostname
+        in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}
+        else "openai_compatible"
+    )
+
+
 def _build_client(
     *,
     model: str,
@@ -218,38 +271,27 @@ def _build_client(
     base_url: str,
     temperature: float,
     max_tokens: int,
+    provider: str = "auto",
 ) -> BaseChatModel:
-    """Build a chat client for the given model/endpoint.
-
-    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) go through
-    ``ChatOpenAI``, which supports structured output. Everything else uses
-    ``ChatNVIDIA``.
-    """
-    if model.startswith(("openai/", "azure/", "aws/")):
+    if not model or not base_url or urlsplit(base_url).scheme not in {"http", "https"}:
+        raise ValueError("Configure an explicit model and HTTP(S) endpoint")
+    profile = _capabilities(type("ModelConfiguration", (), {"model": model})())
+    kwargs = {
+        "model": model,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_tokens": max_tokens,
+    }
+    if profile.get("temperature", True):
+        kwargs["temperature"] = temperature
+    if _provider(base_url, provider) == "openai_compatible":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            # temperature omitted: gpt-5.x/o-series reject any explicit value and
-            # only allow the server default (1). Unset => langchain sends no
-            # temperature field, so the provider default applies.
-            # temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=LLM_INVOKE_TIMEOUT_S,
-            max_retries=0,
-        )
-
+        return ChatOpenAI(**kwargs, timeout=LLM_INVOKE_TIMEOUT_S, max_retries=0)
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-    client = ChatNVIDIA(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+    client = ChatNVIDIA(**kwargs)
     client._client.get_session_fn = lambda: _TimeoutSession(LLM_INVOKE_TIMEOUT_S)
     return client
 
@@ -276,6 +318,9 @@ def get_llm_client(
         base_url=_BASE_URL,
         temperature=temperature,
         max_tokens=max_tokens,
+        provider=os.getenv(
+            "REASONING_PROVIDER", os.getenv("DEFAULT_MODELS_PROVIDER", "auto")
+        ),
     )
 
 
@@ -305,6 +350,9 @@ def get_non_reasoning_llm_client(
         base_url=_NON_REASONING_BASE_URL,
         temperature=temperature,
         max_tokens=max_tokens,
+        provider=os.getenv(
+            "NON_REASONING_PROVIDER", os.getenv("DEFAULT_MODELS_PROVIDER", "auto")
+        ),
     )
     _remember_non_reasoning(client)
     return client
@@ -364,362 +412,291 @@ def _get_reasoning_fallback_client() -> BaseChatModel:
 
 
 def _reasoning_fallback_client(llm: object) -> BaseChatModel | None:
-    """The reasoning client when *llm* is non-reasoning, else ``None``.
-
-    A missing reasoning client leaves the original failure in place.
-    """
     if not _is_non_reasoning_client(llm):
+        return None
+    source = (_NON_REASONING_BASE_URL or "").rstrip("/")
+    destination = (_BASE_URL or "").rstrip("/")
+    allowed = json.loads(os.getenv("LLM_FALLBACK_ENDPOINT_ALLOWLIST", "[]"))
+    if not isinstance(allowed, list) or not all(isinstance(x, str) for x in allowed):
+        raise ValueError("Fallback endpoint allowlist must be an array of exact URLs")
+    if (
+        not source
+        or not destination
+        or (
+            source != destination
+            and destination not in {x.rstrip("/") for x in allowed}
+        )
+    ):
         return None
     try:
         return _get_reasoning_fallback_client()
-    except Exception:
-        logger.warning(
-            "Non-reasoning LLM failed and the reasoning LLM client could not be created",
-            exc_info=True,
-        )
+    except Exception as exc:
+        logger.warning("Fallback unavailable error_class=%s", type(exc).__name__)
         return None
 
 
-def _log_non_reasoning_fallback(exc: Exception, schema_name: str | None = None) -> None:
-    """Log the handoff from a failed non-reasoning call to the reasoning model."""
-    detail = (type(exc).__name__, str(exc)[:120])
-    if schema_name is None:
-        logger.warning(
-            "Non-reasoning LLM exhausted %d retries (%s: %s) — falling back to reasoning LLM",
-            RETRY_MAX_ATTEMPTS,
-            *detail,
-        )
-        return
-    logger.warning(
-        "Non-reasoning LLM exhausted %d retries for %s (%s: %s) — falling back to reasoning LLM",
-        RETRY_MAX_ATTEMPTS,
-        schema_name,
-        *detail,
-    )
-
-
 def _ensure_non_system_message(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Guarantee at least one non-system message.
-
-    Anthropic/Bedrock (via the OpenAI-compatible gateway) reject requests that
-    contain only system messages with "bedrock requires at least one non-system
-    message". Many agents build a single ``SystemMessage`` prompt, so when no
-    user/assistant message is present we promote the last system message to a
-    ``HumanMessage`` (its content is the actual instruction). No-op when a
-    non-system message already exists.
-    """
-    if not messages or any(not isinstance(m, SystemMessage) for m in messages):
-        return messages
-    converted = list(messages)
-    converted[-1] = HumanMessage(content=converted[-1].content)
-    return converted
-
-
-def _is_claude(llm: BaseChatModel) -> bool:
-    """True when *llm* serves an Anthropic/Claude model, matched by name."""
-    model = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
-    lowered = model.lower()
-    return "anthropic" in lowered or "claude" in lowered
+    return normalize_messages(messages)
 
 
 def _system_messages_first(
-    llm: BaseChatModel, messages: list[BaseMessage]
+    llm: object, messages: list[BaseMessage]
 ) -> list[BaseMessage]:
-    """Move every system message ahead of the conversation for Claude models.
-
-    Claude takes a single system prompt ahead of the conversation, but agents
-    interleave them: ``sql_from_semantic`` sends system, user, system, system,
-    user, and a validation retry appends a system message after the user turn.
-    On the inference-api gateway, ``azure/anthropic/*`` rejects every request
-    with a system message after a user message, because the gateway attaches
-    prompt-cache markers in an order Anthropic refuses::
-
-        messages.1.content.0.cache_control.ttl: a ttl='1h' cache_control block
-        must not come after a ttl='5m' cache_control block.
-
-    Measured against the live endpoint: system, user, system, user fails every
-    time on ``azure/anthropic/claude-opus-5-5`` and succeeds once the system
-    messages lead. Relative order within each group is kept. Other models keep
-    the order they were given.
-    """
-    if not _is_claude(llm):
-        return messages
-    system = [m for m in messages if isinstance(m, SystemMessage)]
-    rest = [m for m in messages if not isinstance(m, SystemMessage)]
-    return system + rest
+    return normalize_messages(messages)
 
 
-def _structured_output_kwargs(llm: BaseChatModel) -> dict:
-    """Pick the ``with_structured_output`` method for *llm*.
-
-    Anthropic/Claude models served through the OpenAI-compatible gateway (e.g.
-    ``aws/anthropic/bedrock-claude-opus-4-8``) reject the default json_schema /
-    ``response_format`` path ("output_config.format: Extra inputs are not
-    permitted"), but they support tool calling — so force ``function_calling``
-    for them. Everything else keeps langchain's default (json_schema for
-    OpenAI), which is preferred where supported.
-
-    ``tool_choice=None`` suppresses the tool-choice langchain would otherwise set.
-    Bedrock behind LiteLLM rejects the request when one is present, because the gateway
-    both maps it into ``toolConfig.toolChoice`` and forwards the original
-    ``tool_choice.type``::
-
-        The additional field tool_choice/type conflicts with the existing field
-        toolConfig.toolChoice.tool. Remove tool_choice/type and try again.
-
-    Measured against the live endpoint: every explicit value ("auto", "any",
-    "required", and langchain's default of naming the tool) hits that conflict, and only
-    omitting it succeeds. The model still calls the tool without being forced to, and
-    the caller retries if it ever answers without one.
-    """
-    if _is_claude(llm):
-        return {"method": "function_calling", "tool_choice": None}
-    return {}
+def _structured_output_kwargs(llm: object) -> dict:
+    profile = _capabilities(llm)
+    method = profile.get("structured_output_method")
+    if method not in {None, "json_schema", "function_calling", "json_mode", "prompt"}:
+        raise ValueError("Unsupported structured output method")
+    kwargs = {"method": method} if method and method != "prompt" else {}
+    if "tool_choice" in profile:
+        choice = profile["tool_choice"]
+        if method != "function_calling" or choice not in {"omit", "auto", "required"}:
+            raise ValueError("tool_choice requires function_calling")
+        kwargs["tool_choice"] = None if choice == "omit" else choice
+    if "strict" in profile:
+        if method not in {None, "json_schema", "function_calling"}:
+            raise ValueError("strict is supported only for schema or tools")
+        kwargs["strict"] = profile["strict"]
+    if "structured_output_format" in profile:
+        fmt = profile["structured_output_format"]
+        if fmt not in {"openai", "guided_json", "nvext"}:
+            raise ValueError("Unsupported NVIDIA schema format")
+        kwargs["structured_output_format"] = fmt
+    return kwargs
 
 
-def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
-    response = llm.invoke([HumanMessage(content=prompt)])
-    content = getattr(response, "content", response)
-    return content if isinstance(content, str) else str(content)
+def _refused(raw: object) -> bool:
+    extras = getattr(raw, "additional_kwargs", {})
+    metadata = getattr(raw, "response_metadata", {})
+    if isinstance(extras, dict) and extras.get("refusal"):
+        return True
+    if isinstance(metadata, dict) and metadata.get("finish_reason") in {
+        "content_filter",
+        "refusal",
+    }:
+        return True
+    content = getattr(raw, "content", None)
+    return isinstance(content, list) and any(
+        isinstance(x, dict) and x.get("type") == "refusal" for x in content
+    )
+
+
+def _rpc(
+    llm: object, messages: list[BaseMessage], schema: Type[T] | None, remaining: float
+) -> T | str:
+    messages = normalize_messages(messages)
+    if sum(len(text_content(x.content)) for x in messages) > int(
+        os.getenv("LLM_MAX_PROMPT_CHARACTERS", "120000")
+    ):
+        raise ValueError("LLM prompt budget exceeded")
+    method = _capabilities(llm).get("structured_output_method")
+    _structured_output_kwargs(
+        llm
+    )  # Reject invalid capability combinations before any RPC.
+    sdk = isinstance(llm, BaseChatModel)
+    # ChatOpenAI forwards timeout to the SDK request; NVIDIA's requests.Session
+    # reads the same ContextVar deadline. Test doubles do not receive SDK kwargs.
+    kwargs = (
+        {"timeout": remaining}
+        if sdk and type(llm).__module__.startswith("langchain_openai")
+        else {}
+    )
+    if schema is None:
+        response = llm.invoke(messages, **kwargs)
+        if _refused(response):
+            raise LLMRefusalError("Model refused the request")
+        return text_content(getattr(response, "content", response))
+    if method in {"json_mode", "prompt"}:
+        messages.append(
+            HumanMessage(
+                content="Return only JSON matching this schema: "
+                + json.dumps(schema.model_json_schema())
+            )
+        )
+        messages = normalize_messages(messages)
+        if sum(len(text_content(x.content)) for x in messages) > int(
+            os.getenv("LLM_MAX_PROMPT_CHARACTERS", "120000")
+        ):
+            raise ValueError("LLM prompt budget exceeded")
+    nvidia = sdk and type(llm).__module__.startswith("langchain_nvidia")
+    if nvidia and method != "prompt":
+        if method == "function_calling":
+            raise ValueError("Use the OpenAI-compatible adapter for tool output")
+        profile = _capabilities(llm)
+        if (
+            profile.get("strict") is False
+            and profile.get("structured_output_format", "guided_json") != "openai"
+        ):
+            raise ValueError("strict=false requires NVIDIA openai schema format")
+        if method == "json_mode":
+            binding = {"response_format": {"type": "json_object"}}
+        else:
+            public = urlsplit(str(llm.base_url)).hostname in {
+                "integrate.api.nvidia.com",
+                "ai.api.nvidia.com",
+            }
+            fmt = profile.get(
+                "structured_output_format", "openai" if public else "guided_json"
+            )
+            definition = schema.model_json_schema()
+            if fmt == "openai":
+                binding = {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema.__name__,
+                            "schema": definition,
+                            "strict": profile.get("strict", True),
+                        },
+                    }
+                }
+            elif fmt == "guided_json":
+                binding = {"guided_json": definition}
+            elif fmt == "nvext":
+                binding = {"nvext": {"guided_json": definition}}
+            else:
+                raise ValueError("Unsupported NVIDIA schema format")
+        # The SDK's structured helper silently retries three different wire
+        # formats and cannot expose refusals. Choose one declared format and
+        # validate its raw response with the shared request budget instead.
+        response = llm.bind(**binding).invoke(messages)
+        if _refused(response):
+            raise LLMRefusalError("Model refused the request")
+        result = json.loads(text_content(response.content))
+    elif method == "prompt":
+        response = llm.invoke(messages, **kwargs)
+        if _refused(response):
+            raise LLMRefusalError("Model refused the request")
+        result = json.loads(text_content(getattr(response, "content", response)))
+    else:
+        options = _structured_output_kwargs(llm)
+        if sdk:
+            options["include_raw"] = True
+        response = llm.with_structured_output(schema, **options).invoke(
+            messages, **kwargs
+        )
+        if isinstance(response, dict) and "raw" in response and "parsed" in response:
+            if _refused(response["raw"]):
+                raise LLMRefusalError("Model refused the request")
+            result = response["parsed"]
+        else:
+            result = response
+    if result is None:
+        raise LLMOutputError("Model returned no structured output")
+    return result if isinstance(result, schema) else schema.model_validate(result)
+
+
+def _invoke(
+    llm: object, messages: list[BaseMessage], schema: Type[T] | None = None
+) -> T | str:
+    current = normalize_messages(messages)
+    budget = _BUDGET.get()
+    token = None
+    if budget is None:
+        budget = _Budget(time.monotonic() + LLM_INVOKE_TIMEOUT_S)
+        token = _BUDGET.set(budget)
+    client = llm
+    last: Exception | None = None
+    try:
+        while budget.remaining > 0:
+            remaining = budget.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("LLM total deadline exceeded")
+            budget.remaining -= 1
+            try:
+                with _inflight_guard(timeout=remaining):
+                    remaining = budget.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("LLM total deadline exceeded")
+                    return _rpc(client, current, schema, remaining)
+            except LLMRefusalError:
+                raise
+            except Exception as exc:
+                last = exc
+                correctable = isinstance(
+                    exc, (ValidationError, LLMOutputError, json.JSONDecodeError)
+                )
+                retryable = _is_retryable(exc)
+                logger.warning(
+                    "LLM attempt failed error_class=%s remaining_calls=%d",
+                    type(exc).__name__,
+                    budget.remaining,
+                )
+                if not (correctable or retryable) or budget.remaining <= 0:
+                    raise
+                if correctable:
+                    # Never elevate provider output, validation inputs or error text
+                    # into system instructions or retransmit them in a correction.
+                    current = normalize_messages(
+                        messages
+                        + [
+                            HumanMessage(
+                                content="The response did not match the required schema. Return a complete valid object without extra fields."
+                            )
+                        ]
+                    )
+                elif budget.remaining == 1:
+                    fallback = _reasoning_fallback_client(client)
+                    if fallback is not None:
+                        client = fallback
+                if retryable:
+                    delay = min(
+                        0.5 + random.uniform(0, 0.25),
+                        max(0, budget.deadline - time.monotonic()),
+                    )
+                    time.sleep(delay)
+        raise LLMOutputError("LLM call budget exhausted") from last
+    finally:
+        if token is not None:
+            _BUDGET.reset(token)
 
 
 def invoke_text(llm: BaseChatModel, prompt: str) -> str:
-    """Invoke the LLM with a single system-message *prompt* and return its text.
-
-    Free-text counterpart to :func:`invoke_with_structured_output`, for callers
-    that parse the raw response themselves (e.g. the text-to-PQL pipeline).
-    A non-reasoning client that fails is retried once on the reasoning model.
-    """
-    try:
-        return _invoke_text_once(llm, prompt)
-    except Exception as exc:
-        fallback = _reasoning_fallback_client(llm)
-        if fallback is None:
-            raise
-        logger.warning(
-            "Non-reasoning LLM call failed (%s: %s) — falling back to reasoning LLM",
-            type(exc).__name__,
-            str(exc)[:120],
-        )
-        return _invoke_text_once(fallback, prompt)
+    return _invoke(llm, [HumanMessage(content=prompt)])
 
 
 def _safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
-    """invoke_text with retry/backoff for 503/429 and the inflight semaphore."""
-    messages = [HumanMessage(content=prompt)]
-    for attempt in range(RETRY_MAX_ATTEMPTS):
-        try:
-            with _inflight_guard():
-                response = llm.invoke(messages)
-            content = getattr(response, "content", response)
-            return content if isinstance(content, str) else str(content)
-        except _requests.exceptions.ReadTimeout:
-            logger.error(
-                "LLM invoke timed out after %ds on attempt %d/%d",
-                LLM_INVOKE_TIMEOUT_S,
-                attempt + 1,
-                RETRY_MAX_ATTEMPTS,
-            )
-            if attempt < RETRY_MAX_ATTEMPTS - 1:
-                time.sleep(2 ** (attempt + 1) + random.uniform(0, 1))
-                continue
-            raise
-        except Exception as e:
-            is_retryable = _is_retryable(e)
-            if is_retryable and attempt < RETRY_MAX_ATTEMPTS - 1:
-                wait = 2 ** (attempt + 1) + random.uniform(0, 1)
-                logger.warning(
-                    "Retryable LLM error on attempt %d/%d — retrying in %.1fs: %s",
-                    attempt + 1,
-                    RETRY_MAX_ATTEMPTS,
-                    wait,
-                    str(e)[:120],
-                )
-                time.sleep(wait)
-                continue
-            raise
-    raise RuntimeError("safe_invoke_text exhausted retries")
+    return invoke_text(llm, prompt)
 
 
 def safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
-    """invoke_text with retry/backoff, then the reasoning model if this client is non-reasoning."""
-    try:
-        return _safe_invoke_text(llm, prompt)
-    except Exception as exc:
-        fallback = _reasoning_fallback_client(llm)
-        if fallback is None:
-            raise
-        _log_non_reasoning_fallback(exc)
-        return _safe_invoke_text(fallback, prompt)
+    return invoke_text(llm, prompt)
 
 
 def safe_invoke_with_structured_output(
-    llm: BaseChatModel,
-    messages: list[BaseMessage],
-    schema: Type[T],
+    llm: BaseChatModel, messages: list[BaseMessage], schema: Type[T]
 ) -> T:
-    """LLM structured call with retry."""
-    current_messages = _ensure_non_system_message(messages.copy())
-    schema_name = getattr(schema, "__name__", str(schema))
-    structured_kwargs = _structured_output_kwargs(llm)
-
-    for attempt in range(RETRY_MAX_ATTEMPTS):
-        try:
-            model_llm = llm.with_structured_output(schema, **structured_kwargs)
-            with _inflight_guard():
-                result = model_llm.invoke(_system_messages_first(llm, current_messages))
-        except _requests.exceptions.ReadTimeout:
-            logger.error(
-                "LLM invoke timed out after %ds on attempt %d/%d for %s",
-                LLM_INVOKE_TIMEOUT_S,
-                attempt + 1,
-                RETRY_MAX_ATTEMPTS,
-                schema_name,
-            )
-            if attempt < RETRY_MAX_ATTEMPTS - 1:
-                wait = 2 ** (attempt + 1) + random.uniform(0, 1)
-                time.sleep(wait)
-                continue
-            raise
-        except ValidationError as e:
-            if attempt < RETRY_MAX_ATTEMPTS - 1:
-                if attempt == 0:
-                    # First retry: append the error so the model can self-correct.
-                    current_messages.append(
-                        SystemMessage(
-                            content=(
-                                "Your previous output did not validate. "
-                                f"Validation errors:\n{str(e)}\n"
-                                "Please return a **fully valid** object that satisfies the schema. "
-                                "Do not omit required fields. Do not include extra keys."
-                            )
-                        )
-                    )
-                else:
-                    # Subsequent retries: the accumulated error context didn't help —
-                    # reset to fresh messages to avoid compounding the confusion.
-                    logger.warning(
-                        "Structured output still failing after error-context retry "
-                        "(attempt %d/%d) for %s — resetting to fresh messages",
-                        attempt + 1,
-                        RETRY_MAX_ATTEMPTS,
-                        schema_name,
-                    )
-                    current_messages = _ensure_non_system_message(messages.copy())
-                continue
-            else:
-                logger.error(
-                    f"Validation failed after {RETRY_MAX_ATTEMPTS} attempts for {schema_name}"
-                )
-                raise
-        except Exception as e:
-            is_retryable = _is_retryable(e)
-            if is_retryable and attempt < RETRY_MAX_ATTEMPTS - 1:
-                wait = 2 ** (attempt + 1) + random.uniform(0, 1)
-                logger.warning(
-                    "Retryable LLM error (endpoint saturated/rate-limited) on attempt "
-                    "%d/%d for %s — retrying in %.1fs",
-                    attempt + 1,
-                    RETRY_MAX_ATTEMPTS,
-                    schema_name,
-                    wait,
-                )
-                time.sleep(wait)
-                continue
-            logger.error(
-                f"Unexpected error on attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS} for {schema_name}: "
-                f"{type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            raise
-
-        if result is None:
-            logger.warning(
-                "LLM returned None for %s on attempt %d/%d — retrying.",
-                schema_name,
-                attempt + 1,
-                RETRY_MAX_ATTEMPTS,
-            )
-            if attempt < RETRY_MAX_ATTEMPTS - 1:
-                wait = 2 ** (attempt + 1) + random.uniform(0, 1)
-                time.sleep(wait)
-            continue
-        if isinstance(result, schema):
-            return result
-        return schema.model_validate(result)
+    return _invoke(llm, messages, schema)
 
 
 def invoke_with_structured_output(
-    llm: BaseChatModel,
-    messages: list[BaseMessage],
-    schema: Type[T],
+    llm: BaseChatModel, messages: list[BaseMessage], schema: Type[T]
 ) -> T | None:
-    """Safe wrapper that returns None on failure.
-
-    A non-reasoning client that still fails after its retries is tried once more
-    on the reasoning model. Reasoning clients are not retried on a second model.
-    """
-    schema_name = getattr(schema, "__name__", str(schema))
     try:
         return safe_invoke_with_structured_output(llm, messages, schema)
-    except Exception as e:
-        fallback = _reasoning_fallback_client(llm)
-        if fallback is not None:
-            _log_non_reasoning_fallback(e, schema_name)
-            try:
-                return safe_invoke_with_structured_output(fallback, messages, schema)
-            except Exception as e2:
-                logger.error(
-                    "Reasoning LLM also failed for %s: %s: %s",
-                    schema_name,
-                    type(e2).__name__,
-                    str(e2)[:120],
-                )
-                return None
-        logger.error(
-            f"invoke_with_structured_output failed for {schema_name} after {RETRY_MAX_ATTEMPTS} attempts: "
-            f"{type(e).__name__}: {e}",
-            exc_info=True,
+    except Exception as exc:
+        logger.warning(
+            "Structured call unavailable schema=%s error_class=%s",
+            schema.__name__,
+            type(exc).__name__,
         )
         return None
 
 
 def safe_invoke_text_nr(prompt: str) -> str:
-    """Free-text call on the non-reasoning LLM.
+    # Missing configuration is permanent and must not disclose prompts elsewhere.
+    return safe_invoke_text(get_non_reasoning_llm_client(), prompt)
 
-    ``safe_invoke_text`` retries, then falls back to the reasoning model for
-    that single call when the non-reasoning endpoint stays down.
-    """
+
+def safe_invoke_structured_nr(messages: list[BaseMessage], schema: Type[T]) -> T | None:
     try:
         client = get_non_reasoning_llm_client()
     except Exception as exc:
-        _log_non_reasoning_fallback(exc)
-        client = _get_reasoning_fallback_client()
-    return safe_invoke_text(client, prompt)
-
-
-def safe_invoke_structured_nr(
-    messages: list[BaseMessage],
-    schema: Type[T],
-) -> T | None:
-    """Structured call on the non-reasoning LLM.
-
-    ``invoke_with_structured_output`` retries, then falls back to the reasoning
-    model for that single call. Returns ``None`` when both models fail.
-    """
-    try:
-        client = get_non_reasoning_llm_client()
-    except Exception as exc:
-        schema_name = getattr(schema, "__name__", str(schema))
-        _log_non_reasoning_fallback(exc, schema_name)
-        try:
-            client = _get_reasoning_fallback_client()
-        except Exception as fallback_exc:
-            logger.error(
-                "Reasoning LLM also failed for %s: %s: %s",
-                schema_name,
-                type(fallback_exc).__name__,
-                str(fallback_exc)[:120],
-            )
-            return None
+        logger.warning(
+            "Non-reasoning client unavailable error_class=%s", type(exc).__name__
+        )
+        return None
     return invoke_with_structured_output(client, messages, schema)

@@ -12,10 +12,9 @@ can supply the shared endpoint/key/model for all of them. Each field also falls
 back to its legacy pre-triplet env var name (``NVIDIA_API_KEY`` / ``BASE_URL`` /
 ``MODEL_NAME``) for backward compatibility.
 
-When even ``DEFAULT_MODELS_<FIELD>`` is unset, a built-in default is used. There
-are two sets — one for ``sk-`` inference-api keys and one for ``nvapi-``
-integrate/build.nvidia.com keys — and the set is chosen from the API key that
-applies to the same triplet.
+When even ``DEFAULT_MODELS_<FIELD>`` is unset, a built-in default is used. Only NVIDIA public ``nvapi-`` keys have built-in defaults. Generic keys
+require explicit model and endpoint settings; a key prefix does not identify
+an OpenAI-compatible gateway or select a Claude model.
 """
 
 from __future__ import annotations
@@ -27,17 +26,6 @@ import os
 # safe hardcoded default and fall back to ``DEFAULT_MODELS_API_KEY`` /
 # ``NVIDIA_API_KEY`` instead).
 _DEFAULTS_BY_KEY_PREFIX: dict[str, dict[str, str]] = {
-    # inference-api.nvidia.com (sk-... keys).
-    "sk-": {
-        "REASONING_ENDPOINT": "https://inference-api.nvidia.com/v1",
-        "REASONING_MODEL": "azure/anthropic/claude-opus-5-5",
-        "NON_REASONING_ENDPOINT": "https://inference-api.nvidia.com/v1",
-        "NON_REASONING_MODEL": "azure/anthropic/claude-opus-5-5",
-        "EMBED_ENDPOINT": "https://inference-api.nvidia.com/v1",
-        "EMBED_MODEL": "nvidia/nvidia/nemotron-3.5-embed-1b-nvfp4",
-        "RERANK_ENDPOINT": "https://inference-api.nvidia.com/v1/rerank",
-        "RERANK_MODEL": "nvidia/nvidia/nemotron-3.5-rerank-8b-bf16",
-    },
     # integrate.api.nvidia.com / build.nvidia.com (nvapi-... keys).
     "nvapi-": {
         "REASONING_ENDPOINT": "https://integrate.api.nvidia.com/v1",
@@ -55,7 +43,7 @@ _DEFAULTS_BY_KEY_PREFIX: dict[str, dict[str, str]] = {
 }
 
 # Default set to use when the API key matches no known prefix (or is unset).
-_FALLBACK_KEY_PREFIX = "sk-"
+_FALLBACK_KEY_PREFIX = ""
 
 
 # Legacy (pre-triplet) env var names, still honored so existing deployments and
@@ -86,15 +74,15 @@ def _builtin_default(prefix: str, key: str) -> str:
     for key_prefix, defaults in _DEFAULTS_BY_KEY_PREFIX.items():
         if api_key.startswith(key_prefix):
             return defaults.get(key, "")
-    return _DEFAULTS_BY_KEY_PREFIX[_FALLBACK_KEY_PREFIX].get(key, "")
+    return ""
 
 
 def resolve(prefix: str, field: str) -> str:
     """Resolve one triplet field.
 
     Order of precedence: the ``<prefix>_<field>`` env var, then the shared
-    ``DEFAULT_MODELS_<field>``, then a built-in default chosen by whether the
-    triplet's API key is an ``sk-`` or ``nvapi-`` key.
+    ``DEFAULT_MODELS_<field>``, then a built-in default chosen by the known
+    NVIDIA public key type. Generic keys have no implicit model or endpoint.
     """
     key = f"{prefix}_{field}"
     return os.environ.get(key, "") or _default(field) or _builtin_default(prefix, key)

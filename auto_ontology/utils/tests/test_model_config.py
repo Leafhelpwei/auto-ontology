@@ -48,17 +48,14 @@ def test_an_nvapi_key_selects_the_nemotron_3_5_defaults(
     assert model_config.resolve(role, field) == NVAPI_DEFAULTS[(role, field)]
 
 
-def test_an_sk_key_keeps_the_inference_api_defaults(
-    clean_env: pytest.MonkeyPatch,
+@pytest.mark.parametrize("key", ["sk-test", "arbitrary", ""])
+def test_generic_key_does_not_choose_a_model_or_disclosure_endpoint(
+    clean_env: pytest.MonkeyPatch, key: str
 ) -> None:
-    clean_env.setenv("DEFAULT_MODELS_API_KEY", "sk-test")
-
-    assert model_config.resolve("REASONING", "MODEL") == (
-        "azure/anthropic/claude-opus-5-5"
-    )
-    assert model_config.resolve("EMBED", "MODEL") == (
-        "nvidia/nvidia/nemotron-3.5-embed-1b-nvfp4"
-    )
+    clean_env.setenv("DEFAULT_MODELS_API_KEY", key)
+    for role in ("REASONING", "NON_REASONING", "EMBED", "RERANK"):
+        assert model_config.resolve(role, "MODEL") == ""
+        assert model_config.resolve(role, "ENDPOINT") == ""
 
 
 def test_an_explicit_setting_wins_over_the_default(

@@ -194,9 +194,10 @@ def test_sql_generation_uses_reasoning_client(monkeypatch) -> None:
     assert result["decision"] == "constructable"
     assert invoked_with == [reasoning_llm]
     evidence = "Active means accounts.status = 'active'."
-    assert sum(evidence in message.content for message in invoked_messages) == 2
+    assert sum(evidence in message.content for message in invoked_messages) == 1
     assert evidence in invoked_messages[-1].content
-    assert "## Authoritative Evidence" in invoked_messages[-1].content
+    assert "untrusted data" in invoked_messages[-1].content
+    assert invoked_messages[-1].type == "human"
 
 
 def test_important_columns_include_full_details_and_ignore_structural_paths() -> None:

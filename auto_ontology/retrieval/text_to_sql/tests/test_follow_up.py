@@ -6,6 +6,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 from pytest import MonkeyPatch
 
 from auto_ontology.retrieval.text_to_sql import follow_up
@@ -60,12 +61,13 @@ def test_follow_up_uses_standalone_question(monkeypatch: MonkeyPatch) -> None:
     ) == (True, "Show revenue for August")
 
 
-def test_resolver_failure_falls_back_to_original(monkeypatch: MonkeyPatch) -> None:
+def test_resolver_failure_requires_clarification(monkeypatch: MonkeyPatch) -> None:
     def raise_error(*args, **kwargs):
         raise RuntimeError("LLM unavailable")
 
     monkeypatch.setattr(follow_up, "invoke_with_structured_output", raise_error)
 
-    assert follow_up.resolve_follow_up(
-        question="What about August?", history=_HISTORY, llm=object()
-    ) == (False, "What about August?")
+    with pytest.raises(ValueError, match="restate the complete question"):
+        follow_up.resolve_follow_up(
+            question="What about August?", history=_HISTORY, llm=object()
+        )

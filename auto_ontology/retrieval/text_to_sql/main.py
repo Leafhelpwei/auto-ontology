@@ -292,6 +292,8 @@ def _should_retry_full_pipeline(
     terminal_node: str | None,
 ) -> bool:
     """Whether an unconstructable SQL attempt should restart from intent."""
+    if (final_state.get("path_state") or {}).get("intent_validation_unavailable"):
+        return False
     if terminal_node != _UNCONSTRUCTABLE_NODE:
         return False
     if "restore_from" not in final_state:
@@ -305,39 +307,8 @@ def _apply_last_deterministic_sql_fallback(
     final_state: dict,
     terminal_node: str | None,
 ) -> bool:
-    """Return the last static-valid SQL after the final intent retry is exhausted."""
-    if (
-        terminal_node != _UNCONSTRUCTABLE_NODE
-        or final_state.get("full_pipeline_attempt", 1) < _MAX_FULL_PIPELINE_ATTEMPTS
-    ):
-        return False
-
-    path_state = final_state.get("path_state") or {}
-    fallback_sql = str(path_state.get("last_intent_rejected_sql") or "").strip()
-    if (
-        not fallback_sql
-        or str(_extract_answer(final_state).get("sql_code") or "").strip()
-    ):
-        return False
-
-    path_state["sql_code"] = fallback_sql
-    path_state["returned_deterministic_fallback"] = True
-    final_response = path_state.get("final_response")
-    if isinstance(final_response, dict):
-        final_response = dict(final_response)
-        final_response["sql_code"] = fallback_sql
-    else:
-        final_response = {
-            "response": str(final_response or "SQL intent validation was exhausted."),
-            "sql_code": fallback_sql,
-        }
-    path_state["final_response"] = final_response
-    final_state["path_state"] = path_state
-    logger.warning(
-        "Returning the last deterministically valid SQL after two full-pipeline "
-        "attempts exhausted intent validation"
-    )
-    return True
+    """A rejected query must never become an executable fallback."""
+    return False
 
 
 def _sql_about_to_run(node_name: str, node_output: dict, node_path_state: dict) -> str:

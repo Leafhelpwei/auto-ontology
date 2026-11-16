@@ -1065,7 +1065,7 @@ class SQLValidationAgent(BaseAgent):
         messages = [SystemMessage(content=system_prompt)]
         if evidence:
             messages.append(
-                SystemMessage(content=format_authoritative_evidence(evidence))
+                HumanMessage(content=format_authoritative_evidence(evidence))
             )
         messages.append(HumanMessage(content=validation_prompt))
 
@@ -1074,8 +1074,10 @@ class SQLValidationAgent(BaseAgent):
                 state["llm"], messages, IntentValidationModel
             )
         except Exception as error:
-            self.logger.error("Intent validation LLM call failed: %s", error)
-            return {"decision": "valid_sql", "path_state": path_state}
+            self.logger.error(
+                "Intent validation unavailable error_class=%s", type(error).__name__
+            )
+            validation_result = None
 
         if (
             validation_result is not None
@@ -1087,7 +1089,22 @@ class SQLValidationAgent(BaseAgent):
                 validation_result.reasoning.strip(),
             )
 
-        if validation_result is None or (
+        if validation_result is None:
+            reason = "SQL intent validation is unavailable; no query was executed."
+            return {
+                "decision": "unconstructable",
+                "path_state": {
+                    **path_state,
+                    "sql_code": None,
+                    "sql_generation_result": None,
+                    "last_intent_rejected_sql": None,
+                    "intent_validation_unavailable": True,
+                    "unconstructable_explanation": reason,
+                    "final_response": {"response": reason, "sql_code": None},
+                },
+            }
+
+        if (
             validation_result.is_valid
             and not validation_result.evidence_issues
             and not validation_result.projection_issues
@@ -1105,10 +1122,11 @@ class SQLValidationAgent(BaseAgent):
             or validation_result.evidence_issues
         )
         if not has_real_issues:
-            self.logger.info(
-                "SQL intent validation passed (is_valid=False without issues)"
+            path_state["error"] = (
+                "Intent validator rejected the query without a usable explanation."
             )
-            return {"decision": "valid_sql", "path_state": path_state}
+            path_state["last_intent_rejected_sql"] = sql_code
+            return {"decision": "invalid_sql", "path_state": path_state}
 
         error_parts = ["Critical SQL issues found:"]
         issue_sections = (

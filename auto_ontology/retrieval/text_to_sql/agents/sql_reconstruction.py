@@ -772,7 +772,7 @@ class SQLReconstructionAgent(BaseAgent):
         prompt_messages = _without_prior_repair_turns(list(state["messages"]))
         if evidence:
             prompt_messages.append(
-                SystemMessage(content=format_authoritative_evidence(evidence))
+                HumanMessage(content=format_authoritative_evidence(evidence))
             )
         prompt_messages.append(HumanMessage(content=error_prompt))
 

@@ -44,8 +44,12 @@ def resolve_follow_up(
 ) -> tuple[bool, str]:
     """Return ``(is_follow_up, processing_question)`` with safe fallback."""
 
-    if not history or llm is None:
+    if not history:
         return False, question
+    if llm is None:
+        raise ValueError(
+            "Conversation context resolver is unavailable; restate the complete question"
+        )
 
     prompt = create_follow_up_resolution_prompt(
         question=question,
@@ -55,20 +59,27 @@ def resolve_follow_up(
         result = invoke_with_structured_output(
             llm, [HumanMessage(content=prompt)], FollowUpResolutionModel
         )
-    except Exception:  # noqa: BLE001 — context is optional; chat must still run
-        logger.exception("Follow-up resolution failed; using original question")
-        return False, question
+    except Exception as exc:
+        logger.warning(
+            "Follow-up resolution unavailable error_class=%s", type(exc).__name__
+        )
+        raise ValueError(
+            "Conversation context could not be resolved; restate the complete question"
+        ) from None
 
     if result is None:
-        logger.warning("Follow-up resolution returned no result")
-        return False, question
+        raise ValueError(
+            "Conversation context could not be resolved; restate the complete question"
+        )
 
     standalone = result.standalone_question.strip()
     if not result.is_follow_up:
         # Enforce the contract locally instead of allowing an independent
         # question to be silently changed by the model.
         return False, question
-    return True, standalone or question
+    if not standalone:
+        raise ValueError("Context resolution returned an empty question")
+    return True, standalone
 
 
 __all__ = ["resolve_follow_up"]

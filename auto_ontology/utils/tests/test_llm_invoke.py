@@ -5,6 +5,7 @@
 """Tests for LLM invocation helpers."""
 
 import contextlib
+import json
 import threading
 import time
 from typing import Any
@@ -27,6 +28,12 @@ def _isolate_fallback_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm_invoke, "_NON_REASONING_IDS", set())
     monkeypatch.setattr(llm_invoke, "_NON_REASONING_STRONG_REFS", {})
     monkeypatch.setattr(llm_invoke, "_REASONING_FALLBACK_CLIENT", None)
+    monkeypatch.delenv("LLM_MODEL_CAPABILITIES", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENDPOINT_ALLOWLIST", raising=False)
+    monkeypatch.setattr(
+        llm_invoke, "_NON_REASONING_BASE_URL", "https://same.example/v1"
+    )
+    monkeypatch.setattr(llm_invoke, "_BASE_URL", "https://same.example/v1")
 
 
 class _Model:
@@ -36,45 +43,36 @@ class _Model:
         self.model_name = model_name
 
 
-def test_claude_uses_function_calling_without_a_tool_choice() -> None:
-    """Bedrock behind LiteLLM rejects any explicit tool choice.
-
-    The gateway maps tool_choice into ``toolConfig.toolChoice`` *and* forwards the
-    original ``tool_choice.type``, and Bedrock refuses the pair:
-
-        The additional field tool_choice/type conflicts with the existing field
-        toolConfig.toolChoice.tool.
-
-    Measured against the live endpoint: "auto", "any", "required" and langchain's
-    default (naming the tool) all hit it; only omitting the choice succeeds.
-    """
-    kwargs = _structured_output_kwargs(_Model("aws/anthropic/bedrock-claude-opus-4-8"))
-
-    assert kwargs == {"method": "function_calling", "tool_choice": None}
+@pytest.mark.parametrize(
+    "name", ["claude-opus", "ANTHROPIC/Claude", "qwen", "nvidia/nemotron", "gpt-4o"]
+)
+def test_model_name_does_not_implicitly_select_protocol(name: str) -> None:
+    assert _structured_output_kwargs(_Model(name)) == {}
 
 
-def test_claude_is_matched_on_either_vendor_or_family_name() -> None:
-    for name in (
-        "aws/anthropic/bedrock-claude-opus-4-8",
-        "claude-3-5-sonnet",
-        "ANTHROPIC/Claude",
-    ):
-        assert _structured_output_kwargs(_Model(name))["method"] == "function_calling"
+def test_explicit_tool_capabilities_support_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "LLM_MODEL_CAPABILITIES",
+        json.dumps(
+            {
+                "gateway-model": {
+                    "structured_output_method": "function_calling",
+                    "tool_choice": "omit",
+                }
+            }
+        ),
+    )
+    assert _structured_output_kwargs(_Model("gateway-model")) == {
+        "method": "function_calling",
+        "tool_choice": None,
+    }
 
+    class Alternate:
+        model = "gateway-model"
 
-def test_other_models_keep_the_langchain_default() -> None:
-    """json_schema is preferred where supported, so nothing is forced for them."""
-    for name in ("nvidia/nemotron-3.5-lightning-30b-a3b", "gpt-4o", ""):
-        assert _structured_output_kwargs(_Model(name)) == {}
-
-
-def test_a_client_exposing_model_instead_of_model_name_still_matches() -> None:
-    """Some langchain clients expose `model` rather than `model_name`."""
-
-    class _AltModel:
-        model: Any = "aws/anthropic/bedrock-claude-opus-4-8"
-
-    assert _structured_output_kwargs(_AltModel())["tool_choice"] is None
+    assert _structured_output_kwargs(Alternate())["tool_choice"] is None
 
 
 def _interleaved() -> list[BaseMessage]:
@@ -88,38 +86,20 @@ def _interleaved() -> list[BaseMessage]:
     ]
 
 
-def test_claude_gets_its_system_messages_ahead_of_the_conversation() -> None:
-    """azure/anthropic/* on the gateway 400s on a system message after a user one."""
-    ordered = _system_messages_first(
-        _Model("azure/anthropic/claude-opus-5-5"), _interleaved()
-    )
-
-    assert [m.content for m in ordered] == [
-        "role",
-        "evidence",
-        "anchors",
-        "question",
-        "prompt",
-    ]
-
-
-def test_other_models_keep_their_message_order() -> None:
-    messages = _interleaved()
-
-    assert (
-        _system_messages_first(
-            _Model("nvidia/nemotron-3.5-lightning-30b-a3b"), messages
-        )
-        == messages
-    )
+@pytest.mark.parametrize("model", ["claude-opus", "qwen", "nvidia/nemotron"])
+def test_every_model_gets_a_single_leading_system(model: str) -> None:
+    ordered = _system_messages_first(_Model(model), _interleaved())
+    assert [m.type for m in ordered] == ["system", "human"]
+    assert ordered[0].content == "role\n\nevidence\n\nanchors"
+    assert ordered[1].content == "question\n\nprompt"
 
 
 class _SystemCheckModel(BaseModel):
     answer: str
 
 
-def test_validation_retry_note_reaches_claude_ahead_of_the_conversation() -> None:
-    """The retry appends a system message after the user turn; it must not stay there."""
+def test_validation_correction_remains_in_user_role() -> None:
+    """Output errors never become privileged system instructions."""
     sent: list[list[BaseMessage]] = []
 
     class _Structured:
@@ -140,7 +120,9 @@ def test_validation_retry_note_reaches_claude_ahead_of_the_conversation() -> Non
     )
 
     roles = [m.type for m in sent[1]]
-    assert roles == ["system", "system", "human"]
+    assert roles == ["system", "human"]
+    assert sent[1][0].content == "role"
+    assert "schema" in sent[1][1].content
 
 
 def _bound() -> int | None:
@@ -262,238 +244,132 @@ def test_non_weakref_client_id_cannot_match_an_unrelated_client(
     assert not llm_invoke._is_non_reasoning_client(candidate)
 
 
-def test_structured_non_reasoning_call_falls_back_to_reasoning(
-    monkeypatch: Any,
+class ScriptedModel(_Model):
+    def __init__(self, responses: list[object]) -> None:
+        super().__init__("configured-model")
+        self.responses = iter(responses)
+        self.calls = 0
+
+    def with_structured_output(
+        self, *_args: object, **_kwargs: object
+    ) -> "ScriptedModel":
+        return self
+
+    def invoke(self, _messages: object) -> object:
+        self.calls += 1
+        result = next(self.responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+@pytest.mark.parametrize("structured", [True, False])
+@pytest.mark.parametrize("binding", [True, False])
+def test_same_endpoint_transient_fallback_shares_three_call_budget(
+    monkeypatch: pytest.MonkeyPatch, structured: bool, binding: bool
 ) -> None:
-    primary = object()
-    reasoning = object()
+    error = TimeoutError("temporary")
+    primary = ScriptedModel([error, error])
+    target = ScriptedModel([_SystemCheckModel(answer="ok") if structured else "ok"])
     llm_invoke._remember_non_reasoning(primary)
-    calls: list[object] = []
+    client = primary
+    if binding:
 
-    def invoke(llm: object, _messages: object, _schema: object) -> str:
-        calls.append(llm)
-        if llm is primary:
-            raise RuntimeError("429 Too Many Requests")
-        return "from-reasoning"
+        class Binding(ScriptedModel):
+            def invoke(self, messages: object) -> object:
+                return primary.invoke(messages)
 
-    monkeypatch.setattr(llm_invoke, "safe_invoke_with_structured_output", invoke)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-
-    result = llm_invoke.invoke_with_structured_output(primary, [], _Schema)
-
-    assert result == "from-reasoning"
-    assert calls == [primary, reasoning]
-
-
-def test_bound_non_reasoning_client_falls_back(monkeypatch: Any) -> None:
-    primary = object()
-    reasoning = object()
-    binding = _Binding(primary)
-    llm_invoke._remember_non_reasoning(primary)
-    calls: list[object] = []
-
-    def invoke(llm: object, _messages: object, _schema: object) -> str:
-        calls.append(llm)
-        if llm is not reasoning:
-            raise RuntimeError("down")
-        return "ok"
-
-    monkeypatch.setattr(llm_invoke, "safe_invoke_with_structured_output", invoke)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-
-    result = llm_invoke.invoke_with_structured_output(binding, [], _Schema)
-
-    assert result == "ok"
-    assert calls == [binding, reasoning]
+        client = Binding([])
+        client.bound = primary
+    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_: target)
+    monkeypatch.setattr(llm_invoke.time, "sleep", lambda _: None)
+    if structured:
+        result = llm_invoke.invoke_with_structured_output(
+            client, [HumanMessage(content="q")], _SystemCheckModel
+        )
+        assert result.answer == "ok"
+    else:
+        assert llm_invoke.safe_invoke_text(client, "q") == "ok"
+    assert (primary.calls, target.calls) == (2, 1)
 
 
-def test_reasoning_fallback_client_is_reused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first = object()
-    second = object()
-    reasoning = object()
-    builds: list[object] = []
+def test_reasoning_fallback_client_is_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second, target = object(), object(), object()
+    builds = []
     llm_invoke._remember_non_reasoning(first)
     llm_invoke._remember_non_reasoning(second)
     monkeypatch.setattr(
-        llm_invoke,
-        "get_llm_client",
-        lambda **_kwargs: builds.append(reasoning) or reasoning,
+        llm_invoke, "get_llm_client", lambda **_: builds.append(target) or target
     )
+    assert llm_invoke._reasoning_fallback_client(first) is target
+    assert llm_invoke._reasoning_fallback_client(second) is target
+    assert builds == [target]
 
-    assert llm_invoke._reasoning_fallback_client(first) is reasoning
-    assert llm_invoke._reasoning_fallback_client(second) is reasoning
-    assert builds == [reasoning]
 
-
-def test_structured_fallback_returns_none_when_reasoning_also_fails(
-    monkeypatch: Any,
+@pytest.mark.parametrize("structured", [True, False])
+def test_exhaustion_is_bounded_for_both_public_apis(
+    monkeypatch: pytest.MonkeyPatch, structured: bool
 ) -> None:
-    primary = object()
-    reasoning = object()
+    primary = ScriptedModel([TimeoutError("temporary")] * 2)
+    target = ScriptedModel([TimeoutError("temporary")])
     llm_invoke._remember_non_reasoning(primary)
-    calls: list[object] = []
-
-    def invoke(llm: object, _messages: object, _schema: object) -> None:
-        calls.append(llm)
-        raise RuntimeError("429")
-
-    monkeypatch.setattr(llm_invoke, "safe_invoke_with_structured_output", invoke)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-    monkeypatch.setattr(llm_invoke, "_NON_REASONING_API_KEY", "sk-test")
-    monkeypatch.setattr(llm_invoke, "_build_client", lambda **_kwargs: primary)
-
-    result = llm_invoke.safe_invoke_structured_nr([], _Schema)
-
-    assert result is None
-    assert calls == [primary, reasoning]
+    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_: target)
+    monkeypatch.setattr(llm_invoke.time, "sleep", lambda _: None)
+    if structured:
+        assert (
+            llm_invoke.invoke_with_structured_output(
+                primary, [HumanMessage(content="q")], _SystemCheckModel
+            )
+            is None
+        )
+    else:
+        with pytest.raises(TimeoutError):
+            llm_invoke.invoke_text(primary, "q")
+    assert (primary.calls, target.calls) == (2, 1)
 
 
-def test_structured_nr_uses_reasoning_when_non_reasoning_client_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reasoning = object()
-    calls: list[object] = []
-
-    monkeypatch.setattr(
-        llm_invoke,
-        "get_non_reasoning_llm_client",
-        lambda **_kwargs: (_ for _ in ()).throw(EnvironmentError("missing key")),
-    )
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-    monkeypatch.setattr(
-        llm_invoke,
-        "safe_invoke_with_structured_output",
-        lambda llm, _messages, _schema: calls.append(llm) or "ok",
-    )
-
-    assert llm_invoke.safe_invoke_structured_nr([], _Schema) == "ok"
-    assert calls == [reasoning]
-
-
-def test_structured_nr_returns_none_when_neither_client_is_available(
+def test_missing_configuration_never_redirects_private_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def unavailable(**_kwargs: object) -> object:
         raise EnvironmentError("missing key")
 
     monkeypatch.setattr(llm_invoke, "get_non_reasoning_llm_client", unavailable)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", unavailable)
-
-    assert llm_invoke.safe_invoke_structured_nr([], _Schema) is None
-
-
-def test_reasoning_structured_call_does_not_switch_models(monkeypatch: Any) -> None:
-    reasoning = object()
-
-    def invoke(_llm: object, _messages: object, _schema: object) -> None:
-        raise RuntimeError("429")
-
-    def fail_client(**_kwargs: object) -> object:
-        raise AssertionError("reasoning call must not build a fallback client")
-
-    monkeypatch.setattr(llm_invoke, "safe_invoke_with_structured_output", invoke)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", fail_client)
-
-    assert llm_invoke.invoke_with_structured_output(reasoning, [], _Schema) is None
+    monkeypatch.setattr(
+        llm_invoke, "get_llm_client", lambda **_: pytest.fail("unexpected fallback")
+    )
+    assert (
+        llm_invoke.safe_invoke_structured_nr(
+            [HumanMessage(content="q")], _SystemCheckModel
+        )
+        is None
+    )
+    with pytest.raises(EnvironmentError):
+        llm_invoke.safe_invoke_text_nr("q")
 
 
-def test_text_non_reasoning_call_falls_back_once(monkeypatch: Any) -> None:
-    primary = object()
-    reasoning = object()
-    llm_invoke._remember_non_reasoning(primary)
-    calls: list[object] = []
-
-    def once(llm: object, _prompt: str) -> str:
-        calls.append(llm)
-        if llm is primary:
-            raise RuntimeError("connection error")
-        return "ok"
-
-    monkeypatch.setattr(llm_invoke, "_safe_invoke_text", once)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-
-    assert llm_invoke.safe_invoke_text(primary, "question") == "ok"
-    assert calls == [primary, reasoning]
-
-
-def test_text_nr_uses_reasoning_when_non_reasoning_client_is_unavailable(
+def test_reasoning_client_never_switches_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    reasoning = object()
-    calls: list[object] = []
-
+    client = ScriptedModel([TimeoutError("temporary")] * 3)
     monkeypatch.setattr(
-        llm_invoke,
-        "get_non_reasoning_llm_client",
-        lambda **_kwargs: (_ for _ in ()).throw(EnvironmentError("missing key")),
+        llm_invoke, "get_llm_client", lambda **_: pytest.fail("unexpected fallback")
     )
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-    monkeypatch.setattr(
-        llm_invoke,
-        "_safe_invoke_text",
-        lambda llm, _prompt: calls.append(llm) or "ok",
+    monkeypatch.setattr(llm_invoke.time, "sleep", lambda _: None)
+    assert (
+        llm_invoke.invoke_with_structured_output(
+            client, [HumanMessage(content="q")], _SystemCheckModel
+        )
+        is None
     )
-
-    assert llm_invoke.safe_invoke_text_nr("question") == "ok"
-    assert calls == [reasoning]
+    assert client.calls == 3
 
 
-def test_text_fallback_is_not_attempted_twice(monkeypatch: Any) -> None:
-    primary = object()
-    reasoning = object()
-    calls: list[object] = []
-
-    def once(llm: object, _prompt: str) -> str:
-        calls.append(llm)
-        raise RuntimeError("429")
-
-    monkeypatch.setattr(llm_invoke, "_NON_REASONING_API_KEY", "sk-test")
-    monkeypatch.setattr(llm_invoke, "_build_client", lambda **_kwargs: primary)
-    monkeypatch.setattr(llm_invoke, "_safe_invoke_text", once)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-
-    try:
-        llm_invoke.safe_invoke_text_nr("question")
-    except RuntimeError as exc:
-        assert "429" in str(exc)
-    else:
-        raise AssertionError("both models failing must raise")
-
-    assert calls == [primary, reasoning]
-
-
-def test_invoke_text_falls_back_for_a_non_reasoning_client(monkeypatch: Any) -> None:
-    primary = object()
-    reasoning = object()
-    llm_invoke._remember_non_reasoning(primary)
-    calls: list[object] = []
-
-    def once(llm: object, _prompt: str) -> str:
-        calls.append(llm)
-        if llm is primary:
-            raise RuntimeError("down")
-        return "pql"
-
-    monkeypatch.setattr(llm_invoke, "_invoke_text_once", once)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", lambda **_kwargs: reasoning)
-
-    assert llm_invoke.invoke_text(primary, "predict") == "pql"
-    assert calls == [primary, reasoning]
-
-
-def test_missing_reasoning_client_keeps_the_original_failure(monkeypatch: Any) -> None:
-    primary = object()
-    llm_invoke._remember_non_reasoning(primary)
-
-    def invoke(_llm: object, _messages: object, _schema: object) -> None:
-        raise RuntimeError("429")
-
-    def unavailable(**_kwargs: object) -> object:
-        raise EnvironmentError("REASONING_API_KEY is not set")
-
-    monkeypatch.setattr(llm_invoke, "safe_invoke_with_structured_output", invoke)
-    monkeypatch.setattr(llm_invoke, "get_llm_client", unavailable)
-
-    assert llm_invoke.invoke_with_structured_output(primary, [], _Schema) is None
+def test_waiting_for_capacity_obeys_the_same_deadline() -> None:
+    with llm_invoke.limit_inflight(1):
+        with llm_invoke._inflight_guard():
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                with llm_invoke._inflight_guard(timeout=0.02):
+                    pytest.fail("capacity already held")
+            assert time.monotonic() - started < 0.5

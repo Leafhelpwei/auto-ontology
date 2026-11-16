@@ -1,0 +1,2183 @@
+{
+  "title": "Auto Ontology 全面审计与改进清单",
+  "date": "2026-11-15",
+  "repository": "Leafhelpwei/auto-ontology",
+  "branch": "feat/governed-metrics",
+  "commit": "1a5c505dbc3549dc2e80a3a29bd080b9e7ed7b80",
+  "scope": "只读审查；源码、隔离数据库与本地替身探针；未运行真实 LLM/生产数据/完整登录浏览器链路",
+  "findings": [
+    {
+      "id": "RUNTIME-01",
+      "title": "报错后的旧 DONE 标记污染下一请求，工作进程复用可错配后续用户结果",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 226,
+          "end_line": 235,
+          "note": "同一次失败依次发送 error、done；进程循环继续存活。指标模式263-267亦同。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 368,
+          "end_line": 371,
+          "note": "events遇error立即抛异常，未消费后续done。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 492,
+          "end_line": 540,
+          "note": "pump捕获错误后finally释放slot；未把worker标为损坏。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 292,
+          "end_line": 296,
+          "note": "非cancelled分支调用return_alive。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 454,
+          "end_line": 462,
+          "note": "仍存活的worker放回全局共享standby。"
+        }
+      ],
+      "trigger": "工作进程在一次请求A中抛出外层异常；同一进程被后续请求B、C复用。",
+      "impact": "B首先消费A遗留的done，提前结束；B真实事件留在队列，可被C消费并按C的slot持久化/展示。已用实际events、pump及WarmPool复现事件错配。真实SSO数据泄露未实测；若B与C属于不同用户、B结果含C无权查看的数据，则存在跨用户结果暴露条件。",
+      "fix": "错误即淘汰worker，或在有界清理到该请求done后才允许复用；所有输入/输出增加服务器request_id并严格匹配，禁止无ID的跨请求复用。",
+      "acceptance": "测试A异常后B仍完整返回B结果；C只能收到C事件。分别覆盖explore/metrics、不同user_id、不同subject_token、error与done到达间隔、worker异常退出。",
+      "verification": "纯内存最小复现实际PrewarmedWorker.events：A报错；B-consumes=[]；C-consumes=[B-private-result]。再调用实际router._pump+WarmPool：A错误后返还同一worker=True；B buffer=[]且返还同一worker=True；C buffer含B private result和SELECT B_private。使用不同slot.user_id但analytics_id=None，因此未写数据库；真实SSO凭据及持久化泄露未实测。",
+      "effort": "M（修补淘汰S；完整请求关联与回归M）",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-02",
+      "title": "Chat 在途状态仅存进程内，多副本时取消、重连和会话互斥不一致",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 246,
+          "end_line": 271,
+          "note": "active slots字典及锁均为本地进程对象。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 812,
+          "end_line": 822,
+          "note": "watch在本地无slot时直接返回DONE。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 857,
+          "end_line": 869,
+          "note": "cancel在本地无slot时返回cancelled=false。"
+        },
+        {
+          "path": "helm/auto-ontology/templates/backend.yaml",
+          "line": 13,
+          "end_line": 29,
+          "note": "普通ClusterIP Service，replicas可配置；模板未配置会话亲和或任务所有者路由。"
+        }
+      ],
+      "trigger": "backend.replicas>1、多个ASGI worker，或任务执行中Pod重启/滚动升级；请求被分发到不同进程。",
+      "impact": "A副本执行时B副本的watch报告无任务、cancel无效；同一会话可在两副本同时提交并执行，破坏单轮互斥与顺序。SSE事件缓冲在进程退出后丢失。默认单副本可规避跨副本场景，但不能恢复重启中的任务。",
+      "fix": "短期明确单backend进程限制；长期把run状态、owner/lease与conversation互斥持久化，取消路由至owner，事件采用带序号的可重放日志。粘性会话仅作为过渡，不替代故障恢复。",
+      "acceptance": "双副本随机分流下，同会话仅一个run被接受；另一副本可watch与cancel；杀死owner后任务进入可解释终态/被安全接管，不永久running。",
+      "verification": "代码确认本地字典查找和Helm可扩副本；未运行真实多Pod集群。",
+      "effort": "L",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-03",
+      "title": "会话并发无总量限制，且重复请求在检查409之前已创建工作进程",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 443,
+          "end_line": 452,
+          "note": "无standby即新建子进程，没有池容量或等待队列。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 665,
+          "end_line": 697,
+          "note": "先acquire并等待初始化，后try_claim_slot判409。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 123,
+          "end_line": 126,
+          "note": "每个探索worker初始化两种retriever及全部connector。"
+        },
+        {
+          "path": "auto_ontology/connectors/postgres.py",
+          "line": 72,
+          "end_line": 80,
+          "note": "每个Postgres connector独立连接池min1/max4。"
+        },
+        {
+          "path": "auto_ontology/vdb/postgres.py",
+          "line": 202,
+          "end_line": 212,
+          "note": "每种VDB独立pool_size10+overflow10；data与semantic分别建池。"
+        }
+      ],
+      "trigger": "大量同时活动会话、无conversation_id的并行请求，或同会话重复提交；每进程均加载重资源。",
+      "impact": "工作进程数、驻留内存与数据库连接随并发增长；连最终返回409的请求也可能完成昂贵冷启动。SQL单语句timeout不能约束入场资源或LLM整个生命周期。池大小是单worker上限，不是部署全局预算。",
+      "fix": "在spawn前完成廉价的会话占位与全局/用户配额检查；设置有界worker数量、有限等待队列、等待截止时间与429/503；按副本数×worker数制定源库和store连接预算。",
+      "acceptance": "并发提交超过上限时PID数和连接数稳定在配置预算内；相同会话重复请求快速409且不增加worker；队列超时/取消释放配额。",
+      "verification": "代码确认无容量控制与入场顺序，未做大规模压力试验。",
+      "effort": "M",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-04",
+      "title": "工作进程初始化等待无截止时间，也不检查死亡或READY失败",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 377,
+          "end_line": 390,
+          "note": "默认timeout=None，直接Queue.get，不检查child存活。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 429,
+          "end_line": 439,
+          "note": "后台预热无timeout且忽略ready布尔结果。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 449,
+          "end_line": 452,
+          "note": "请求路径同样无timeout且忽略ready结果。"
+        }
+      ],
+      "trigger": "子进程在发READY前被OOM/SIGKILL，或初始化依赖永久阻塞；也包括初始化返回error而非ready。",
+      "impact": "acquire线程及HTTP请求可无限等待；后台预热线程不回收。初始化error的False结果也被忽略，可把尚未正常就绪的worker交给请求。",
+      "fix": "有界轮询就绪队列，同时检测进程退出；超时或非READY必须kill/join并关闭队列，向调用方返回明确503。初始化预算与SQL执行预算分开配置。",
+      "acceptance": "在READY前强杀子进程、卡住初始化以及发送ERROR三种情况下，acquire在配置时间内退出、没有孤立线程/进程，并可创建下一健康worker。",
+      "verification": "纯内存复现：is_alive=False且队列为空，drain_until_ready线程在100ms后仍等待；补入READY才解除。代码显示默认等待没有上限。",
+      "effort": "S",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-05",
+      "title": "探索SQL结果全量读取和序列化，缺少行数及字节预算",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/connectors/postgres.py",
+          "line": 31,
+          "end_line": 47,
+          "note": "普通客户端cursor执行后fetchall，再构建DataFrame。"
+        },
+        {
+          "path": "auto_ontology/connectors/mysql.py",
+          "line": 214,
+          "end_line": 221,
+          "note": "legacy execute同样fetchall与DataFrame。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_execution.py",
+          "line": 172,
+          "end_line": 189,
+          "note": "完整结果to_json，sliced始终False。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/prompts.py",
+          "line": 165,
+          "end_line": 172,
+          "note": "非明确top-N等意图要求不添加LIMIT。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 222,
+          "end_line": 228,
+          "note": "SSE所有事件驻留append-only buffer，重连从头重放。"
+        }
+      ],
+      "trigger": "合法探索SELECT返回大量行或极宽文本；查询在30秒内完成但结果很大；多个会话并行放大。",
+      "impact": "驱动结果、Python行对象、DataFrame、JSON和事件缓冲形成多份内存；可能OOM并放大进程重启风险。SQL时间限制不等于结果大小限制。标准指标已限制limit<=10000，因此本条主要针对探索链路；宽值仍应设字节预算。",
+      "fix": "交互结果明确行/字节预算与truncated元数据；按需采用驱动服务器游标/分批读取，导出走独立有界流式任务。不要仅把fetchall改成普通客户端cursor的fetchmany而以为避免驱动全量缓冲。SSE只放结果摘要/分页引用。",
+      "acceptance": "百万行和单行超大文本fixture下峰值RSS受控；截断可见且不会被LLM描述成全集；取消关闭游标与事务；小结果行为保持。",
+      "verification": "代码路径确认，无大结果压力测试。Psycopg官方说明普通Cursor先接收全结果，ServerCursor适用于需要分批处理的大结果。",
+      "effort": "M",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-06",
+      "title": "刷新连接配置后，在途旧worker可重新成为standby并继续使用旧配置",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/connections/service.py",
+          "line": 113,
+          "end_line": 120,
+          "note": "修改连接后调用refresh_chat_workers。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 515,
+          "end_line": 523,
+          "note": "只替换当时standby，不给活跃worker标记版本。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 454,
+          "end_line": 461,
+          "note": "活跃worker完成后不检查配置generation即返还。"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 435,
+          "end_line": 441,
+          "note": "旧worker先占standby后，新预热worker反而被杀。"
+        }
+      ],
+      "trigger": "连接更新/删除/凭据轮换发生时worker仍在处理请求；旧worker先于新预热worker结束。",
+      "impact": "后续探索请求可继续使用旧connector配置，直到worker偶然被淘汰；新配置刷新承诺不稳定。其他Pod也不会收到本地刷新通知。本条不宣称已证实权限绕过，实际后果取决于变更配置与源库是否仍接受旧连接。",
+      "fix": "连接配置维护单调generation；worker记录创建generation，return_alive和acquire均淘汰旧generation；多副本通过持久化版本或失效广播对齐。",
+      "acceptance": "阻塞旧worker，在连接更新后放行其完成，下一请求必须使用新generation；旧worker不能抢占新standby；覆盖删除连接与凭据轮换。",
+      "verification": "实际WarmPool/refresh_chat_workers的纯内存复现：刷新时无standby，旧active worker return_alive后pool.acquire()仍返回同一旧对象。",
+      "effort": "M",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-07",
+      "title": "摄取202仅表示进程内启动，缺少可恢复任务与可区分的中断状态",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/ingestion_service/router.py",
+          "line": 74,
+          "end_line": 88,
+          "note": "ingest/delete立即返回accepted，无job_id。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/ingest.py",
+          "line": 202,
+          "end_line": 231,
+          "note": "daemon Thread执行，异常仅日志。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/history.py",
+          "line": 19,
+          "end_line": 28,
+          "note": "编译history的NULL同时代表运行、停止、禁用、崩溃且不再归类。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/data_scheduler.py",
+          "line": 35,
+          "end_line": 36,
+          "note": "失败后的定时机会默认为24小时；无持久逐任务重试。"
+        },
+        {
+          "path": "auto_ontology/server/ingestion/proxy.py",
+          "line": 66,
+          "end_line": 82,
+          "note": "服务不可达时running被报告为False，UI看起来空闲。"
+        }
+      ],
+      "trigger": "HTTP已返回202后进程重启、失败、被OOM；或用户需要精确知道任务是否成功及重试进度。",
+      "impact": "请求和中间进度可能丢失，调用方不能用job_id追踪；失败通常要等待下次整轮调度。历史无法区分仍运行与已孤立；不可达也显示空闲。",
+      "fix": "先用现有Postgres实现持久jobs/outbox：job_id、幂等键、owner lease、心跳、阶段、attempt、next_retry_at及明确cancelled/interrupted状态；失败有界退避并人工可重试。需要更高吞吐时再评估外部队列，避免为小部署先引入额外系统。",
+      "acceptance": "202前任务已持久化；202后SIGKILL并重启能恢复或明确标记中断；重试不重复产生数据；UI区分idle/running/unreachable/failed/interrupted。",
+      "verification": "代码确认任务线程和history定义；未做真实kill恢复演练。PostgreSQL官方将SKIP LOCKED描述为适合多消费者queue-like表的能力，可作为领取实现的一部分，仍需lease及幂等。",
+      "effort": "L",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-08",
+      "title": "同源摄取、删除和多副本调度之间没有统一的分布式互斥",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/ingestion_service/__main__.py",
+          "line": 63,
+          "end_line": 77,
+          "note": "每服务进程启动自身data/semantic scheduler。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/scheduler.py",
+          "line": 38,
+          "end_line": 46,
+          "note": "running/trigger/abort/paused均为进程内状态。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/ingest.py",
+          "line": 167,
+          "end_line": 231,
+          "note": "手工ingest与delete使用独立线程，无按datasource锁。"
+        },
+        {
+          "path": "auto_ontology/connectors/registry.py",
+          "line": 120,
+          "end_line": 129,
+          "note": "手工/定时刷新缓存会close当前共享connector。"
+        },
+        {
+          "path": "helm/auto-ontology/templates/ingestion.yaml",
+          "line": 29,
+          "note": "ingestion.replicas可配置。"
+        }
+      ],
+      "trigger": "重复POST同源ingest、ingest与delete并行、手工触发遇上周期任务，或ingestion.replicas>1。",
+      "impact": "可重复远程采样/LLM/embedding成本；一任务刷新缓存可能关闭另一任务使用的connector；delete/reset与写入交错可留下不完整catalog/vector状态。语义reset的本地pause只约束本进程scheduler，不能协调另一副本。",
+      "fix": "以datasource和作业类型建立共享互斥/lease；删除/reset与ingest/compile统一调度；并发请求按幂等键合并或409，仍允许不同datasource在全局上限内并行。短期限制ingestion单副本不等于解决单进程手工线程冲突。",
+      "acceptance": "同时触发同源两次ingest及delete，只有合法串行顺序执行；双副本不重复领取同一job；失去lease的旧worker不能继续发布；不同源仍可并行。",
+      "verification": "代码确认独立线程与各副本独立scheduler；并未在真实数据库制造破坏性并发。",
+      "effort": "M-L",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-09",
+      "title": "Embedding按首个成功chunk删除旧索引，后续失败会暴露不完整新索引",
+      "priority": "P1",
+      "kind": "代码确认缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/ingestion_service/ingest.py",
+          "line": 124,
+          "end_line": 139,
+          "note": "首个有记录chunk调用get_data_vdb(reset=True)，随后逐chunk写当前索引；没有版本切换。"
+        },
+        {
+          "path": "auto_ontology/vdb/postgres.py",
+          "line": 175,
+          "end_line": 185,
+          "note": "reset构造立即按database删除已有向量。"
+        },
+        {
+          "path": "auto_ontology/vdb/postgres.py",
+          "line": 421,
+          "end_line": 430,
+          "note": "直接执行store.delete。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/tests/test_ingest_reset.py",
+          "line": 101,
+          "end_line": 118,
+          "note": "现有测试明确允许a embedding失败、b成功、c失败后reset并只写b；没有完整度失败门禁。"
+        }
+      ],
+      "trigger": "至少一个embedding chunk成功，但后续chunk异常/空embedding，或者进程在部分chunk写入后退出。",
+      "impact": "旧完整索引已删除，在线检索只能看到部分新表/列；静默缺embedding时仍可到达success日志。当前lazy reset只保护首个成功chunk之前的失败，不能保护整轮发布一致性。",
+      "fix": "按datasource写新generation/staging索引，统计期望与实际成功记录并设置完整度门禁；成功后原子更新active generation，再异步清旧版本。失败保留旧active索引及可重试staging。",
+      "acceptance": "第二chunk抛错、部分embedding为None、写入中进程被杀时，检索仍看到完整旧generation；全成功后一次切换到完整新generation，不出现混合或部分可见。",
+      "verification": "完整代码链及现有测试预期确认；未修改索引或制造真实数据丢失。",
+      "effort": "M-L",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "RUNTIME-10",
+      "title": "若干async路由直接执行同步数据库调用，慢库阻塞整个事件循环",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/ingestion_service/router.py",
+          "line": 40,
+          "end_line": 53,
+          "note": "async health直接调用同步check_store/check_schema。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/router.py",
+          "line": 131,
+          "end_line": 145,
+          "note": "async semantic_status同步调用两个history读函数。"
+        },
+        {
+          "path": "auto_ontology/ingestion_service/history.py",
+          "line": 136,
+          "end_line": 149,
+          "note": "同步psycopg.connect/cursor.execute；connect_timeout不约束SQL执行。"
+        },
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 635,
+          "end_line": 636,
+          "note": "async chat_completions同步检查semantic_layer_calculated。"
+        },
+        {
+          "path": "auto_ontology/dal/terms.py",
+          "line": 286,
+          "end_line": 291,
+          "note": "semantic_layer_calculated执行同步SQLAlchemy store查询。"
+        }
+      ],
+      "trigger": "数据库连接慢、池等待或SQL锁等待；这些调用发生在async def路由内部且没有to_thread。",
+      "impact": "同一进程其他请求、liveness、取消响应及调度器事件不能及时运行；数据库本身故障可能被放大成整个服务不响应。",
+      "fix": "无异步I/O的路由改为def由FastAPI线程池执行；或对同步DB段显式await asyncio.to_thread/专门有界executor。为SQL本身配置超时，并区分健康检查预算。",
+      "acceptance": "注入300ms数据库等待时并发liveness/ticker仍按低延迟执行；数据库长锁等待在配置预算内结束；线程池饱和时可观察且不阻塞事件循环。",
+      "verification": "调用实际semantic_status，两个history helper各模拟150ms同步等待，10ms asyncio ticker实际300ms才运行。FastAPI官方明确直接调用的普通helper不会自动被转入线程池。",
+      "effort": "S-M",
+      "area": "运行稳定性与任务执行"
+    },
+    {
+      "id": "SEC-01",
+      "title": "SSO Bearer 认证遗漏本地封禁检查，已封禁账户仍能使用原角色",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "frontend/auth/resolve-user.ts",
+          "line": 58,
+          "note": "按邮箱匹配时仅选择 id/role，直接返回用户。",
+          "end_line": 63
+        },
+        {
+          "path": "frontend/auth/resolve-user.ts",
+          "line": 66,
+          "note": "按 SSO subject 回退匹配同样不读取 banned。",
+          "end_line": 71
+        },
+        {
+          "path": "frontend/auth/api-token.ts",
+          "line": 71,
+          "note": "API token 分支已有 banned 校验，说明账户封禁属于既有控制。",
+          "end_line": 75
+        },
+        {
+          "path": "frontend/auth/with-auth.ts",
+          "line": 60,
+          "note": "所有 permission gateway 信任 resolveUser 的结果。",
+          "end_line": 64
+        },
+        {
+          "path": "auto_ontology/server/users/postgres_dal.py",
+          "line": 45,
+          "note": "后端当前角色复验也只 SELECT role，无法补上 SSO 的封禁缺口。",
+          "end_line": 50
+        }
+      ],
+      "trigger": "用户已有有效的已配置信任 SSO JWT，随后在 Auto Ontology 中被封禁；请求不携带可用本地 session，走 SSO Bearer 分支。用户不需要访问私有后端或伪造内部 header。",
+      "impact": "封禁的 viewer 或 admin 仍可经公开 Next.js 业务 API 取得原有读写能力，直至 SSO token 失效或账户删除；治理指标后端的角色复验也不会拒绝 banned 用户。",
+      "fix": "将所有凭证解析后的本地账户状态检查统一到一个入口，读取并拒绝 banned/已删除账户；SSO 两个匹配分支均覆盖。后端身份查询可返回账号可用性，避免只查 role 的第二道检查继续放行。",
+      "acceptance": [
+        "本地 banned=true 的用户用有效 SSO JWT访问 catalog、metrics、chat、connections API 均返回401/403。",
+        "解封后恢复；API token、OAuth token、cookie 分支的封禁/降权回归均通过。"
+      ],
+      "verification": "将仓库实际 resolve-user.ts 转译执行，注入无 session、已验证的合成 SSO principal 和 banned=true 的合成 Prisma 用户；真实 select 投影后返回 {id:banned-test-user,role:admin}。未使用真实账号、网络或数据库。见 security-auth-probe-results.jsonl。",
+      "effort": "小",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-02",
+      "title": "跨服务 SSO Bearer 信任任意 audience，且不要求到期字段或已验证的账户绑定",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "frontend/auth/bearer.ts",
+          "line": 15,
+          "note": "明确将任意同 issuer 签名的 token 都视为可信，未限定受信客户端。",
+          "end_line": 17
+        },
+        {
+          "path": "frontend/auth/bearer.ts",
+          "line": 103,
+          "note": "jwtVerify 只传 issuer，没有 audience 或 requiredClaims。"
+        },
+        {
+          "path": "frontend/auth/bearer.ts",
+          "line": 121,
+          "note": "只要求 sub，email 未检查 email_verified 即交给用户解析器。",
+          "end_line": 126
+        },
+        {
+          "path": "frontend/auth/resolve-user.ts",
+          "line": 58,
+          "note": "email 匹配优先于 subject；subject 查询未包含 providerId。",
+          "end_line": 71
+        }
+      ],
+      "trigger": "同一 IdP 服务多个 OAuth 客户端，存在给非 Auto Ontology/AI-Q 客户端签发的 JWT；或 IdP 能签发无 exp、未验证/可更改 email 的 token。风险依赖所配 IdP 的签发/账号治理规则，不能由本地代码证明真实 IdP 已可被利用。",
+      "impact": "其他客户端持有的 token 可被重放为 Auto Ontology 凭证；缺少 exp 的有效签名 token 不会因应用要求过期而被拒绝。邮箱优先绑定使身份安全依赖 IdP 对 email 的唯一性和验证保证，而非明确的 issuer+subject 本地关联。",
+      "fix": "为允许跨服务调用配置明确的 audience/client allowlist（保留确有授权的 AI-Q 客户端），要求 exp/iat/sub 并限制 token 类型；按 provider/issuer+subject 匹配已绑定账号，邮箱只用于受控且 email_verified=true 的首次绑定，避免静默映射到已有高权限账号。",
+      "acceptance": [
+        "本地签名测试中，正确issuer但无关aud、缺exp、错误provider subject均被拒绝。",
+        "预先配置的 Auto Ontology 和 AI-Q audience可继续使用，正常已绑定SSO用户兼容。",
+        "不同subject但同email的token不能静默取得已有用户权限。"
+      ],
+      "verification": "对实际 bearer.ts 使用本地生成 RSA 密钥签发 JWT，aud=unrelated-application、没有exp、email_verified=false；仅把远程JWKS替换为对应本地公钥，实际jose验签成功且verifyBearer返回principal。网络调用0次。此probe证明接收策略，不证明真实IdP会签发该组合。",
+      "effort": "中",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-03",
+      "title": "默认 Compose 将依赖私有网关的后端和摄取端口绑定到所有宿主接口",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "docker-compose.yml",
+          "line": 46,
+          "note": "3001:3001 未指定127.0.0.1，发布后端服务到宿主地址。",
+          "end_line": 47
+        },
+        {
+          "path": "docker-compose.yml",
+          "line": 75,
+          "note": "3002:3002 同样公开宿主摄取端口。",
+          "end_line": 76
+        },
+        {
+          "path": "auto_ontology/server/identity.py",
+          "line": 20,
+          "note": "后端明确假设网络私有，直接信任x-auto-ontology-user-id。",
+          "end_line": 30
+        },
+        {
+          "path": "auto_ontology/server/connections/router.py",
+          "line": 66,
+          "note": "connections路由本身没有认证dependency，权限由Next.js前门承担。",
+          "end_line": 76
+        },
+        {
+          "path": "frontend/auth/proxy-backend.ts",
+          "line": 40,
+          "note": "公开前门重建header，不会转发客户端伪造的内部身份；风险是绕过前门直连。",
+          "end_line": 54
+        },
+        {
+          "path": "helm/auto-ontology/templates/backend.yaml",
+          "line": 13,
+          "note": "Helm使用ClusterIP，不能把Compose配置风险泛化为所有部署均公网暴露。",
+          "end_line": 18
+        }
+      ],
+      "trigger": "使用仓库默认Compose，且宿主3001/3002可从非可信网络访问（云安全组、局域网、防火墙或额外反代允许）。纯本机且有网络隔离的开发部署不满足此条件。",
+      "impact": "可绕过公开Next.js的登录/权限检查访问私有API；需要内部身份的路由也只有可伪造header作为身份来源。可暴露目录信息或触发写操作/摄取。未发现或探测任何真实公网部署。",
+      "fix": "Compose默认不发布3001/3002，仅允许frontend通过容器网络访问；确需开发直连时绑定127.0.0.1，并明确生产网络策略。长期可对网关到服务增加签名或mTLS验证，降低网络配置失误影响。",
+      "acceptance": [
+        "默认Compose从另一主机无法连通3001/3002，frontend业务请求仍正常。",
+        "Helm服务维持ClusterIP，NetworkPolicy限定入口；网关伪造header回归持续拒绝。"
+      ],
+      "verification": "静态核实Compose端口、Next.js权限与header重建、后端信任约定、Helm ClusterIP四层控制链。没有执行网络扫描或攻击请求。",
+      "effort": "小",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-04",
+      "title": "连接返回的秘密字段黑名单遗漏实际支持的 access_token_override",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/connections/router.py",
+          "line": 30,
+          "note": "连接请求是任意dict，没有阻止内部token字段持久化。",
+          "end_line": 31
+        },
+        {
+          "path": "auto_ontology/server/connections/router.py",
+          "line": 43,
+          "note": "公共返回仅按SECRET_FIELDS删键，其他键原样返回。",
+          "end_line": 53
+        },
+        {
+          "path": "auto_ontology/server/connections/service.py",
+          "line": 37,
+          "note": "秘密字段黑名单没有access_token_override。",
+          "end_line": 45
+        },
+        {
+          "path": "auto_ontology/server/connections/service.py",
+          "line": 200,
+          "note": "除了schema之外其余连接键均保留并持久化到Vault或JSON。",
+          "end_line": 219
+        },
+        {
+          "path": "auto_ontology/connectors/connection_string_factory.py",
+          "line": 102,
+          "note": "access_token_override真实参与Databricks认证，不只是任意无效字段。",
+          "end_line": 111
+        },
+        {
+          "path": "frontend/app/api/connections/route.ts",
+          "line": 8,
+          "note": "公开GET只需connection:read，viewer具有此权限。",
+          "end_line": 11
+        }
+      ],
+      "trigger": "管理员/API/Vault导入的已存连接中包含 access_token_override。这不是默认SSO交换流程：registry正常只把该字段临时叠加到内存配置；常规password/PAT已经正确隐藏。",
+      "impact": "连接只读用户会从GET /api/connections拿到这一Databricks认证token，突破“可看连接但不可看凭据”的响应约定。",
+      "fix": "持久化API采用封闭的各dialect连接DTO并拒绝内部access_token_override；公共响应改为可公开字段白名单。对既有Vault/JSON字段兼容读取但一律脱敏，且日志/错误中不打印token。",
+      "acceptance": [
+        "带fake access_token_override的连接序列化及GET均不包含token。",
+        "外部写入该内部字段返回422；运行时SSO交换仍可内部使用且不写回存储。",
+        "对password、private_key、truststore和未知秘密字段执行回归。"
+      ],
+      "verification": "直接抽取并执行仓库的SECRET_FIELDS与_serialize_connection实函数；合成password被移除，合成access_token_override原样保留。未连接Databricks、未使用真实凭据。",
+      "effort": "小至中",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-05",
+      "title": "探索模式没有强制只读执行边界，确定性校验可接受UPDATE",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_parse_validation.py",
+          "line": 961,
+          "note": "确定性校验只做catalog表列解析，返回success；没有语句类型安全检查。",
+          "end_line": 983
+        },
+        {
+          "path": "auto_ontology/catalog/sql_parse.py",
+          "line": 48,
+          "note": "解析器设计上支持所有SQL语句类型。",
+          "end_line": 55
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_parse_validation.py",
+          "line": 1072,
+          "note": "意图LLM异常时放行为valid_sql；None结果亦放行。",
+          "end_line": 1099
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/chat_sql.py",
+          "line": 80,
+          "note": "执行入口只添加日志与超时，调用普通connector.execute。",
+          "end_line": 86
+        },
+        {
+          "path": "auto_ontology/connectors/postgres.py",
+          "line": 127,
+          "note": "普通执行事务只设置超时，没有READ ONLY，成功结束会提交。",
+          "end_line": 132
+        },
+        {
+          "path": "auto_ontology/connectors/postgres.py",
+          "line": 31,
+          "note": "无结果集的写语句返回空DataFrame，不会因fetchall错误被自动回滚。",
+          "end_line": 35
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/db_probe/executor.py",
+          "line": 54,
+          "note": "probe辅助判断也只靠关键字，任意SELECT函数仍可通过。",
+          "end_line": 69
+        }
+      ],
+      "trigger": "用户有chat:use，所选业务数据库共享账号拥有写权限或有副作用函数EXECUTE权限，且探索LLM/重建产出该SQL并通过或跳过意图判断。没有证明任意自然语言必然触发写操作；只读数据库账号可显著限制影响。",
+      "impact": "原本用于问数的探索路径可能修改业务数据；应用中的LLM意图校验不是确定性安全边界。普通PGexecute对写语句成功后提交。标准metrics使用确定性编译和只读事务，不受这一具体执行缺口影响。",
+      "fix": "所有探索执行/探测入口强制单一只读查询AST检查，拒绝DML/DDL/多语句/写CTE/SELECT INTO；支持的连接使用数据库READ ONLY事务；业务账号实施SELECT最小权限及函数EXECUTE限制。安全校验失败必须终止，不借LLM决定是否允许。",
+      "acceptance": [
+        "实际SQLValidationAgent对UPDATE/DELETE/写CTE/多语句返回拒绝，connector spy确认未发往数据库。",
+        "隔离PG中使用具备写权限的测试账号，探索执行仍由READ ONLY阻止写入且表内容不变。",
+        "正常SELECT与现有metrics只读、取消、超时回归通过。"
+      ],
+      "verification": "用合成内存Schema调用实际SQLValidationAgent._sql_parse_validation，UPDATE public.audit_fake SET id=2得到success:true；SELECT audit_side_effect(id)亦通过，probe只读辅助函数也接受后者。全程未执行这些SQL；依据实际connector源码确认提交边界。",
+      "effort": "中",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-06",
+      "title": "MySQL连接丢弃显式TLS配置，治理只读事务也未验证服务端身份",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/connectors/mysql.py",
+          "line": 97,
+          "note": "URI解析只保留host/port/user/password/database，全部query参数被忽略。",
+          "end_line": 114
+        },
+        {
+          "path": "auto_ontology/connectors/mysql.py",
+          "line": 138,
+          "note": "后续只增加字符集与pure模式，未补TLS身份验证。",
+          "end_line": 145
+        },
+        {
+          "path": "auto_ontology/connectors/mysql.py",
+          "line": 241,
+          "note": "新治理事务同样使用_connect_kwargs，不增加CA/主机名验证。",
+          "end_line": 248
+        },
+        {
+          "path": "auto_ontology/connectors/connection_string_factory.py",
+          "line": 67,
+          "note": "UI结构化MySQL连接构造器也没有TLS参数。",
+          "end_line": 73
+        }
+      ],
+      "trigger": "MySQL业务连接跨越不完全可信网络，或操作员在URI上设置ssl_ca/ssl_verify_cert/ssl_verify_identity并误认为已生效。风险利用需要网络中间人/错误服务端；本次没有进行网络中间人实验。",
+      "impact": "当前安装的mysql-connector-python默认ssl_verify_cert=False、ssl_verify_identity=False；连接即使使用加密也不由应用验证目标服务身份。显式安全参数被静默丢弃，可能将业务数据/凭据交给错误服务端。标准指标的SQL只读及认证模型不能弥补传输身份缺口。",
+      "fix": "连接DTO和URI解析支持明确的TLS模式、CA、证书与身份验证参数；生产默认要求验证服务端，开发明文须明确选择。未知连接安全参数应拒绝而非静默忽略；同样配置应用于查询、取消用第二连接及连接测试。",
+      "acceptance": [
+        "含ssl_verify_cert/identity与CA的URI能生成准确driver kwargs。",
+        "在隔离TLS MySQL中，错误CA/错误主机名/不提供TLS在严格模式下一律失败，正确证书成功。",
+        "同一TLS配置用于read_transaction、legacy execute和cancel连接。"
+      ],
+      "verification": "实际_parse_connection_string对带ssl_ca、ssl_verify_cert=true、ssl_verify_identity=true的合成URI只返回五个基础字段；读取当前安装驱动DEFAULT_CONFIGURATION确认两种验证默认false。没有访问真实业务MySQL或输出凭据。",
+      "effort": "中",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-07",
+      "title": "PII标签没有形成采样、提示和查询结果的脱敏策略",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/pii_detection/service.py",
+          "line": 140,
+          "note": "PII检测只根据元数据贴标签，分类本身刻意不读取sample values。",
+          "end_line": 150
+        },
+        {
+          "path": "auto_ontology/semantic/visit_enter.py",
+          "line": 742,
+          "note": "真实列样本写入Catalog。",
+          "end_line": 746
+        },
+        {
+          "path": "auto_ontology/semantic/embed.py",
+          "line": 240,
+          "note": "sample_values直接拼入embedding文本，没有按PII标签处理。",
+          "end_line": 249
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/formatters_util.py",
+          "line": 54,
+          "note": "列prompt格式化器无条件展示sample_values，忽略PII标签。",
+          "end_line": 72
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 640,
+          "note": "治理查询返回实际结果；该路径也没有PII标签/列策略过滤。",
+          "end_line": 646
+        }
+      ],
+      "trigger": "敏感列被采样/查询且调用方或外部LLM/embedding提供商不应获知原始值。当前产品若仅承诺PII分类，此项不是既有权限绕过；需要脱敏或数据驻留控制的部署才有缺口。",
+      "impact": "管理员开启PII检测不等于脱敏。已标记的邮箱等值仍可进入提示/embedding或查询结果；pii:read/manage权限控制设置，并不控制读取敏感数据。新标准指标模式避免把结果交给自由LLM图表，但仍可返回敏感维度，不能被宣传为自动隐私保护。",
+      "fix": "明确区分分类与策略执行；建立统一列/样本/结果访问策略，并在采样持久化、embedding、LLM提示、查询投影/维度和结果输出前执行。敏感源可先使用只暴露脱敏列的数据库视图与最小权限账户。补充历史样本/embedding清理机制。",
+      "acceptance": [
+        "合成PII标签邮箱在无PII读取授权时不进入sample/embedding/LLM请求和返回结果。",
+        "允许读取的授权主体与汇总指标正常；历史敏感样本及embedding可重建/清除。",
+        "文档和UI清楚说明分类开关不自动脱敏。"
+      ],
+      "verification": "将带PII标签的合成email列传给实际_format_column_for_prompt，输出含synthetic-person@example.invalid原文；静态追踪采样、embedding与标准指标返回路径。没有发送样本给任何外部模型。",
+      "effort": "大",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEC-08",
+      "title": "当前是全局目录与共享数据源权限模型，不具备租户/行列隔离",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "frontend/auth/proxy-backend.ts",
+          "line": 12,
+          "note": "代码明确zone不再是授权边界，调用不附加用户zone scope。",
+          "end_line": 14
+        },
+        {
+          "path": "frontend/auth/access.json",
+          "line": 21,
+          "note": "viewer拥有全局catalog:read、chat:use、connection:read。",
+          "end_line": 31
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 93,
+          "note": "治理服务明确catalog reader全局可见，zone只是组织过滤。",
+          "end_line": 94
+        },
+        {
+          "path": "auto_ontology/server/metrics/router.py",
+          "line": 152,
+          "note": "模型列表无用户/租户条件。",
+          "end_line": 155
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 612,
+          "note": "标准查询执行参数只有model/query/revision，复用配置的源connector，无用户数据库身份。",
+          "end_line": 625
+        },
+        {
+          "path": "auto_ontology/connectors/registry.py",
+          "line": 219,
+          "note": "Databricks SSO federation是已有特例；不能笼统说所有connector始终共享身份。",
+          "end_line": 236
+        }
+      ],
+      "trigger": "准备把实例提供给互不信任的租户、部门或不同数据权限用户，并希望zone、owner或模型认证承担读取隔离；单一可信组织全局共享场景本来符合当前设计。",
+      "impact": "目录所有权限制编辑，不限制读取。不同viewer对同一PG/MySQL源使用同一账号，模型/source/fingerprint认证只证明结构与口径，不提供租户或行列权限。不可把全局可见的故意设计描述为已利用的越权漏洞。",
+      "fix": "先明确部署信任域。需要隔离时引入用户/组到datasource/model及行列策略的授权，在检索、编译、执行、export和缓存键中一致应用；或每租户独立实例/数据库凭据，以数据库RLS或按用户凭据执行兜底。",
+      "acceptance": [
+        "双用户/双租户用同名业务对象验证列表、详情、搜索、导出、Chat、compile/execute及缓存都不跨界。",
+        "请求参数中的zone_ids/model_id不能扩大授权范围；数据库RLS在应用过滤漏掉时仍有效。",
+        "现有全局共享模式作为明确配置保留，不暗改已有用户可见性。"
+      ],
+      "verification": "核实公开前门角色表、代理zone约定、标准模型列表、service执行签名和connector选择；同时确认Databricks按用户token federation属于例外。未把会话所有权隔离与业务数据隔离混淆。",
+      "effort": "大",
+      "area": "身份、权限与数据安全"
+    },
+    {
+      "id": "SEM-01",
+      "title": "币种分组只比较字段 ID，循环角色路径可将不同币种合并",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 298,
+          "end_line": 300,
+          "note": "currency_check 的 grouped 仅比较 dimension_path(...)[0] == ref，忽略 role path 与 SQL alias。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/validator.py",
+          "line": 223,
+          "end_line": 238,
+          "note": "显式维度路径允许 A→B→A 回到同一 source；只检查连续性和 many_to_one/one_to_one。"
+        }
+      ],
+      "trigger": "事实 orders 的 currency 是本行币种；report_currency 维度却经 orders→bridge→orders 指向另一行的 currency。两个关联均物理唯一、inner many_to_one，模型验证通过。",
+      "impact": "10 USD 与 20 EUR 被确定性 SQL 合成 report_currency=USD、amount=30；货币防混算被绕过。该逻辑为 PostgreSQL/MySQL 共用。",
+      "fix": "币种语义引用必须包含完整角色路径/别名。事实自身币种仅可由空路径的同字段分组证明；对未定义角色语义的回环路径先明确拒绝。effective_currency 也应包含路径身份。",
+      "acceptance": "加入 A→B→A 的真实结果回归，模型或查询应以币种/路径错误拒绝；原有非循环币种维度与单币种过滤保持正确，不能只比较字段 ID。",
+      "verification": "audit/repro_semantic.py + semantic-repro-results.json：validate_model=True，实际 PG 返回 [{report_currency:'USD',amount:'30'}]，输入同时含 USD10/EUR20。所有审计 schema 事务回滚。",
+      "effort": "M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-02",
+      "title": "PostgreSQL 关联未验证物理比较语义，唯一键仍可能产生扇出",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 294,
+          "end_line": 318,
+          "note": "物理 join key 兼容检查仅在 model.dialect == 'mysql' 时执行。PG 仍仅靠 target 唯一键证明基数。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 192,
+          "end_line": 195,
+          "note": "关联直接发出原生 =，PostgreSQL 会选择隐式转换操作符。"
+        }
+      ],
+      "trigger": "事实键 double precision=9007199254740992；目标键 numeric PRIMARY KEY 含 9007199254740992 和 9007199254740993；两端契约 data_type 均为 number。",
+      "impact": "PG numeric=float8 比较将目标值转为 float8，两条 UNIQUE 目标记录都匹配同一事实；COUNT/SUM 会放大，many_to_one 的安全保证不成立。",
+      "fix": "将物理关联兼容检查扩展至 PG；按原生类型、比较操作符、collation/唯一索引语义证明等值关系，至少先拒绝 float↔exact numeric 等有损组合。不要盲目 cast 到 float。",
+      "acceptance": "用真实 PG 运行上述 2^53 边界数据，认证/执行必须拒绝不兼容键，正常相同类型与经过证明的无损键继续通过；增加不同 collation/opclass 的边界矩阵。",
+      "verification": "audit/repro_semantic.py：模型 validate=True；一条 fact 经编译 SQL 返回 A:n=1、B:n=1 两行，总数为2。未篡改认证或绕过编译器。",
+      "effort": "M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-03",
+      "title": "PostgreSQL 生成列公式改变不会使认证失效",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/source_adapters.py",
+          "line": 43,
+          "end_line": 51,
+          "note": "PG 物理列快照只有 name/data_type/nullable，缺失 generated expression、collation 等会改变计算语义的属性。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/source_adapters.py",
+          "line": 169,
+          "end_line": 176,
+          "note": "inspect 返回 properties=None；生成表达式变化不进入 source hash。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 497,
+          "end_line": 502,
+          "note": "认证有效性完全依赖这一 catalog fingerprint。"
+        }
+      ],
+      "trigger": "PG17 表 amount numeric GENERATED ALWAYS AS(id*10) STORED，通过 create/validate/certify/activate；随后 ALTER COLUMN amount SET EXPRESSION AS(id*20)，列名、类型、可空性和唯一键未变。",
+      "impact": "同一已认证 revision1 的金额从30变60，service.execute 仍返回 trusted=true；实际业务公式已变但审核授权被继续沿用。",
+      "fix": "为 PG source fingerprint 增加 attgenerated/pg_get_expr、实际 collation 与影响解释的表属性；对生成列依赖的可变函数明确限制或纳入依赖定义。给 fingerprint 加版本并要求旧证书重新审核，不能自动替换证书散列。",
+      "acceptance": "完整服务回归：生成表达式修改后必须 SOURCE_CHANGED、禁止 trusted 结果；对普通列无关注释变更不误伤。测试旧指纹迁移和重新认证流程。",
+      "verification": "audit/semantic-repro-results.json.pg_generated_certified_service：before amount='30'，after amount='60'，trusted_after=true，revision_after=1。使用现有隔离 catalog fixture，finally 清理其专属 ID/schema。",
+      "effort": "M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-04",
+      "title": "合法 number 四则表达式会继承窄整数运算并提前溢出",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 272,
+          "end_line": 287,
+          "note": "行级表达式直接使用物理字段的原生数值类型。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 486,
+          "end_line": 501,
+          "note": "仅除法处理数值提升；加减乘保持原生算术类型。"
+        }
+      ],
+      "trigger": "两个 PostgreSQL integer 字段 q=50000、p=50000，定义 SUM(q*p)；契约字段均为 number，模型验证和编译通过。",
+      "impact": "中间 int4 乘法在 SUM 之前溢出，实际返回 SQLSTATE 22003，而2500000000可被 bigint/numeric精确表达。合法指标会在普通业务数量范围突然失效；MySQL unsigned/decimal边界也需独立验证。",
+      "fix": "引入明确数值类型/精度推导，PG 精确算术在操作前提升到 numeric；MySQL依据实际 precision/scale 推导可安全结果类型，不统一硬塞 DECIMAL(65,30)造成另一种截断。异常返回可解释的范围限制。",
+      "acceptance": "真实 PG SUM(50000*50000)=2500000000，组合表达式、负数与NULL行为保持；MySQL unsigned减法、DECIMAL最大精度用独立金标准验证。",
+      "verification": "audit/repro_semantic.py.integer_arithmetic：validate=True，编译SQL SUM(((f.q)*(f.p)))，实际PG报22003 integer out of range。未以手写SQL替代编译步骤。",
+      "effort": "M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-05",
+      "title": "非有限数的输出没有明确语义：Infinity 被改为 NULL，Decimal NaN 被当作十进制字符串",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 555,
+          "end_line": 570,
+          "note": "Decimal直接str；float非有限值直接None，丢失异常与真正SQL NULL的区别。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 642,
+          "end_line": 646,
+          "note": "serialize_frame结果仍与trusted=true一起返回，缺少数据质量状态。"
+        }
+      ],
+      "trigger": "PostgreSQL支持的浮点 Infinity/NaN 或 NUMERIC NaN 进入聚合结果，或结果编码器接收到这些原生值。",
+      "impact": "错误/非有限结果可以显示成普通NULL；Decimal NaN又标为decimal-string，客户端无法用统一精确数字规则解释，数值异常与缺失数据被混淆。",
+      "fix": "在序列化前统一检测float/Decimal有限性；治理指标默认拒绝非有限结果并返回结构化数据质量错误，或定义显式带类型的特殊值编码，不能静默改NULL。",
+      "acceptance": "SQL NULL、float NaN/±Infinity、Decimal NaN/Infinity分别验证；只有真正NULL编码为null，异常不得被标成正常trusted数值结果，历史/SSE一致。",
+      "verification": "audit/semantic-pure-results.json：输入float inf与真正None，两者均输出null；Decimal('NaN')输出'NaN'且json_encoding='decimal-string'。这是编码器真实调用，尚未做生产数据测试。",
+      "effort": "S",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-06",
+      "title": "MySQL 时区检查把 end_exclusive 算入区间，拒绝实际未跨DST的分组",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 113,
+          "end_line": 118,
+          "note": "while point < end后仍check(end)，与声明的半开区间不一致。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 431,
+          "end_line": 437,
+          "note": "同一helper用于查询分组目标时区的固定偏移证明。"
+        }
+      ],
+      "trigger": "UTC存储的MySQL TIMESTAMP，查询[2026-03-29T00:00Z,2026-03-29T01:00Z)，按Europe/Paris日分组。所有纳入的时刻均为+01；恰好被排除的01:00Z才转换为+02。",
+      "impact": "编译器返回UNSUPPORTED_TIMEZONE_TRANSITION，连截止夏令时切换点之前的完整固定偏移片段也无法查询；提示拆分区间无法解决这一末端误判。",
+      "fix": "区分“存储边界转换校验”和“半开范围内分组偏移校验”；后者检查end_exclusive之前最后可表达时刻，而不是转换点本身，同时保留真正跨DST和fold/gap的拒绝。",
+      "acceptance": "上述UTC源/Paris分组成功；将end延长1微秒后仍按不支持跨转换规则拒绝。补秋季回拨及源DATETIME墙上时间边界测试，不能放松模糊存储语义。",
+      "verification": "直接调用当前compile_query，纯模型只有UTC datetime字段与count指标，返回UNSUPPORTED_TIMEZONE_TRANSITION；数据范围内offset均+01。未声称已执行MySQL SQL，该缺陷在编译阶段已触发。",
+      "effort": "S-M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-07",
+      "title": "多角色维度可以分组，但过滤器不能指定对应角色路径",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/semantic/contracts/models.py",
+          "line": 25,
+          "end_line": 27,
+          "note": "FieldRef只有source_id/field_id。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/models.py",
+          "line": 48,
+          "end_line": 53,
+          "note": "Predicate没有dimension_id或relationship_path。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 220,
+          "end_line": 226,
+          "note": "predicate使用隐式relationship_path；多个业务角色必定被判歧义。"
+        }
+      ],
+      "trigger": "订单同时指向买方与卖方customer；customer_name维度已明确buyer path，用户希望对“买方=Alice”过滤。",
+      "impact": "当前安全拒绝AMBIGUOUS_RELATIONSHIP，但API无法表达消除歧义的信息；提示用户声明dimension path也无法修复已有明确维度的过滤。业务模型越多角色越容易遇到不可表达条件。",
+      "fix": "扩展闭合Predicate引用为带角色path的字段或注册dimension_id引用，统一用同一别名注册表解析维度、过滤、时间和币种。保持旧歧义请求失败，不让LLM猜角色。",
+      "acceptance": "买方Alice/卖方Alice分别生成对应alias条件；两者同时过滤可组合；未指定角色仍拒绝。PG和MySQL均与独立金标准对照。",
+      "verification": "audit/semantic-pure-results.json.role_filter：f0模型增加order_seller关系，原buyer维度已有明确path，过滤customers.customer_name仍AMBIGUOUS_RELATIONSHIP。分类为表达能力不足而非错误放行。",
+      "effort": "M",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-08",
+      "title": "指标层仍要求所有指标共享单一事实来源，无法表达跨事实的业务比率",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/semantic/contracts/compiler.py",
+          "line": 725,
+          "end_line": 730,
+          "note": "对整个metric_closure的source_ids求交集，为空直接UNSUPPORTED_MULTI_FACT。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/validator.py",
+          "line": 691,
+          "end_line": 700,
+          "note": "复合指标在模型验证阶段已要求子指标共享fact。"
+        }
+      ],
+      "trigger": "订单金额来自orders，实收来自payments，退款来自refunds；即使客户/币种/业务日期维度已统一且各自grain安全，仍无法定义回款率或净收入组合。",
+      "impact": "这是已声明且安全的限制，但对“以Auto Ontology为统一指标主体”的实用范围影响较大；容易迫使用户建人工宽表或误把独立事实伪装成替代来源。",
+      "fix": "局部吸收MetricFlow的entity/path语义与分阶段计划思想：先对每个事实独立聚合到明确公共维度，再对齐结果并计算复合指标；保留现有治理DTO、认证和执行入口。先做订单/支付/退款一条受限PoC，不重写整个系统。",
+      "acceptance": "一订单多次支付、跨币种、缺失支付、不同业务时间角色、零分母均有金标准；不得在明细级直接join多个fact。MySQL5.7 SQL生成/执行与许可证/适配器可用性需独立PoC，不能假定MetricFlow可直接替换。",
+      "verification": "代码确认的显式限制，不算计算bug；现有UNSUPPORTED_MULTI_FACT是正确拒绝。外部参考仅用于局部设计借鉴。",
+      "effort": "L",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "SEM-09",
+      "title": "无关来源也进入每次查询的认证与锁定，扩大故障和结构变更影响范围",
+      "priority": "P2",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 98,
+          "end_line": 141,
+          "note": "catalog_state读取并遍历model.sources全部来源。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/service.py",
+          "line": 617,
+          "end_line": 640,
+          "note": "执行先executable_model全模型复验，再打开全部connectors、锁全部sources，而plan.source_ids此时已可用。"
+        }
+      ],
+      "trigger": "同一模型包含多个独立指标或优先级替代来源；某个本次查询完全未用的表变更、不可达或被DDL锁住。",
+      "impact": "无关指标也会SOURCE_CHANGED、连接失败或等待锁；一个大型模型成为共同故障域，替代来源优先级无法提供真正可用性降级。当前全模型证书策略是保守设计，这里不把其拒绝称作越权漏洞。",
+      "fix": "明确选择模型级还是依赖闭包级认证；若要降低影响范围，证书保存每source依赖签名，执行只验证/锁定计划完整依赖闭包，同时对实际选择和排除原因留审计记录。预检与执行仍必须在安全快照中复验。",
+      "acceptance": "变更未引用source不会破坏无关指标；变更实际依赖一定拒绝；任何fallback必须满足原业务语义和显式优先级，不能因错误自动跳到不等价数据。另做大模型查询锁/连接数基准。",
+      "verification": "代码路径确认；未压测生产并发，具体可用性影响取决于模型是否含多来源及运维频率，因此标记条件风险。",
+      "effort": "M-L",
+      "area": "指标计算与本体契约"
+    },
+    {
+      "id": "LLM-01",
+      "title": "标准指标的长澄清链会静默遗失原始业务约束",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/conversation_dal.py",
+          "line": 22,
+          "note": "最多保留 5 轮、12,000 字符。"
+        },
+        {
+          "path": "auto_ontology/server/chat/conversation_dal.py",
+          "line": 142,
+          "end_line": 165,
+          "note": "仅最新单轮超长会标记 context_too_large；累计超长或超过 5 轮直接丢弃旧轮次。"
+        },
+        {
+          "path": "auto_ontology/server/chat/metrics_flow.py",
+          "line": 99,
+          "end_line": 118,
+          "note": "未成功形成请求时 current_query=None，待决业务约束依赖截断后的自然语言 turns。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/interpretation.py",
+          "line": 171,
+          "end_line": 185,
+          "note": "解释器另有后缀窗口；没有将截断转为澄清链不完整错误。"
+        }
+      ],
+      "trigger": "首问包含客户排除、单币种等条件，但尚未形成 current_query；连续澄清超过五轮，或累计字符溢出。",
+      "impact": "后续解释不再看到原始条件，合法但范围更大的指标请求仍可 ready 并自动执行。模型、版本、认证都正确，也可能算错用户要的范围。",
+      "fix": "持久化有来源的结构化 pending constraints/slots；最小修复是在尚无 current_query 的澄清链发生历史截断时明确要求完整重述。不得将剩余片段当成完整问题。",
+      "acceptance": "六轮澄清、累计字符上限、长回答三类测试中，原客户排除/币种条件必须保留或明确中止；不得静默扩大查询范围。",
+      "verification": "已运行 uv run --no-sync python ../audit/metrics_prompt_probe.py；真实 _rows_to_history → _interpretation_context 得到 history_turns=5、原排除/币种条件均 false、current_query=null；无 filters 候选仍 ready。证据：audit/metrics_prompt_probes.json#clarification_history_trim。",
+      "effort": "M",
+      "existing_protections": "可信 turn ID、模型/版本边界、超大最新单轮要求重述、已有成功请求的结构化过滤继承均存在；此缺陷限于尚未形成有效请求的澄清链。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-02",
+      "title": "探索 SQL 的意图校验不可用时仍被标记为通过",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_parse_validation.py",
+          "line": 1072,
+          "end_line": 1099,
+          "note": "调用异常返回 valid_sql；结果 None 也进入通过分支，并记录 passed static and intent validation。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/text_to_sql_graph.py",
+          "line": 540,
+          "end_line": 564,
+          "note": "valid_sql 路由到执行，或经过额外 precheck 后执行。"
+        }
+      ],
+      "trigger": "SQL 已通过确定性检查，但意图审查模型超时、返回空结构或调用失败。",
+      "impact": "本应区分的“语义检查通过”和“没有完成检查”被合并；缺少用户所需过滤条件的可解析 SQL 可以继续执行，日志还显示意图校验通过。",
+      "fix": "引入 passed/failed/unavailable 三态；不可用时停止自动执行或要求用户明确采用仅静态校验结果。返回可观测状态，不记录为意图通过。",
+      "acceptance": "stub 返回 None 和抛异常时均不得产生正常 valid_sql 路由；用户问题含客户/状态条件而候选遗漏时，模型不可用不能越过该语义检查。",
+      "verification": "已运行 audit/llm_probe.py 的实际 _validate_intent helper；None 和 RuntimeError 均得到 valid_sql，SQL 为 SELECT count(*) FROM orders，而问题要求客户甲已支付订单。假定静态阶段已通过；未执行 SQL、未证明真实模型会犯该错。证据：audit/llm_probes.json#intent_validator_unavailable_accepts_sql。",
+      "effort": "S/M",
+      "existing_protections": "目录解析、退化 SQL、聚合规则、可选预执行检查和连接器边界仍存在；本项不是任意写 SQL 绕过，也不影响标准指标的封闭编译链。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-03",
+      "title": "探索路径把用户抽取证据提升为必须逐条遵守的 System 指令",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/question_intent.py",
+          "line": 334,
+          "end_line": 346,
+          "note": "提示模型将问题内的 supporting instruction 提取为 evidence；543、559 行合并并送到下游。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/prompts.py",
+          "line": 501,
+          "end_line": 535,
+          "note": "verbatim evidence 包装成 MUST follow every instruction exactly。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_from_semantic.py",
+          "line": 321,
+          "end_line": 335,
+          "note": "证据和检索到的 SQL 示例直接置于 SystemMessage。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_parse_validation.py",
+          "line": 1065,
+          "end_line": 1070,
+          "note": "意图验证器也接收同一高权限证据块，生成与复核共享同一信任边界。"
+        }
+      ],
+      "trigger": "用户问题、调用方 evidence 或被纳入证据的业务文本包含超出业务定义的指令，例如忽略某过滤、扩大数据范围；模型按高优先级提示执行。",
+      "impact": "不可信内容与系统政策混合，生成器和语义复核可能同时被影响，导致错误口径、额外读取或错误解释。实际越权程度仍受应用/数据库权限限制。",
+      "fix": "系统层只声明不变政策；将用户问题、检索证据、样例按来源作为结构化数据传递。允许证据约束字段映射/公式，禁止它改写安全政策和校验流程；对有权威地位的口径引入认证来源与版本。",
+      "acceptance": "对问题/evidence/列描述/SQL 示例分别放入恶意哨兵，捕获消息确保其不被提升为系统政策；模型对抗评测不得因这些文本移除用户显式条件或扩大权限。",
+      "verification": "实际 SQLFromCandidatesAgent.execute 使用本地模型替身，捕获到同一 SYNTHETIC_EVIDENCE 同时位于 system 和 human 消息。证据：audit/llm_probes.json#nested_sql_generation_retries.evidence_roles。这证明角色提升，不等同于已证明真实模型攻击成功。",
+      "effort": "M",
+      "existing_protections": "SQL 示例已有 advisory 说明，目录与执行约束仍存在；标准指标 _SYSTEM 明确把模型描述/evidence/历史视为不可信数据并禁止生成 SQL，可作为现有项目内的改造范式。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-04",
+      "title": "标准指标校验保证契约合法，但没有确认自然语言意图与候选请求一致",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/interpretation.py",
+          "line": 134,
+          "end_line": 140,
+          "note": "不得把确认当支付、不得默认全部历史主要由提示词要求。"
+        },
+        {
+          "path": "auto_ontology/server/metrics/interpretation.py",
+          "line": 378,
+          "end_line": 431,
+          "note": "显式 ID、指标族和编译规则通过后返回 ready；未把问题中的具体日期/口径作为独立来源约束对齐。"
+        },
+        {
+          "path": "auto_ontology/server/chat/metrics_flow.py",
+          "line": 200,
+          "end_line": 232,
+          "note": "ready 后自动执行；trusted=true 表示契约执行可信，容易被理解为解释也已准确。"
+        }
+      ],
+      "trigger": "LLM 输出类型和字段合法但语义错误，例如把“昨天上海时区已支付金额，不要所有历史”解释成 confirmed_amount + all_time=true；未有用户显式选中 metric ID 可拦截。",
+      "impact": "确定性编译、认证版本、精确数值都正常，仍可能得到用户并未要求的业务答案；这是解释层风险，不是编译器计算错误。",
+      "fix": "将显式日期/时区、all_time、口径与排除条件记录为有来源的约束；对首次解释或范围扩大提供归一化请求确认。区分契约执行可信与意图已确认，不用第二个自由文本 LLM 判定代替确定性校验。",
+      "acceptance": "固定错误候选覆盖“昨天→全部历史”“支付→确认”“排除条件消失”；应澄清、拒绝或要求确认，不能自动当作语义正确执行。",
+      "verification": "metrics_prompt_probe.py 注入上述错误 InterpretationCandidate，validate_interpretation 返回 ready、all_time=true、计划参数 CONFIRMED。证据：audit/metrics_prompt_probes.json#intent_mismatch。没有调用真实 LLM；不能据此估计真实错误率。",
+      "effort": "M/L",
+      "existing_protections": "显式指标 ID 不可被替换；指标族歧义、单位、时间角色、来源、权限、版本/认证均有检查；失败不回退探索 SQL。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-05",
+      "title": "显式选择单一指标时仍把整个模型与无关证据发送给 LLM",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/metrics/interpretation.py",
+          "line": 451,
+          "end_line": 475,
+          "note": "即使已显式选择单指标，仍序列化整个 GovernedModel，包含未选指标 evidence、固定过滤字面值等。"
+        }
+      ],
+      "trigger": "用户已经明确选择单一指标，但模型中还有其他指标、证据和固定过滤字面值。",
+      "impact": "解释调用仍接收未选指标的信息；扩大不必要的数据出站范围与上下文成本。具体 token 和准确率影响未做真实模型基准。PII 标签未脱敏的问题统一记在 SEC-07，不重复计数。",
+      "fix": "按所选指标和必要依赖闭包生成专用解释视图；未明确选择时先检索候选，再逐步加载所需字段、角色和口径。完整认证模型留在服务端，裁剪提示不得改变认证或权限。",
+      "acceptance": "单指标请求中捕获的提示不包含无关指标私密证据哨兵；候选检索召回和歧义识别通过固定评测；记录实际 token 与成本。",
+      "verification": "metrics_prompt_probe.py 真实解释函数使用本地 LLM 替身：explicit_selection=[confirmed_amount]，未选 cancelled_amount 的 ID 和证据仍在入参。合成模型提示 7605 字符；未调用外部模型。这是缺少数据最小化的能力项。",
+      "effort": "M",
+      "existing_protections": "项目已有自动 PII 分类/标签传播，不能说整体无 PII 功能。指标解释不发送连接配置、既往执行计划或结果；200,000 字符上限存在。图表提示仅发送 SQL/问题/行数/列名，ResponseAgent 也不会把整个结果再交给 LLM。可选 SQL 值验证另会发送少量 probe 样本，需纳入同一策略。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-06",
+      "title": "INFO 日志直接记录完整 Chat 请求和自然语言问题",
+      "priority": "P2",
+      "kind": "代码确认缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/chat/router.py",
+          "line": 633,
+          "note": "logger.info 输出 request.model_dump()，包含问题与随请求提交的字段。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/main.py",
+          "line": 434,
+          "note": "探索入口另一次 INFO 输出完整 question。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/question_intent.py",
+          "line": 544,
+          "end_line": 551,
+          "note": "意图日志也记录 rewritten 原文。"
+        }
+      ],
+      "trigger": "用户在问题中输入客户身份、内部金额、邮箱或意外粘贴密钥；INFO 日志开启并转发到日志平台。",
+      "impact": "业务内容复制进入独立日志存储，访问面和保留期可能不同于会话权限；删除会话并不意味着删除日志副本。",
+      "fix": "默认记录 run/conversation ID、长度、阶段和模型统计；内容诊断需显式 opt-in、字段脱敏和保留期控制。复用现有局部脱敏能力并统一应用到异常/重试记录。",
+      "acceptance": "caplog 在 INFO 级捕获 Chat、explore、intent 和错误路径时，合成敏感哨兵不出现；仍能依 ID 排查问题。",
+      "verification": "从当前 router 源码 AST 提取实际 INFO 表达式，仅执行该表达式并注入合成 request，哨兵出现在日志字符串。证据：audit/llm_probes.json#info_log_contains_raw_question；未启动服务或读取真实用户内容。",
+      "effort": "S",
+      "existing_protections": "Kumo 路径存在部分 literal/error 脱敏；指标解释不会把 provider 异常原文返回用户。本项只针对已定位的日志内容边界，不等于日志平台已泄漏。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-07",
+      "title": "结构化输出的两种失败返回绕过预期纠错和降级",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 566,
+          "end_line": 649,
+          "note": "连续 None 走完循环后隐式返回 None；dict 的 schema.model_validate 位于 try/except 之外。"
+        },
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 663,
+          "end_line": 670,
+          "note": "reasoning fallback 只在异常分支触发。"
+        }
+      ],
+      "trigger": "工具调用模式没有返回结构化工具结果，连续得到 None；或 provider 返回需本地校验的 dict 且首轮字段不合法。",
+      "impact": "前者重试三次后跳过已配置的 reasoning fallback；后者第一轮就抛出校验异常，未执行声明的三轮自纠错。调用方看到相同 None/失败，但实际恢复行为依结果形态不一致。",
+      "fix": "把结果归一化和 Pydantic 校验纳入统一 try；循环耗尽抛类型化错误。区分模型拒绝、缺少工具调用、结构错误、传输失败，再交由明确策略决定重试或降级。",
+      "acceptance": "None×3 能触发允许的 fallback；invalid dict→valid dict 发生两次调用并成功；真正拒绝不可通过无条件切换模型规避；最终失败保留明确原因。",
+      "verification": "llm_probe.py：none_exhaustion 为 primary_calls=3/fallback_calls=0/result=null；dict_validation_outside_retry 为 calls=1/ValidationError，准备好的第二个有效输出未被调用。证据：audit/llm_probes.json。",
+      "effort": "S",
+      "existing_protections": "已有 Pydantic、extra=forbid 模型、provider 抛出 ValidationError 时的纠错、退避和模型角色身份跟踪；修复是补边界，不需要替换全部调用栈。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-08",
+      "title": "多层重试相乘，且永久错误也可能被字符串规则识别成瞬时错误",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 141,
+          "end_line": 183,
+          "note": "仅凭错误字符串包含 litellm/AzureException 等宽泛词即可重试；单调用最多三次。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/agents/sql_from_semantic.py",
+          "line": 356,
+          "end_line": 389,
+          "note": "内层安全调用已重试，外层遇任何失败又重复三次。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/main.py",
+          "line": 290,
+          "end_line": 301,
+          "note": "无 SQL 的 unconstructable 还可启动第二次完整流水线；72 行上限为 2。"
+        }
+      ],
+      "trigger": "端点持续超时/空输出、上下文或 schema 永久错误，尤其消息中包含 litellm。",
+      "impact": "隔离实测单个 SQL 生成节点可调用模型 9 次；满足完整重跑条件时仅这一步理论上可达 18 次，增加延迟、费用和端点压力。不是无限循环，也未实测真实收费或总时长。",
+      "fix": "明确单一 retry owner；按类型/HTTP 状态区分瞬时与永久错误；将绝对截止时间、剩余调用/token 预算贯穿节点及重启。记录每个逻辑请求的累计调用、token、fallback 次数。",
+      "acceptance": "永久 schema/auth 错误一次终止；瞬时故障总次数遵守同一个预算；连续 None 的节点不可产生 3×3 重试；取消/预算耗尽必须停止后续 LLM 调用。",
+      "verification": "llm_probe.py 实际执行 SQLFromCandidatesAgent，provider_calls_per_sql_node=9；ValueError('litellm.BadRequestError: invalid schema') 被 _is_retryable 判 true 且调用三次。证据：audit/llm_probes.json#nested_sql_generation_retries 和 #permanent_error_retried。",
+      "effort": "M",
+      "existing_protections": "单调用超时默认 120 秒、图 recursion_limit=45、完整流水线最多两次、工具调用次数上限、取消终止 worker、可选并发限制均存在。它们不能消除嵌套调用放大。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-09",
+      "title": "任意非推理模型异常都会把同一提示词送往推理端点",
+      "priority": "P2",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 202,
+          "end_line": 211,
+          "note": "reasoning/non-reasoning 明确支持不同 key、endpoint、model。"
+        },
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 485,
+          "end_line": 504,
+          "note": "invoke_text 对任意 Exception 采用 reasoning fallback，并原样发送 prompt。"
+        },
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 663,
+          "end_line": 670,
+          "note": "结构化调用同样未区分拒绝、认证、配置与瞬时传输错误。"
+        }
+      ],
+      "trigger": "两个模型角色指向不同信任域或不同成本档；主端点拒绝、认证失败、配置错误或其他非瞬时异常。",
+      "impact": "本应终止的错误变成另一端点处理，可能越过操作者预期的数据边界，或在配置错误时持续增加高价模型成本；当前返回值不能直接说明实际使用的模型。",
+      "fix": "按用途配置 fallback allowlist 和允许错误类型；拒绝/权限/配置失败默认不自动切换。记录实际 endpoint 标识、model、fallback 原因和累计费用；路由策略与数据出站等级绑定。",
+      "acceptance": "合成 policy/auth 拒绝不得调用 fallback；允许的 503/超时可在同数据等级路由中降级；响应或审计元数据能追溯实际模型且不泄露 key。",
+      "verification": "llm_probe.py 的 primary 抛本地非瞬时 ValueError，注册为 non-reasoning 后 fallback_calls=1，完全相同的合成私密 prompt 被转发。证据：audit/llm_probes.json#non_transient_error_fallback。没有发往真实端点。",
+      "effort": "S/M",
+      "existing_protections": "fallback 端点由操作者配置，并非攻击者任意地址；仅已登记的 non-reasoning 客户端可降级，身份跟踪避免误识别与递归。不能将本项描述为已发生数据外泄。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-10",
+      "title": "探索追问解析失败后把依赖上下文的问题当作独立请求继续处理",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/follow_up.py",
+          "line": 54,
+          "end_line": 71,
+          "note": "异常或 None 返回 (False, 原问题)，与确实不是追问的结果相同。"
+        },
+        {
+          "path": "auto_ontology/retrieval/text_to_sql/main.py",
+          "line": 190,
+          "end_line": 197,
+          "note": "processing_question 缺失即使用当前提交的问题进入生成流水线。"
+        }
+      ],
+      "trigger": "用户上一轮指定客户/口径，随后问“那上个月呢？”，但追问解析模型本轮超时、无结构化输出或初始化不可用。",
+      "impact": "上游错误被折叠成正常的 independent 状态，后续检索失去业务对象/过滤上下文；可能要求重复说明，也可能生成与原问题无关的 SQL。具体错误 SQL 取决于模型，不是本地探针已证明的结果。",
+      "fix": "采用 resolved_follow_up/independent/unavailable 三态；已有上下文且解析 unavailable 时要求重述或可重试，不能自动当独立问题执行。逐步以结构化 query delta 替代完全自由文本重写。",
+      "acceptance": "对“那上个月呢？”注入模型 None/异常，返回明确 unavailable/clarification，不能丢弃原客户/口径条件后继续生成；真正独立新问题仍保持原样。",
+      "verification": "实际 resolve_follow_up 在提供“只统计客户甲的已支付订单”历史、返回 None 的 stub 下得到 is_follow_up=false、processing_question='那上个月呢？'，客户条件不存在。证据：audit/llm_probes.json#follow_up_resolver_failure。",
+      "effort": "S/M",
+      "existing_protections": "解析判为 independent 时会强制保留用户原文；主流程区分 original/standalone/normalized question；标准指标成功请求已有结构化 query_update，这些不补偿本路径的 unavailable 状态丢失。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "LLM-11",
+      "title": "OpenAI 类客户端无条件忽略调用方 temperature 配置",
+      "priority": "P2",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 214,
+          "end_line": 241,
+          "note": "所有 openai/、azure/、aws/ 前缀进入同分支，一律不传 temperature；注释仅引用部分推理模型不支持该参数。"
+        },
+        {
+          "path": "auto_ontology/utils/llm_invoke.py",
+          "line": 282,
+          "end_line": 308,
+          "note": "公开构造函数仍暴露 temperature=0.0 并传到 _build_client，调用者易误以为已生效。"
+        }
+      ],
+      "trigger": "调用者选用支持 temperature 的模型并请求低温，例如网关的 openai/gpt-4.1，或任何共享该前缀分支的兼容模型。",
+      "impact": "有效参数静默失效，生成稳定性和评测复现条件与配置不一致；不支持参数的推理模型兼容问题被扩大为全部模型共同限制。",
+      "fix": "以 provider/endpoint/model 能力表决定支持参数，并对忽略的配置发出结构化警告；支持 temperature 的模型传入用户值，不支持的模型显式拒绝或明确记录使用 provider 默认。",
+      "acceptance": "构造函数测试验证普通模型收到 0.0、不支持模型不发送且有明确说明；网关别名不应仅靠字符串前缀猜能力。真实能力烟测应在有授权模型 key 时单独进行。",
+      "verification": "patch ChatOpenAI 构造函数，_build_client(model='openai/gpt-4.1', temperature=0.0) 的 kwargs 没有 temperature。证据：audit/llm_probes.json#temperature_ignored。官方 Chat Completions 文档说明参数支持依模型而异，temperature 通用默认值为 1；没有调用真实模型。",
+      "effort": "S/M",
+      "existing_protections": "当前省略参数确实避免部分推理模型因不支持 temperature 而报错；不能简单恢复为所有模型一律发送。",
+      "area": "LLM、提示词与上下文"
+    },
+    {
+      "id": "FE-01",
+      "priority": "P1",
+      "classification": "confirmed_bug",
+      "title": "指标工作台的迟到状态响应会切回旧模型并丢弃新草稿",
+      "trigger": "在已保存的 A 模型点击 Validate/Certify/Activate/Deprecate，延迟请求；此时切换到 B 或 New model 并输入草稿，随后 A 请求完成。",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 126,
+          "observation": "transition await 返回后无 mounted/model/request epoch 检查，直接 onSaved(response.data)。",
+          "note": "transition await 返回后无 mounted/model/request epoch 检查，直接 onSaved(response.data)。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 603,
+          "observation": "模型导航只在 dirty/importing 时禁用；子组件 busy 不上报父级。",
+          "note": "模型导航只在 dirty/importing 时禁用；子组件 busy 不上报父级。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 464,
+          "observation": "saved 无条件 setSelectedId(value.model_id)、setCreating(null)、setDirty(false)。",
+          "note": "saved 无条件 setSelectedId(value.model_id)、setCreating(null)、setDirty(false)。"
+        }
+      ],
+      "impact": "A 的成功回调覆盖用户当前工作区选择，使 B 编辑器卸载；B 的未保存编辑可能丢失。服务器版本冲突保护不能保护浏览器中的草稿。",
+      "verification": "从实际源码 AST 提取 saved 回调并在当前 B、dirty=true、有新草稿的状态调用 A 返回值，结果为 activeModel=A,draft=null,dirty=false；完整 UI 请求时序由静态调用链确认。未声称浏览器复现。",
+      "fix": "将请求绑定模型 ID 与工作区 epoch；迟到成功只更新对应缓存，不修改当前选择/草稿。也可将治理操作 busy 上提锁定离开，但仍应防卸载后的回调。",
+      "acceptance": [
+        "用可控 Promise 延迟 A 的治理请求；切 B 编辑后完成 A，B 内容和 dirty 保持，A 缓存正确更新。",
+        "同一模型正常完成后更新版本；切页后返回不会回放陈旧导航。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "FE-02",
+      "priority": "P1",
+      "classification": "confirmed_bug",
+      "title": "中文输入法的 Enter 确认会触发 Chat 发送",
+      "trigger": "Windows 中文输入法正在 composition，使用 Enter 确认候选词；事件 key=Enter、shiftKey=false、isComposing=true。",
+      "evidence": [
+        {
+          "path": "frontend/components/chatPage/ChatInput.tsx",
+          "line": 81,
+          "observation": "handleKeyDown 仅检查 Enter 和 Shift，未检查 composition 状态。",
+          "note": "handleKeyDown 仅检查 Enter 和 Shift，未检查 composition 状态。"
+        }
+      ],
+      "impact": "确认文字和发送消息冲突，可能发送尚未完成的问题并启动查询；与公司中文使用场景直接相关。",
+      "verification": "执行从源码提取的 handleKeyDown，传入 isComposing=true / nativeEvent.isComposing=true 的 Enter；handleSubmit 被调用一次。该探针验证逻辑，真实 IME 事件顺序仍须 Windows 浏览器验收。",
+      "fix": "在 compositionstart/end 维护状态，并结合 nativeEvent.isComposing 拦截提交；仅在 composition 已结束后的独立 Enter 发送。保留 Shift+Enter 换行。",
+      "acceptance": [
+        "Windows 150% 显示缩放下，用微软拼音在 Edge/Chrome 完成候选词，确认期间不发送；下一次独立 Enter 只发送一次。",
+        "单元事件序列覆盖 compositionstart、Enter、compositionend、普通 Enter、Shift+Enter。"
+      ],
+      "official_sources": [
+        "https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/isComposing"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "FE-03",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "切换会话后旧发送失败会回填旧会话问题",
+      "trigger": "新会话 A 首次发送后创建会话请求尚未返回，用户选择 B / New chat；旧请求返回并因 viewEpoch 不一致返回 false。",
+      "evidence": [
+        {
+          "path": "frontend/components/chatPage/ChatView.tsx",
+          "line": 227,
+          "observation": "旧 sendEpoch 在会话切换后返回 false。",
+          "note": "旧 sendEpoch 在会话切换后返回 false。"
+        },
+        {
+          "path": "frontend/components/chatPage/ChatInput.tsx",
+          "line": 69,
+          "observation": "收到 false 后仅检查 textarea 当前为空，直接恢复 text；没有会话 ID 或发送 epoch。",
+          "note": "收到 false 后仅检查 textarea 当前为空，直接恢复 text；没有会话 ID 或发送 epoch。"
+        },
+        {
+          "path": "frontend/components/chatPage/ChatView.tsx",
+          "line": 338,
+          "observation": "ChatInput 未按会话 key 重挂载，也未接收会话 ID。",
+          "note": "ChatInput 未按会话 key 重挂载，也未接收会话 ID。"
+        }
+      ],
+      "impact": "A 的问题出现在 B 输入框，用户下一次发送可能把旧问题送入错误会话/模型上下文；不是已确认的服务器跨用户越权。",
+      "verification": "执行源码实际 handleSubmit，等待 onSend Promise、模拟切换到空输入框后 resolve(false)，textarea 被写入“会话A的问题”。",
+      "fix": "为 composer 草稿和恢复操作绑定 conversationId + request epoch；同一会话失败才能恢复。需要保留多会话草稿时按会话存储，不共用未受控 textarea 的最后值。",
+      "acceptance": [
+        "延迟 A 的创建/拒绝响应，切 B 并等待，B 不出现 A 内容；B 自有草稿不被清空。",
+        "留在 A 的普通发送拒绝仍恢复问题。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "FE-04",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "连接测试成功状态未绑定被测试的表单版本",
+      "trigger": "点击 Test Connection 后修改 host/账号/database，再等待原测试成功；测试过程中连接字段仍可输入。",
+      "evidence": [
+        {
+          "path": "frontend/components/connectionsPage/ConnectionModal.tsx",
+          "line": 205,
+          "observation": "字段变化清除 isConnectionTested，但不取消旧请求或递增请求版本。",
+          "note": "字段变化清除 isConnectionTested，但不取消旧请求或递增请求版本。"
+        },
+        {
+          "path": "frontend/components/connectionsPage/ConnectionModal.tsx",
+          "line": 219,
+          "observation": "await 旧测试后直接 setIsConnectionTested(true) 并写 availableSchemas。",
+          "note": "await 旧测试后直接 setIsConnectionTested(true) 并写 availableSchemas。"
+        },
+        {
+          "path": "frontend/components/connectionsPage/steps/ConnectionConnectStep.tsx",
+          "line": 174,
+          "observation": "字段没有受 testingConnection 控制的 disabled；该状态只禁用测试按钮。",
+          "note": "字段没有受 testingConnection 控制的 disabled；该状态只禁用测试按钮。"
+        },
+        {
+          "path": "frontend/components/connectionsPage/ConnectionModal.tsx",
+          "line": 244,
+          "observation": "保存只检查布尔 isConnectionTested，随后 buildConnection 使用当前值。",
+          "note": "保存只检查布尔 isConnectionTested，随后 buildConnection 使用当前值。"
+        }
+      ],
+      "impact": "B 配置可显示 A 的成功提示与 schema 清单，并通过“已测试”UI门禁；后端即使再验证，交互状态仍是错误的。",
+      "verification": "执行源码实际 handleTestConnection，发送 old-host，输入改为 new-host 后旧 Promise 成功；当前 new-host 被标 tested=true。",
+      "fix": "保存 testedPayloadFingerprint，字段修改使其失效；请求完成前比较 fingerprint/requestId，忽略旧响应。必要时取消旧请求。",
+      "acceptance": [
+        "延迟 A 测试，编辑为 B 后 A 成功不得启用 Save/Next，也不得写 A schemas。",
+        "重新测试 B 成功后才能保存 B，失败时保留具体错误。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "FE-05",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "建模编辑器删除后新增会生成重复稳定 ID",
+      "trigger": "已有 source_1/source_2/source_3，删除 source_2，再 Add source；字段、维度、关系、指标有同样 length+1 模式。",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/ModelEditor.tsx",
+          "line": 866,
+          "observation": "新来源 ID 使用 newSource(model.sources.length + 1)。",
+          "note": "新来源 ID 使用 newSource(model.sources.length + 1)。"
+        },
+        {
+          "path": "frontend/components/metricsPage/ModelEditor.tsx",
+          "line": 217,
+          "observation": "字段 ID 为 field_${source.fields.length+1}。",
+          "note": "字段 ID 为 field_${source.fields.length+1}。"
+        },
+        {
+          "path": "frontend/components/metricsPage/ModelEditor.tsx",
+          "line": 908,
+          "observation": "关系 ID 为 relationship_${model.relationships.length+1}。",
+          "note": "关系 ID 为 relationship_${model.relationships.length+1}。"
+        },
+        {
+          "path": "frontend/lib/governedMetrics.ts",
+          "line": 226,
+          "observation": "newSource 直接按输入 index 生成 source_${index}。",
+          "note": "newSource 直接按输入 index 生成 source_${index}。"
+        }
+      ],
+      "impact": "普通增删操作即可产生歧义 ID；后续校验拒绝，已有引用难以区分，用户要手工修复。后端拒绝阻止执行，但不等于编辑体验正确。",
+      "verification": "导入实际 newSource 函数模拟删中间项后新增，得到 source_1,source_3,source_3。",
+      "fix": "按已占用 ID 集合生成下一个未使用值或使用稳定内部 UUID；同时在重命名/删除时列出引用并原子更新或阻止破坏引用。不能仅修改 React key。",
+      "acceptance": [
+        "来源/字段/维度/关系/指标各执行删中间项→新增，ID 无重复。",
+        "被引用 ID 重命名/删除后无悬空引用，或明确阻止并显示依赖清单。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "FE-06",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "Metrics 未保存内容仅保护内部模型选择，离开页面即丢失",
+      "trigger": "编辑已存在模型或 Advanced JSON 尚未应用，点击全局导航、浏览器后退、刷新或关闭标签页。",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 56,
+          "observation": "模型与待应用 JSON 只保存在组件 useState。",
+          "note": "模型与待应用 JSON 只保存在组件 useState。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 68,
+          "observation": "dirty 仅传父级锁内部操作。",
+          "note": "dirty 仅传父级锁内部操作。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricsWorkspace.tsx",
+          "line": 603,
+          "observation": "局部按钮 disabled 不能保护全局导航。",
+          "note": "局部按钮 disabled 不能保护全局导航。"
+        },
+        {
+          "path": "frontend/common/NavRail.tsx",
+          "line": 56,
+          "observation": "全局 Link 正常导航，不读取工作台 dirty。",
+          "note": "全局 Link 正常导航，不读取工作台 dirty。"
+        }
+      ],
+      "impact": "用户看到内部“Save or discard”保护，容易误认为草稿已被保护；离页会卸载编辑器并丢失较长建模工作。",
+      "verification": "静态全仓检索未找到 beforeunload/工作台离页拦截或草稿恢复实现；状态持有与卸载路径明确，未浏览器实测。",
+      "fix": "把草稿生命周期显式化：路由离开提示、beforeunload 提醒和按用户/模型/基础修订版保存可恢复编辑缓冲；恢复不能自动认证或覆盖新版本。",
+      "acceptance": [
+        "表单和未应用 JSON 在导航/后退/刷新时均提示或可恢复；保存/丢弃后不再误报。",
+        "恢复遇到服务端版本变化时保留本地内容并提示冲突，不静默覆盖。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "代码确认缺陷"
+    },
+    {
+      "id": "FE-07",
+      "priority": "P2",
+      "classification": "conditional_risk",
+      "title": "1280×720 下展开大量指标口径会挤出 Chat 消息和输入区",
+      "trigger": "公司 13 寸 1920×1080、Windows 150% 对应约 1280×720 CSS 视口；标准指标模型有 30–40 个口径，展开 Metric variants。",
+      "evidence": [
+        {
+          "path": "frontend/common/AppTopBar.tsx",
+          "line": 17,
+          "observation": "固定顶部栏 52px，剩余应用高度约668px。",
+          "note": "固定顶部栏 52px，剩余应用高度约668px。"
+        },
+        {
+          "path": "frontend/components/chatPage/ChatModeControls.tsx",
+          "line": 164,
+          "observation": "指标列表一次渲染全部，sm 两列，没有 max-height/overflow 内部滚动或搜索。",
+          "note": "指标列表一次渲染全部，sm 两列，没有 max-height/overflow 内部滚动或搜索。"
+        },
+        {
+          "path": "frontend/components/chatPage/ChatView.tsx",
+          "line": 292,
+          "observation": "模式控件、消息列表和输入框为同一纵向 flex 流。",
+          "note": "模式控件、消息列表和输入框为同一纵向 flex 流。"
+        },
+        {
+          "path": "frontend/components/chatPage/ChatSidebar.tsx",
+          "line": 205,
+          "observation": "lg 起侧栏固定296px；1280宽时正文约1280-48-296=936px。",
+          "note": "lg 起侧栏固定296px；1280宽时正文约1280-48-296=936px。"
+        }
+      ],
+      "impact": "每个口径含复选框、描述和 gap；几十项展开可超过剩余视口高度，使对话区严重缩小或页面整体溢出，无法边选口径边看问题。24/27寸与4K不应通过固定放大控件规避。",
+      "verification": "CSS/DOM布局推导，未测浏览器像素边界或断言具体遮挡位置。",
+      "fix": "将口径选择做成有搜索/家族分组的限高滚动区域或抽屉，保留已选摘要；Chat 主容器设置明确 min-h-0，输入区不收缩。使用容器/可用高度响应，不能只看物理屏幕分辨率。",
+      "acceptance": [
+        "1280×720 下40个口径（含长中文名）展开时输入/停止按钮始终可见且可键盘到达，消息仍可滚动；无页面水平溢出。",
+        "复测实际 innerWidth/innerHeight 为1280×720、1440×900、1920×1080、2560×1440和3840×2160，另测浏览器200%缩放；不要把显示器英寸当断点。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "条件风险"
+    },
+    {
+      "id": "FE-08",
+      "priority": "P2",
+      "classification": "conditional_risk",
+      "title": "指标工作台全量 DOM 表格与主线程图布局缺少大数据性能预算",
+      "trigger": "工作台执行10,000行且多列结果；或图谱500基础节点连续多次扩展，再拖拽/筛选，尤其在13寸公司笔记本及4K画布。",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/MetricQueryPanel.tsx",
+          "line": 89,
+          "observation": "rows.map 嵌套 columns.map 渲染全部行列，max-h-96只限制视觉高度。",
+          "note": "rows.map 嵌套 columns.map 渲染全部行列，max-h-96只限制视觉高度。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/models.py",
+          "line": 184,
+          "observation": "请求允许limit最高10000。",
+          "note": "请求允许limit最高10000。"
+        },
+        {
+          "path": "frontend/components/chatPage/DynamicTable.tsx",
+          "line": 21,
+          "observation": "原Chat表已有 usePagination/pageRows，可直接复用，不能把整个项目说成无分页。",
+          "note": "原Chat表已有 usePagination/pageRows，可直接复用，不能把整个项目说成无分页。"
+        },
+        {
+          "path": "frontend/api/exploration.ts",
+          "line": 34,
+          "observation": "基础图请求上限500，已有保护。",
+          "note": "基础图请求上限500，已有保护。"
+        },
+        {
+          "path": "frontend/components/explorationPage/graph/GraphCanvas.tsx",
+          "line": 1029,
+          "observation": "d3-force在主线程运行，tick更新所有节点属性；每次扩展重新加热。",
+          "note": "d3-force在主线程运行，tick更新所有节点属性；每次扩展重新加热。"
+        }
+      ],
+      "impact": "10,000×30列约300,000单元格；大量 React节点、表布局与力模拟竞争主线程，可能造成输入/滚动卡顿。现有图节点/单次扩展上限降低风险，但不能据此声称已满足目标设备性能。",
+      "verification": "工作量由代码确认；没有测得卡顿时间、FPS或内存数字，不宣称必然冻结。",
+      "fix": "先复用现有分页表并限制一次展示行数，保留精确字符串与空表元数据；为图谱设置累计展开预算、稳定布局缓存和暂停布局控制。仅在真实profile显示布局长任务后才考虑Worker，不要求更换图框架。",
+      "acceptance": [
+        "在目标笔记本用10k×30真实长度数据记录首次可交互、主线程long task与滚动；翻页只渲染当前页，金额字符串逐字相同。",
+        "500节点+20次扩展压测，记录节点/边数与P95交互延迟；选择的性能门槛写入测试而非凭感觉。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "条件风险"
+    },
+    {
+      "id": "FE-09",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "通用 Modal 声明了模态语义，但没有实现焦点隔离与恢复",
+      "trigger": "键盘用户在连接向导等弹窗中按 Tab/Shift+Tab，或使用屏幕阅读器进入弹窗。",
+      "evidence": [
+        {
+          "path": "frontend/common/modal/Modal.tsx",
+          "line": 27,
+          "observation": "仅锁body滚动，未移动焦点/设置背景inert。",
+          "note": "仅锁body滚动，未移动焦点/设置背景inert。"
+        },
+        {
+          "path": "frontend/common/modal/Modal.tsx",
+          "line": 36,
+          "observation": "仅处理 Escape，未捕获Tab循环或关闭后恢复焦点。",
+          "note": "仅处理 Escape，未捕获Tab循环或关闭后恢复焦点。"
+        },
+        {
+          "path": "frontend/common/modal/Modal.tsx",
+          "line": 60,
+          "observation": "role=dialog、aria-modal=true但无aria-labelledby/aria-label。",
+          "note": "role=dialog、aria-modal=true但无aria-labelledby/aria-label。"
+        },
+        {
+          "path": "frontend/common/modal/ModalWithSteps.tsx",
+          "line": 83,
+          "observation": "标题h3未以ID连接到dialog名称。",
+          "note": "标题h3未以ID连接到dialog名称。"
+        }
+      ],
+      "impact": "视觉模态与键盘实际操作不一致，焦点可进入遮罩后的控件；屏幕阅读器不能稳定读到对话框名称。此为通用基础组件缺陷，影响多条流程。",
+      "verification": "组件完整源码确认缺少焦点管理；没有进行NVDA或浏览器自动化验收。",
+      "fix": "在通用Modal集中实现初始焦点、Tab循环、背景inert、关闭恢复触发器和可访问名称；处理嵌套弹窗时只关闭顶层。复用现有设计，不需要改框架。",
+      "acceptance": [
+        "仅用键盘完成连接向导，焦点不越出弹窗；Escape关闭后回到触发按钮。",
+        "NVDA+Edge朗读对话框标题，自动a11y检查无dialog-name问题；嵌套弹窗焦点与滚动锁正确。"
+      ],
+      "official_sources": [
+        "https://www.w3.org/WAI/ARIA/apg/patterns/dialog-modal/"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "代码确认缺陷"
+    },
+    {
+      "id": "FE-10",
+      "priority": "P2",
+      "classification": "confirmed_bug",
+      "title": "表单校验与后端约束脱节，FastAPI字段错误退化成通用422",
+      "trigger": "标准查询行数填0/1.5/10001，或输入非ISO时间；UI仍可发请求，后端返回detail数组。",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/MetricQueryPanel.tsx",
+          "line": 524,
+          "observation": "Row limit标注1–10000但只Number(limit)，不校验范围/整数。",
+          "note": "Row limit标注1–10000但只Number(limit)，不校验范围/整数。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricFields.tsx",
+          "line": 33,
+          "observation": "TextField不提供min/max/step或字段error关联。",
+          "note": "TextField不提供min/max/step或字段error关联。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricQueryPanel.tsx",
+          "line": 183,
+          "observation": "发送前只检查指标、时间存在/非空，没有完整请求schema校验。",
+          "note": "发送前只检查指标、时间存在/非空，没有完整请求schema校验。"
+        },
+        {
+          "path": "auto_ontology/semantic/contracts/models.py",
+          "line": 184,
+          "observation": "真实约束int/ge=1/le=10000。",
+          "note": "真实约束int/ge=1/le=10000。"
+        },
+        {
+          "path": "frontend/api/requests.ts",
+          "line": 33,
+          "observation": "extractServerMessage只认识detail字符串或.message对象，不解析FastAPI detail数组。",
+          "note": "extractServerMessage只认识detail字符串或.message对象，不解析FastAPI detail数组。"
+        },
+        {
+          "path": "frontend/components/metricsPage/MetricQueryPanel.tsx",
+          "line": 212,
+          "observation": "UI只显示response.message，details里的loc/msg未显示。",
+          "note": "UI只显示response.message，details里的loc/msg未显示。"
+        },
+        {
+          "path": "frontend/scripts/generate-openapi.ts",
+          "line": 55,
+          "observation": "生成器目标是OpenAPI JSON；types/governedMetrics.ts、lib/governedMetrics.ts仍手写，当前无生成请求validator/client流程。",
+          "note": "生成器目标是OpenAPI JSON；types/governedMetrics.ts、lib/governedMetrics.ts仍手写，当前无生成请求validator/client流程。"
+        }
+      ],
+      "impact": "可避免的无效请求到达服务器；用户只见Request failed with status code422，无法定位字段。后端仍拒绝非法查询，这是UX/契约维护缺口，不是绕过认证。",
+      "verification": "以mock axios adapter返回真实FastAPI数组形状，通过实际requests.post，得到通用message，同时details数组仍在；可据此修复而不改错误协议。",
+      "fix": "统一请求schema边界校验及字段错误映射，保留服务端为语义真值；将OpenAPI作为生成TS请求/响应类型或契约一致性测试的输入，另生成/维护运行时validator，不能误以为TS类型会校验范围。",
+      "acceptance": [
+        "0、1.5、10001和非法时间在字段旁显示具体原因并阻止发送，1和10000正常。",
+        "任意FastAPI422 detail数组保留loc/msg并定位到对应字段；API契约变化能触发生成差异或fixture一致性测试失败。"
+      ],
+      "area": "前端、交互与建模体验",
+      "kind": "已复现缺陷"
+    },
+    {
+      "id": "ENG-01",
+      "title": "旧库升级会直接清空会话分析历史，前端 schema 又没有版本化迁移链",
+      "priority": "P1",
+      "kind": "已复现缺陷",
+      "evidence": [
+        {
+          "path": "frontend/prisma/migrate.sh",
+          "line": 42,
+          "end_line": 59,
+          "note": "旧 conversation_analytics 存在且缺 user_id 时执行 TRUNCATE，然后 db push"
+        },
+        {
+          "path": "frontend/package.json",
+          "line": 10,
+          "end_line": 13,
+          "note": "start 同步 schema；仓库 frontend/prisma 只有 schema 与 migrate.sh，没有迁移目录"
+        },
+        {
+          "path": "helm/auto-ontology/templates/frontend-migrate-job.yaml",
+          "line": 61,
+          "end_line": 71,
+          "note": "正式 Helm 升级执行同一脚本"
+        }
+      ],
+      "trigger": "从缺少 user_id 的旧版 schema 升级；不是新安装都会丢数据。",
+      "impact": "历史分析记录被不可逆清空；其他字段重命名、回填和兼容窗口也无法从版本化迁移追踪。没有声称本次生产环境已经发生丢失。",
+      "fix": "建立 Prisma migration baseline；将旧数据归档或可审计回填，再迁移约束。生产使用 migrate deploy；迁移与应用启动解耦，做升级前备份和演练。不要在数据损失警告上加 accept-data-loss。",
+      "acceptance": "对旧版数据库快照执行升级：记录数与可归属信息保留，无法归属的记录进入归档；重复执行幂等；回滚/前滚方案经演练。",
+      "verification": "在独立 UUID PostgreSQL schema 执行原 DO 块（仅替换 schema 名），两条历史记录变为零条，测试 schema 已清理。",
+      "effort": "中",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-02",
+      "title": "当前交付方式绕开了 main / PR 的自动 CI 门禁",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": ".github/workflows/ci-python.yml",
+          "line": 7,
+          "end_line": 12,
+          "note": "push 只监听 main，PR 只面向 main"
+        },
+        {
+          "path": ".github/workflows/ci-client.yml",
+          "line": 7,
+          "end_line": 13,
+          "note": "同样只监听 main 和面向 main 的 PR"
+        }
+      ],
+      "trigger": "向 feat/governed-metrics 直接推送且没有 PR。",
+      "impact": "本地测试不能自动约束后续提交；新增真实 MySQL CI 服务只是配置，当前分支并没有因此得到远端验收。",
+      "fix": "为开发分支启用 CI 或将后续变更放入面向主分支的 PR，并设置所需 checks；保留手动触发入口。",
+      "acceptance": "在开发分支提交最小变更可看到对应 commit 的 Python、前端、OpenAPI checks；失败阻止合并。",
+      "verification": "GitHub Actions runs 按 feat/governed-metrics 查询，返回 total_count=0；已核对远端与本地 head 均为 1a5c505。",
+      "effort": "小",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-03",
+      "title": "前端 CI 没有运行已经编写的 Vitest 回归",
+      "priority": "P1",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": ".github/workflows/ci-client.yml",
+          "line": 56,
+          "end_line": 66,
+          "note": "只有 install、格式、lint、build，没有 vitest"
+        },
+        {
+          "path": "frontend/package.json",
+          "line": 7,
+          "end_line": 17,
+          "note": "无 test 脚本，虽有 vitest 依赖和现有测试文件"
+        }
+      ],
+      "trigger": "前端行为回归不影响编译、类型或 lint，例如 Chat 追问与异步状态错配。",
+      "impact": "已有 37 项行为测试在本地通过，却不是自动合并门槛；构建成功不能证明行为正确。",
+      "fix": "新增冻结依赖后的 vitest run 门禁、JUnit 报告；增加关键登录/Chat/指标流程浏览器 E2E，而非用快照替代业务断言。",
+      "acceptance": "故意破坏一条 Chat/指标行为测试使 CI 失败；E2E 至少覆盖登录权限、澄清追问、取消恢复和 1280×720 布局。",
+      "verification": "逐项阅读 ci-client.yml；未发现调用 Vitest 的 CI step。未据此声称仓库没有单测。",
+      "effort": "小到中",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-04",
+      "title": "镜像构建未完全遵守锁文件，存在环境漂移窗口",
+      "priority": "P2",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "Dockerfile",
+          "line": 62,
+          "end_line": 68,
+          "note": "uv sync 缺 --locked/--frozen"
+        },
+        {
+          "path": "frontend/Dockerfile",
+          "line": 128,
+          "end_line": 133,
+          "note": "迁移运行时 npm install --no-package-lock，部分 overrides 使用范围"
+        }
+      ],
+      "trigger": "pyproject 与 uv.lock 不一致，或重新构建时迁移工具的传递依赖发生变化。",
+      "impact": "本地锁定依赖验证过的环境与镜像不一定相同；同一源码提交重新构建可能得到不同传递依赖。不是声称每次构建都会换版本。",
+      "fix": "后端构建使用 uv sync --locked；前端迁移工具复用独立提交的锁文件并用 npm ci 或锁定 pnpm 部署；镜像保存 SBOM 和实际依赖清单。",
+      "acceptance": "故意使项目声明与锁文件不一致时构建失败；同 commit 两次构建比较依赖清单一致。",
+      "verification": "构建命令和 uv 官方同步语义核对，未做网络依赖更新或安装攻击包。",
+      "effort": "小到中",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-05",
+      "title": "所有数据库连接器强制安装并在基础包导入时加载",
+      "priority": "P2",
+      "kind": "改进建议",
+      "evidence": [
+        {
+          "path": "auto_ontology/connectors/__init__.py",
+          "line": 7,
+          "end_line": 21,
+          "note": "全部驱动 eager import"
+        },
+        {
+          "path": "auto_ontology/connectors/registry.py",
+          "line": 18,
+          "end_line": 27,
+          "note": "注册表也直接导入所有驱动"
+        },
+        {
+          "path": "pyproject.toml",
+          "line": 23,
+          "end_line": 47,
+          "note": "多个数据库 SDK 属于基础依赖而非 extras"
+        }
+      ],
+      "trigger": "部署只需要 PostgreSQL/MySQL，却仍安装 Snowflake、Databricks、HeavyDB、Hive 等驱动；其中任何导入依赖故障影响基础启动。",
+      "impact": "镜像、冷启动、升级耦合和供应链维护负担增加。具体耗时、体积收益尚未进行本轮基准测试。",
+      "fix": "按连接器拆 extras，使用惰性工厂或 entry points；保留常用 postgres/mysql 发行组合，缺失驱动给出明确安装提示。",
+      "acceptance": "仅安装核心加 mysql extra 可启动并查询；未安装的 connector 不影响服务启动；比较镜像体积和冷启动实测。",
+      "verification": "代码导入链直接确认；pyproject 也记录过 HeavyDB 传递依赖导致全包导入失败的历史。",
+      "effort": "中",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-06",
+      "title": "缺少跨 HTTP、工作进程、LLM 与 SQL 的统一追踪和成本指标",
+      "priority": "P2",
+      "kind": "能力不足",
+      "evidence": [
+        {
+          "path": "auto_ontology/server/__main__.py",
+          "line": 18,
+          "end_line": 22,
+          "note": "基础文本 logging，无统一 tracing middleware"
+        },
+        {
+          "path": "frontend/prisma/schema.prisma",
+          "line": 89,
+          "end_line": 101,
+          "note": "现有 conversation analytics 保存问题、时间、回答和 SQL，未记录 token/model/stage cost"
+        },
+        {
+          "path": "auto_ontology/server/chat/worker.py",
+          "line": 204,
+          "end_line": 208,
+          "note": "处理问题通过普通日志输出"
+        }
+      ],
+      "trigger": "一次请求经过多个模型/重试/工作进程，出现慢查询、费用增加或结果问题时。",
+      "impact": "现有日志与会话分析可以辅助排查，但难以还原每次检索、编译、LLM、SQL 阶段耗时、模型版本、token 和失败原因，无法设置可靠预算告警。",
+      "fix": "先建立 request_id/run_id 并跨进程传播；增加阶段耗时、取消、队列长度、LLM token/model/费用字段与 SLO；用 OpenTelemetry 统一采集，可按需接 Langfuse/LangSmith，默认不采集完整敏感内容。",
+      "acceptance": "同一 run 能串起网关、worker、LLM、SQL；可定位 p95 延迟和单请求 token；超预算告警不依赖明文问题日志。",
+      "verification": "检查入口、worker、analytics schema 并在运行代码范围检索 trace/token 相关字段；这是所检查链路的观测不足，不是宣称所有外部部署均没有监控。",
+      "effort": "中",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-07",
+      "title": "随附 PostgreSQL 部署是单副本单卷，没有内建恢复与高可用配置",
+      "priority": "P1",
+      "kind": "条件风险",
+      "evidence": [
+        {
+          "path": "helm/auto-ontology/templates/postgres.yaml",
+          "line": 8,
+          "end_line": 18,
+          "note": "单一 ReadWriteOnce PVC"
+        },
+        {
+          "path": "helm/auto-ontology/templates/postgres.yaml",
+          "line": 41,
+          "end_line": 43,
+          "note": "StatefulSet replicas:1"
+        },
+        {
+          "path": "helm/auto-ontology/templates/postgres.yaml",
+          "line": 92,
+          "end_line": 95,
+          "note": "固定数据卷；模板集合无备份任务"
+        }
+      ],
+      "trigger": "把随附快速部署直接用于承载正式元数据、模型、用户会话和向量索引。",
+      "impact": "数据库或存储故障影响全部核心能力；持久卷本身不等于可恢复备份。外部运维可能已经配置备份，本次没有核查实际集群。",
+      "fix": "生产优先使用已有托管 PostgreSQL 或经过运维验证的 operator；明确备份/WAL/PITR、恢复目标和演练，提供 externalDatabase 配置。不要只增加 replicas 值假装复制。",
+      "acceptance": "从备份恢复认证模型、用户会话和向量数据；测试数据库故障切换，并记录可达成的 RPO/RTO。",
+      "verification": "只读模板审查，未声称生产已经丢失数据，也未测试真实集群容灾。",
+      "effort": "中到大",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-08",
+      "title": "已有许可证检查持续失败，完整测试仍不是全绿",
+      "priority": "P2",
+      "kind": "代码确认缺陷",
+      "evidence": [
+        {
+          "path": "CODE_OF_CONDUCT.md",
+          "line": 1,
+          "note": "缺少仓库要求的 SPDX 标注"
+        },
+        {
+          "path": "dev_tools/tests/test_licensing.py",
+          "line": 76,
+          "end_line": 92,
+          "note": "强制检查 tracked source headers"
+        },
+        {
+          "path": "docs/plans/governed-metrics-progress.md",
+          "line": 106,
+          "note": "本轮验证记录明确保留上游失败"
+        }
+      ],
+      "trigger": "执行完整后端测试或将分支纳入 CI。",
+      "impact": "合法的质量门禁保持红色，团队容易习惯忽略失败，降低后续回归辨识能力。",
+      "fix": "核对该文档实际来源与许可，按仓库规则补正确 SPDX 或合法 sidecar；不要随意改写作者/许可或屏蔽测试。",
+      "acceptance": "许可证检查通过，完整测试不再有此已知失败。",
+      "verification": "上一轮同 commit 的全量记录为2881 passed、1 skipped、1 failed；本轮阅读文件与检查实现，没有重跑全部测试。",
+      "effort": "小",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "ENG-09",
+      "title": "Python CI 为统计跳过再次执行整个测试套件",
+      "priority": "P3",
+      "kind": "改进建议",
+      "evidence": [
+        {
+          "path": ".github/workflows/ci-python.yml",
+          "line": 225,
+          "end_line": 241,
+          "note": "主测试一次；skip guard 再跑一次，异常时可能第三次"
+        }
+      ],
+      "trigger": "主测试成功后运行 skip guard。",
+      "impact": "增加 CI 时间和数据库重复建删负担，第二次运行可能与第一次受时序影响而不一致；故障重试难对齐同一份结果。",
+      "fix": "一次 pytest 输出 JUnit/JSON 报告，同时基于该报告判断失败和特定允许的 skips；明确测试 DSN 与版本作为报告元数据。",
+      "acceptance": "一个 workflow 只执行一次全量 suite，跳过数量和失败数量来自同一 run，意外跳过仍阻止 CI。",
+      "verification": "workflow 命令顺序直接确认；不把第二次测试等同于额外覆盖。",
+      "effort": "小",
+      "area": "工程、部署与可观测性"
+    },
+    {
+      "id": "FE-11",
+      "title": "建模仍依赖手工 Catalog ID，缺少面向业务人员的来源选择向导",
+      "priority": "P2",
+      "kind": "能力不足",
+      "trigger": "需要业务人员自行把已摄取表、列和术语绑定为可认证模型。",
+      "impact": "重复查找和粘贴 ID 增加录入错误与学习成本；当前编辑器更适合熟悉内部实体的工程人员。",
+      "fix": "从现有 Catalog 提供数据库→表→列的选择和搜索，自动带出 ID、类型及名称；将唯一键/关系作为建议而非自动认证结论，服务端继续复验。",
+      "acceptance": "业务人员无需查看原始 UUID 即可完成订单金额模型；选择失效或无权访问的对象必须明确报错。",
+      "area": "前端、交互与建模体验",
+      "evidence": [
+        {
+          "path": "frontend/components/metricsPage/ModelEditor.tsx",
+          "line": 51,
+          "note": "来源、Term、Catalog表/列仍靠手工粘贴ID和重复输入名称；当前是工程师可用的治理编辑器，还不是业务人员可自助的Catalog驱动建模向导。建议后续按数据库→表→列选择回填ID、名称、类型、唯一键建议，服务端仍复验。此为明确能力限制，不伪称现有picker损坏。"
+        }
+      ],
+      "verification": "静态源码确认；未进行真实浏览器、辅助技术或凭据测试。",
+      "effort": "中"
+    },
+    {
+      "id": "FE-12",
+      "title": "图谱缺少键盘可操作的节点与关系等价路径",
+      "priority": "P2",
+      "kind": "能力不足",
+      "trigger": "用户只使用键盘或屏幕阅读器，需要选择节点、展开关系与查看详情。",
+      "impact": "主要图交互依赖 pointer/click；容器 aria-label 本身不能使每个业务对象可操作。",
+      "fix": "增加与图选择状态同步的节点/关系列表，支持键盘搜索、选择与展开；先提供等价工作路径，再评估图内完整空间导航。",
+      "acceptance": "仅用键盘可搜索、选择、展开并查看任意已加载实体；屏幕阅读器能读到名称、类型和关系方向。",
+      "area": "前端、交互与建模体验",
+      "evidence": [
+        {
+          "path": "frontend/components/explorationPage/graph/GraphCanvas.tsx",
+          "line": 1706,
+          "note": "图谱容器只有aria-label，事件为pointer/click，无节点键盘导航或等价关系列表；需要额外键盘可达的节点/关系列表或受控选择路径。这是能力限制，本报告未将其合并为已测屏幕阅读器问题。"
+        }
+      ],
+      "verification": "静态源码确认；未进行真实浏览器、辅助技术或凭据测试。",
+      "effort": "中"
+    },
+    {
+      "id": "FE-13",
+      "title": "连接表单统一 trim 字符串，会改写带首尾空格的合法秘密值",
+      "priority": "P2",
+      "kind": "代码确认缺陷",
+      "trigger": "密码等 secret 字段的首尾空格属于凭据原文。",
+      "impact": "buildConnection 对所有非布尔字符串调用 trim，实际提交字节与输入不一致，导致合法连接测试或保存失败。未使用真实凭据测试。",
+      "fix": "只规范化 host、port、展示名等非秘密字段；secret 按原文传递，明确区分未修改、清空与替换。",
+      "acceptance": "合成密码前后含空格、换行和非 ASCII 字符时，到 driver 的值逐字一致；普通主机名仍按规则规范化。",
+      "area": "前端、交互与建模体验",
+      "evidence": [
+        {
+          "path": "frontend/components/connectionsPage/ConnectionModal.tsx",
+          "line": 141,
+          "note": "所有字符串统一trim，包括secret字段；带首尾空格的合法password/private key字节会被改写。建议secret值保留原文，仅对非secret规范化。静态确认，未用真实凭据测试。"
+        }
+      ],
+      "verification": "静态源码确认；未进行真实浏览器、辅助技术或凭据测试。",
+      "effort": "小"
+    }
+  ]
+}

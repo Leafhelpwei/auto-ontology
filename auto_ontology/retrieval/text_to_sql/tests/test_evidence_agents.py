@@ -59,13 +59,11 @@ def test_tables_agent_uses_state_evidence_as_authoritative_context(
         evidence="The time refers to events.duration LIKE 'M:SS%'.",
     )
 
-    assert "## Authoritative Evidence" in messages[1].content
-    assert "MUST follow every instruction" in messages[1].content
-    assert messages[1].content.endswith(
-        "The time refers to events.duration LIKE 'M:SS%'."
-    )
-    assert "events.duration LIKE '1:54%'" not in messages[2].content
-    assert "The time refers to" not in messages[2].content
+    assert [m.type for m in messages] == ["system", "human"]
+    assert "untrusted data" in messages[1].content
+    assert "The time refers to events.duration LIKE 'M:SS%'." in messages[1].content
+    assert "The time refers to" not in messages[0].content
+    assert "events.duration LIKE '1:54%'" not in messages[1].content
 
 
 def test_tables_agent_does_not_scan_question_for_evidence(

@@ -255,7 +255,7 @@ def test_response_with_state_uses_the_same_full_retry_cycle(
     assert result["path_state"]["caller_context"] == "keep"
 
 
-def test_final_attempt_returns_last_sql_rejected_only_by_intent(
+def test_final_attempt_never_returns_sql_rejected_by_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _AttemptApp(["failure", "failure_with_fallback"])
@@ -265,4 +265,4 @@ def test_final_attempt_returns_last_sql_rejected_only_by_intent(
     events = list(main.stream_agent_response(_payload()))
 
     assert len(app.states) == 2
-    assert events[-1]["answer"]["sql_code"] == "SELECT fallback"
+    assert not events[-1]["answer"]["sql_code"]
