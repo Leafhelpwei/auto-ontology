@@ -16,7 +16,10 @@ from auto_ontology.connectors.databricks_oauth import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache() -> None:
+def _clear_cache(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "auto_ontology.dal.connections.connection_generation", lambda: 0
+    )
     databricks_oauth.clear_cache()
     # `any_connection_uses_sso_federation` memoises for a TTL, so without this a
     # result cached by one test decides the answer in the next.
@@ -168,15 +171,33 @@ def test_any_connection_uses_sso_federation(monkeypatch: MonkeyPatch) -> None:
     assert databricks_oauth.any_connection_uses_sso_federation() is True
 
 
-def test_any_connection_fails_soft_when_lookup_errors(monkeypatch: MonkeyPatch) -> None:
-    """A storage blip degrades to the stored PAT rather than breaking chat."""
+def test_any_connection_fails_closed_when_lookup_errors(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Unavailable policy cannot authorize use of a shared PAT."""
     import auto_ontology.dal.connections as dal
 
     def boom() -> None:
         raise RuntimeError("store down")
 
     monkeypatch.setattr(dal, "list_connections", boom)
+    with pytest.raises(DatabricksOAuthError, match="Cannot verify"):
+        databricks_oauth.any_connection_uses_sso_federation()
+
+
+def test_durable_generation_invalidates_another_replicas_sso_decision(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from auto_ontology.dal import connections as dal
+
+    generation = [1]
+    monkeypatch.setattr(dal, "connection_generation", lambda: generation[0])
+    monkeypatch.setattr(
+        dal, "list_connections", lambda: [{"sso_federation": generation[0] == 2}]
+    )
     assert databricks_oauth.any_connection_uses_sso_federation() is False
+    generation[0] = 2
+    assert databricks_oauth.any_connection_uses_sso_federation() is True
 
 
 def test_exchange_requests_all_apis_scope(monkeypatch: MonkeyPatch) -> None:

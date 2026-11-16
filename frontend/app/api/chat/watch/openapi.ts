@@ -30,10 +30,12 @@ export const openapi: OpenApiRoute = {
 				contentType: 'text/plain',
 				schema: z.literal('Conversation not found'),
 			},
-			// The backend's 422 is unreachable: this proxy supplies
-			// `conversation_id` itself, and a non-2xx upstream is rewritten to the
-			// plain-text failure below rather than relayed as a validation body.
-			422: null,
+			422: {
+				description:
+					'Invalid conversation UUID or Last-Event-ID (<run UUID>:<sequence>) cursor.',
+				contentType: 'text/plain',
+				schema: z.literal('Upstream watch request failed'),
+			},
 			502: {
 				description:
 					'The backend refused the watch. The upstream status is used when it has ' +

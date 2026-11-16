@@ -312,6 +312,7 @@ def set_sso_federation(*, database_name: str, enabled: bool) -> dict[str, Any]:
 
     if is_vault_configured():
         write_secret(database_name, updated)
+        insert_connection(connection="", database_name=database_name)
     else:
         insert_connection(
             connection=json.dumps(updated),

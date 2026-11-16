@@ -129,3 +129,66 @@ it('surfaces structured pre-stream rejection and never calls onStart', async () 
 	expect(error).toBe('Choose the current active revision.');
 	expect(start).not.toHaveBeenCalled();
 });
+
+it('forwards an event cursor and closes the stream reader after terminal data', async () => {
+	const cancelled = vi.fn();
+	const ids: string[] = [];
+	const bytes = new TextEncoder().encode(
+		'id: run:2\ndata: {"type":"result","answer":{"response":"ok"}}\n\ndata: [DONE]\n\n',
+	);
+	const fetcher = vi.fn<typeof fetch>(
+		async () =>
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(bytes);
+					},
+					cancel: cancelled,
+				}),
+			),
+	);
+	vi.stubGlobal('fetch', fetcher);
+	await new Promise<void>((resolve, reject) =>
+		watchChat(
+			'conversation',
+			{
+				onStep: vi.fn(),
+				onResult: vi.fn(),
+				onEventId: (id) => ids.push(id),
+				onError: (event) => reject(new Error(event.message)),
+				onDone: resolve,
+			},
+			'run:1',
+		),
+	);
+	await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce());
+	expect(fetcher.mock.calls[0][1]?.headers).toEqual({ 'Last-Event-ID': 'run:1' });
+	expect(ids).toEqual(['run:2']);
+});
+
+it('rejects an oversized incomplete SSE event and cancels its reader', async () => {
+	const cancelled = vi.fn();
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(
+			async () =>
+				new Response(
+					new ReadableStream({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('x'.repeat(2_200_001)));
+						},
+						cancel: cancelled,
+					}),
+				),
+		),
+	);
+	const message = await new Promise<string>((resolve) =>
+		watchChat('conversation', {
+			onStep: vi.fn(),
+			onResult: vi.fn(),
+			onError: (event) => resolve(event.message),
+		}),
+	);
+	expect(message).toContain('interactive result limit');
+	expect(cancelled).toHaveBeenCalledOnce();
+});

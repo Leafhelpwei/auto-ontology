@@ -2,67 +2,18 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat streaming endpoint — wraps the LangGraph text-to-SQL pipeline.
+"""Chat workers with PostgreSQL admission, leases and durable event replay.
 
-Each chat request runs in a prewarmed agent subprocess from
-``WarmPool``. See ``worker.py`` for why subprocess isolation is
-necessary (cancellation of sync, C-blocked agent code) and how the warm
-pool keeps the cold-start cost off the request path.
+All replicas share per-conversation exclusion and global/user quotas before
+worker allocation. Server-issued owner tokens fence event/history writes;
+cancel requests are observed by the owner heartbeat. Lost owners become
+interrupted, never silently restart a database query. Disconnecting an SSE
+observer does not stop its run. Explicit cancellation, deadlines and failed
+ownership checks terminate the worker.
 
-Concurrency model
------------------
-Each conversation gets its own warm agent subprocess and may only have one
-in-flight stream at a time. Global and per-user admission limits are checked
-before allocating a worker; process capacity is shared across query modes.
-Slots are keyed by the authenticated user plus ``conversation_id``. Stateless
-calls (no ``conversation_id``, see ``ChatRequest``) get a fresh, unique key
-per request instead and so never contend with anything.
-
-* If the conversation's slot is empty → request runs.
-* A reserved, running or finalizing conversation rejects another request
-  with HTTP 409 until its slot has been released.
-* Disconnecting leaves the run active. Use ``/chat/watch`` to reattach or
-  explicitly cancel before submitting a replacement question.
-
-  **Web-app caveat:** the Next.js ``/api/chat/completions`` proxy tees the
-  upstream SSE stream and keeps the FastAPI connection alive until the run
-  finishes (so ``after()`` can persist the assistant turn). Browser
-  navigate-away therefore does **not** free the slot for web-app requests —
-  a second submit into the same conversation still gets 409 until the run
-  completes. Use ``/chat/watch`` to reattach instead.
-
-Disconnecting never cuts the answer short
-------------------------------------------
-A disconnected client (navigate-away, switch to another conversation, closed
-tab) only clears ``client_alive`` — it does **not** cancel the run. ``_pump``
-keeps draining the worker and persisting the result independently of any HTTP
-connection, so the agent always finishes and the full answer always lands in
-the conversation, whether or not anyone is still watching. The only things
-that kill an in-flight worker are explicit ``POST /chat/cancel`` (Stop),
-request deadlines, process failures or invalid worker messages.
-Reattach with ``/chat/watch`` to see a run that kept going after you left.
-
-The chart/table bubble is guaranteed too
------------------------------------------
-Once the SQL answer ("Message 1") lands, ``_pump`` immediately generates and
-persists the chart-or-table bubble ("Message 2") itself — see
-``_build_charts_event``. It streams back as its own ``charts`` SSE event once
-ready, so a still-connected client renders it with no extra request, and
-``/chat/watch`` replays it for anyone who reattaches later. Same guarantee as
-the SQL answer: it exists whether or not a browser tab is still around to ask
-for it — provided the call had a ``conversation_id`` to persist into.
-Stateless calls (no ``conversation_id``) don't get a chart step at all, same
-as they never got the old client-driven visualize step without an
-authenticated conversation to save into.
-
-Disconnect detection
---------------------
-A relying-on-write-failure ("the next heartbeat will fail") detection is too
-slow in practice — the kernel buffers small writes and disconnect-triggered
-GeneratorExit only fires when the response object is garbage-collected,
-which can be tens of seconds. We instead spawn a per-request async watchdog
-that polls ASGI ``http.disconnect`` and clears ``client_alive`` within one
-poll interval (~100 ms), without releasing the running conversation.
+Live submissions and reconnects read the bounded database log. Last-Event-ID
+pins replay to a retained run and sequence. The local slot map only locates
+processes for prompt cancellation; it is not the authoritative run state.
 """
 
 from __future__ import annotations
@@ -75,10 +26,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Generator
+from contextlib import nullcontext
+from auto_ontology.dal import chat_runs
+from auto_ontology.server.chat.run_lifecycle import LeaseGuard, OWNER_ID
+from typing import Any, Generator, Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 
 from auto_ontology.dal import datasources as datasources_dal
@@ -102,8 +56,6 @@ from auto_ontology.server.chat.worker import (
     PrewarmedWorker,
     get_pool,
     get_metrics_pool,
-    WorkerBusy,
-    WorkerStartupError,
 )
 from auto_ontology.server.chat.metrics_flow import require_metric_access
 from auto_ontology.semantic.contracts.models import ContractError
@@ -244,6 +196,8 @@ class _Slot:
     last_sql: str | None = None
     query_mode: str = "explore"
     query_context: dict[str, Any] | None = None
+    ticket: chat_runs.Ticket | None = None
+    lease_guard: LeaseGuard | None = None
 
 
 # Keyed by authenticated user + conversation_id (or a per-request unique key
@@ -252,7 +206,9 @@ _active_slots: dict[str, _Slot] = {}
 _slot_lock = threading.Lock()
 _pending_slots: dict[str, str | None] = {}
 _MAX_USER_RUNS = max(1, int(os.getenv("CHAT_MAX_RUNS_PER_USER", "2")))
-_MAX_ACTIVE_RUNS = max(1, int(os.getenv("CHAT_MAX_WORKERS", "4")))
+_MAX_ACTIVE_RUNS = max(
+    1, int(os.getenv("CHAT_MAX_ACTIVE_RUNS", os.getenv("CHAT_MAX_WORKERS", "4")))
+)
 
 
 def _reserve_slot(key: str, user_id: str | None) -> None:
@@ -325,10 +281,14 @@ def _release(slot: _Slot) -> None:
             del _active_slots[slot.key]
 
     pool = get_metrics_pool() if slot.query_mode == "metrics" else get_pool()
-    if slot.cancelled.is_set():
-        pool.replace(slot.worker)
-    else:
-        pool.return_alive(slot.worker)
+    try:
+        if slot.cancelled.is_set():
+            pool.replace(slot.worker)
+        else:
+            pool.return_alive(slot.worker)
+    except Exception as exc:
+        slot.worker.kill()
+        logger.warning("Worker release failed error_class=%s", type(exc).__name__)
 
 
 async def _watch_disconnect(http_request: Request, slot: _Slot) -> None:
@@ -405,7 +365,8 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
     if slot.cancelled.is_set():
         return None
 
-    try:
+    if slot.ticket is None:
+        # Local, non-server callers retain the helper's historical behavior.
         persist_result_message(
             conversation_id=slot.conversation_id,
             user_id=slot.user_id,
@@ -413,171 +374,170 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
             sql_response=sql_response,
             query_context=answer.get("query_context") or slot.query_context,
         )
-    except Exception:  # noqa: BLE001 — persistence must not break SSE
-        logger.exception("Failed to persist chart/result message")
 
     event = {"type": "charts", "content": content, "sql_response": sql_response}
-    if slot.query_mode == "metrics":
-        event["query_context"] = answer.get("query_context") or slot.query_context
+    event["query_context"] = answer.get("query_context") or slot.query_context
     return event
 
 
 def _pump(slot: _Slot) -> None:
-    """Drain ``slot.worker``'s event queue into ``slot.buffer``.
-
-    Runs in its own thread, independent of any HTTP request/response — this
-    decoupling is what lets a reloaded/reopened browser tab "reconnect" via
-    ``/chat/watch`` and see every step of a run from the start, not just
-    whatever happens to arrive after it joins. Releases the slot back to
-    the pool once the run ends, naturally or via error, regardless of
-    whether anyone is currently watching.
-    """
-
+    """Persist events and history atomically, fenced by the current run lease."""
     persisted = False
     terminal_received = False
+    failure = False
 
-    def persist_event(event: dict) -> None:
-        nonlocal persisted, terminal_received
-        if event.get("type") in {"result", "error"}:
-            terminal_received = True
-        if persisted or slot.user_id is None or slot.analytics_id is None:
-            return
-
-        event_type = event.get("type")
-        if event_type == "result":
-            answer = event.get("answer") or {}
-            response = str(answer.get("response") or "")
-            # An answer the agent gave up on (``unconstructable_sql_response``)
-            # carries no SQL, even when a query did run earlier in the turn.
-            # Fall back to the last one streamed so the failed query is still
-            # in history, matching what the user watched live.
-            sql_code = answer.get("sql_code") or slot.last_sql
-            query_context = answer.get("query_context") or slot.query_context
-        elif event_type == "error":
-            response = str(event.get("message") or "")
-            sql_code = slot.last_sql
-            query_context = slot.query_context
-        else:
-            return
-        if not response and not sql_code:
-            return
-
+    def emit(event: dict) -> None:
+        nonlocal persisted, terminal_received, failure
+        old_persisted = persisted
         try:
-            if slot.conversation_id is not None:
-                persist_assistant_result(
-                    conversation_id=slot.conversation_id,
-                    user_id=slot.user_id,
-                    analytics_id=slot.analytics_id,
-                    response=response,
-                    sql_code=sql_code,
-                    query_context=query_context,
-                )
-            else:
-                persist_analytics_result(
-                    analytics_id=slot.analytics_id,
-                    user_id=slot.user_id,
-                    response=response,
-                    sql_code=sql_code,
-                )
-            persisted = True
-        except Exception:  # noqa: BLE001 — persistence must not break SSE
-            logger.exception("Failed to persist assistant conversation turn")
+            with (
+                chat_runs.owned_transaction(slot.ticket)
+                if slot.ticket
+                else nullcontext()
+            ):
+                # Check budgets before history writes; rollback both on failure.
+                if slot.ticket:
+                    chat_runs.append(slot.ticket, event)
+                kind = event.get("type")
+                if kind in {"result", "error"}:
+                    terminal_received = True
+                    failure = failure or kind == "error"
+                    if not persisted and slot.user_id and slot.analytics_id:
+                        answer = event.get("answer") or {}
+                        response = str(
+                            answer.get("response") or event.get("message") or ""
+                        )
+                        sql_code = answer.get("sql_code") or slot.last_sql
+                        context = answer.get("query_context") or slot.query_context
+                        if slot.conversation_id:
+                            persist_assistant_result(
+                                conversation_id=slot.conversation_id,
+                                user_id=slot.user_id,
+                                analytics_id=slot.analytics_id,
+                                response=response,
+                                sql_code=sql_code,
+                                query_context=context,
+                            )
+                        else:
+                            persist_analytics_result(
+                                analytics_id=slot.analytics_id,
+                                user_id=slot.user_id,
+                                response=response,
+                                sql_code=sql_code,
+                            )
+                        persisted = True
+                elif (
+                    kind == "charts"
+                    and slot.ticket
+                    and slot.conversation_id
+                    and slot.user_id
+                ):
+                    persist_result_message(
+                        conversation_id=slot.conversation_id,
+                        user_id=slot.user_id,
+                        content=event["content"],
+                        sql_response=event["sql_response"],
+                        query_context=event.get("query_context") or slot.query_context,
+                    )
+            if slot.ticket is None:
+                with slot.buffer_lock:
+                    slot.buffer.append(event)
+        except BaseException:
+            persisted = old_persisted
+            raise
+
+    def failed_event(cancelled: bool) -> dict:
+        message = "查询已取消。" if cancelled else "查询未能完成，请重试。"
+        if slot.query_mode != "metrics":
+            return {"type": "error", "message": message}
+        context = {
+            **(slot.query_context or {}),
+            "status": "cancelled" if cancelled else "error",
+            "trusted": False,
+            "clarification": {
+                "code": "QUERY_CANCELLED" if cancelled else "WORKER_FAILED",
+                "message": message,
+                "options": [],
+            },
+        }
+        return {
+            "type": "result",
+            "answer": {"response": message, "query_context": context},
+        }
 
     try:
-        for item in slot.worker.events():
-            if item is None:
-                # Just a queue-poll heartbeat from the worker side; the
-                # heartbeat clients actually see is generated per-consumer
-                # in `_stream_slot` instead, so there's nothing to buffer.
-                continue
+        for event in slot.worker.events():
             if slot.cancelled.is_set():
-                break
-            event = item
+                raise chat_runs.RunCancelled("Query cancelled")
+            if event is None:
+                continue
             if event.get("type") == "metric_context":
                 slot.query_context = event["query_context"]
             elif event.get("type") == "result" and event.get("answer", {}).get(
                 "query_context"
             ):
                 slot.query_context = event["answer"]["query_context"]
-            if event.get("type") == "step":
-                node_name = event.get("node", "")
+            if slot.analytics_id:
+                slot.query_context = {
+                    **(slot.query_context or {}),
+                    "turn_id": slot.analytics_id,
+                }
+            if event.get("type") == "result":
                 event = {
                     **event,
-                    "label": event.get("label")
-                    or NODE_LABELS.get(node_name, node_name),
+                    "answer": {
+                        **(event.get("answer") or {}),
+                        "query_context": slot.query_context,
+                    },
+                }
+            elif event.get("type") == "error":
+                event = {**event, "query_context": slot.query_context}
+            if event.get("type") == "step":
+                node = event.get("node", "")
+                event = {
+                    **event,
+                    "label": event.get("label") or NODE_LABELS.get(node, node),
                 }
             elif event.get("type") == "sql":
-                # Streamed straight through for the live view; remembered so
-                # the failure paths above have something to persist.
                 slot.last_sql = str(event.get("sql") or "") or None
-            persist_event(event)
-            with slot.buffer_lock:
-                slot.buffer.append(event)
+            emit(event)
             if event.get("type") == "result" and not slot.cancelled.is_set():
-                try:
-                    charts_event = _build_charts_event(slot, event.get("answer") or {})
-                except Exception:  # noqa: BLE001 — the chart step must not break the run
-                    logger.exception("Chart step failed")
-                    charts_event = None
-                if charts_event is not None:
-                    with slot.buffer_lock:
-                        slot.buffer.append(charts_event)
+                chart = _build_charts_event(slot, event.get("answer") or {})
+                if chart is not None:
+                    emit(chart)
+        if not terminal_received:
+            raise RuntimeError("Worker stopped without a terminal result")
+        if slot.ticket:
+            chat_runs.finish(slot.ticket, "failed" if failure else "succeeded")
     except Exception as exc:
-        was_cancelled = slot.cancelled.is_set()
+        cancelled = slot.cancelled.is_set() or isinstance(exc, chat_runs.RunCancelled)
         slot.cancelled.set()
-        logger.error("Agent stream failed error_class=%s", type(exc).__name__)
-        error_event = {
-            "type": "error",
-            "message": "Request cancelled" if was_cancelled else "Agent stream failed",
-        }
-        if slot.query_mode == "metrics":
-            message = (
-                "标准指标查询已取消。"
-                if was_cancelled
-                else "标准指标查询失败。未运行探索查询。"
-            )
-            context = {
-                **(slot.query_context or {}),
-                "status": "cancelled" if was_cancelled else "error",
-                "trusted": False,
-                "clarification": {
-                    "code": "QUERY_CANCELLED" if was_cancelled else "WORKER_FAILED",
-                    "message": message,
-                    "options": [],
-                },
-            }
-            error_event = {
-                "type": "result",
-                "answer": {"response": message, "query_context": context},
-            }
-        persist_event(error_event)
-        with slot.buffer_lock:
-            slot.buffer.append(error_event)
+        logger.warning("Chat run ended error_class=%s", type(exc).__name__)
+        if slot.ticket:
+            try:
+                message = (
+                    "查询已取消。"
+                    if cancelled
+                    else (
+                        "结果超过交互查询预算，请缩小范围后重试。"
+                        if isinstance(exc, chat_runs.EventBudgetExceeded)
+                        else "查询未能完成，请重试。"
+                    )
+                )
+                chat_runs.finish(
+                    slot.ticket, "cancelled" if cancelled else "failed", message=message
+                )
+            except Exception as final_error:
+                # A stale owner cannot overwrite recovery or a newer run.
+                logger.warning(
+                    "Chat finalization deferred error_class=%s",
+                    type(final_error).__name__,
+                )
+        else:
+            emit(failed_event(cancelled))
     finally:
-        if slot.query_mode == "metrics" and not terminal_received:
-            cancelled = slot.cancelled.is_set()
-            message = (
-                "标准指标查询已取消。未返回执行结果。"
-                if cancelled
-                else "标准指标查询未能完成。未运行探索查询。"
-            )
-            context = {
-                **(slot.query_context or {}),
-                "status": "cancelled" if cancelled else "error",
-                "trusted": False,
-                "clarification": {
-                    "code": "QUERY_CANCELLED" if cancelled else "WORKER_STOPPED",
-                    "message": message,
-                    "options": [],
-                },
-            }
-            event = {
-                "type": "result",
-                "answer": {"response": message, "query_context": context},
-            }
-            persist_event(event)
-            with slot.buffer_lock:
-                slot.buffer.append(event)
+        if slot.lease_guard:
+            slot.lease_guard.close()
         slot.finished.set()
         _release(slot)
 
@@ -592,9 +552,16 @@ def _subject_token(http_request: Request) -> str | None:
     """
     from auto_ontology.connectors.databricks_oauth import (
         any_connection_uses_sso_federation,
+        DatabricksOAuthError,
     )
 
-    if not any_connection_uses_sso_federation():
+    try:
+        requires_token = any_connection_uses_sso_federation()
+    except DatabricksOAuthError as exc:
+        raise HTTPException(
+            503, detail="Connection authorization is unavailable"
+        ) from exc
+    if not requires_token:
         return None
 
     header = http_request.headers.get("authorization") or ""
@@ -620,6 +587,9 @@ def _stream_slot(slot: _Slot) -> Generator[str, None, None]:
     before catching up to the live tail.
     """
 
+    if slot.ticket:
+        yield from _stream_run(slot.ticket.run_id, slot.user_id)
+        return
     index = 0
     while True:
         with slot.buffer_lock:
@@ -638,6 +608,56 @@ def _stream_slot(slot: _Slot) -> Generator[str, None, None]:
         time.sleep(_BUFFER_POLL_S)
 
     yield "data: [DONE]\n\n"
+
+
+def _stream_run(
+    run_id: str, user_id: str | None, after: int = 0
+) -> Generator[str, None, None]:
+    while True:
+        try:
+            events, status = chat_runs.replay(
+                run_id=run_id, user_id=user_id, after=after
+            )
+        except Exception:
+            yield _sse({"type": "error", "message": "运行记录暂时不可用，请重新连接。"})
+            return
+        for item in events:
+            after = item["sequence"]
+            yield f"id: {run_id}:{after}\n" + _sse(item["event"])
+        if events:
+            continue
+        if status not in chat_runs.ACTIVE:
+            yield "data: [DONE]\n\n"
+            return
+        yield ": ping\n\n"
+        time.sleep(_BUFFER_POLL_S)
+
+
+def _prepare_run(
+    ticket: chat_runs.Ticket,
+    request: ChatRequest,
+    user_id: str | None,
+    source: str,
+    context: dict,
+) -> tuple[str | None, list[dict]]:
+    with chat_runs.owned_transaction(ticket):
+        analytics_id, history = None, []
+        if request.conversation_id is not None and user_id is not None:
+            prepared = prepare_conversation(
+                conversation_id=request.conversation_id,
+                user_id=user_id,
+                question=request.question,
+                source=source,
+                query_context=context,
+            )
+            analytics_id = prepared.analytics_id
+            history = [vars(turn) for turn in prepared.history]
+        elif user_id:
+            analytics_id = create_stateless_analytics(
+                user_id=user_id, question=request.question, source=source
+            )
+        chat_runs.attach_analytics(ticket, analytics_id, context)
+        return analytics_id, history
 
 
 @router.post(
@@ -678,7 +698,9 @@ async def chat_completions(
         len(request.question),
     )
 
-    if request.query_mode == "explore" and not semantic_layer_calculated():
+    if request.query_mode == "explore" and not await asyncio.to_thread(
+        semantic_layer_calculated
+    ):
         raise HTTPException(status_code=409, detail=_SEMANTIC_MISSING_MSG)
     target_db = (
         await asyncio.to_thread(_resolve_chat_target_db, request.target_db)
@@ -706,113 +728,79 @@ async def chat_completions(
         else str(uuid.uuid4())
     )
     subject_token = (
-        _subject_token(http_request) if request.query_mode == "explore" else None
+        await asyncio.to_thread(_subject_token, http_request)
+        if request.query_mode == "explore"
+        else None
     )
     _reserve_slot(key, user_id)
+    ticket = None
+    guard = None
+    slot = None
+    worker = None
+    pool = None
+    launched = False
     try:
-        pool = get_metrics_pool() if request.query_mode == "metrics" else get_pool()
+        ticket = await asyncio.to_thread(
+            chat_runs.reserve,
+            user_id=user_id,
+            conversation_id=str(request.conversation_id)
+            if request.conversation_id
+            else None,
+            query_mode=request.query_mode,
+            owner_id=OWNER_ID,
+            global_limit=_MAX_ACTIVE_RUNS,
+            user_limit=_MAX_USER_RUNS,
+        )
+        guard = LeaseGuard(ticket)
+        context: dict[str, Any] = {"version": 1, "query_mode": request.query_mode}
+        if request.metric_context is not None:
+            context.update(
+                request.metric_context.model_dump(mode="json"),
+                status="running",
+                trusted=False,
+            )
+            context["selected_metric_ids"] = list(
+                request.metric_context.selected_metric_ids or ()
+            )
+        analytics_id, history = await asyncio.to_thread(
+            _prepare_run,
+            ticket,
+            request,
+            user_id,
+            http_request.headers.get("x-auto-ontology-source") or "api",
+            context,
+        )
+        context["turn_id"] = analytics_id
+        pool = await asyncio.to_thread(
+            get_metrics_pool if request.query_mode == "metrics" else get_pool
+        )
         worker = await _acquire_worker(pool)
-    except (WorkerBusy, WorkerStartupError) as exc:
-        with _slot_lock:
-            _pending_slots.pop(key, None)
-        raise HTTPException(
-            503,
-            detail="Chat worker unavailable; retry shortly",
-            headers={"Retry-After": "2"},
-        ) from exc
-    except BaseException:
-        with _slot_lock:
-            _pending_slots.pop(key, None)
-        raise
-    query_context: dict[str, Any] = {"version": 1, "query_mode": request.query_mode}
-    if request.metric_context is not None:
-        query_context.update(
-            request.metric_context.model_dump(mode="json"),
-            status="running",
-            trusted=False,
+        await asyncio.to_thread(guard.set_worker, worker)
+        slot = _Slot(
+            key=key,
+            worker=worker,
+            user_id=user_id,
+            conversation_id=request.conversation_id,
+            analytics_id=analytics_id,
+            question=request.question,
+            query_mode=request.query_mode,
+            query_context=context,
+            ticket=ticket,
+            lease_guard=guard,
+            client_alive=threading.Event(),
+            cancelled=guard.cancelled,
+            released=threading.Event(),
         )
-        query_context["selected_metric_ids"] = list(
-            request.metric_context.selected_metric_ids or ()
-        )
-    slot = _Slot(
-        key=key,
-        worker=worker,
-        user_id=user_id,
-        conversation_id=request.conversation_id,
-        analytics_id=None,
-        question=request.question,
-        query_mode=request.query_mode,
-        query_context=query_context,
-        client_alive=threading.Event(),
-        cancelled=threading.Event(),
-        released=threading.Event(),
-    )
-    slot.client_alive.set()
-
-    try:
+        slot.client_alive.set()
         _try_claim_slot(slot)
-    except HTTPException:
-        with _slot_lock:
-            _pending_slots.pop(key, None)
-        # Lost the race against a still-connected sibling — return the
-        # acquired worker to the pool so we don't waste its warm state.
-        pool.return_alive(worker)
-        raise
-
-    conversation_history: list[dict[str, Any]] = []
-    if request.conversation_id is not None and user_id is not None:
-        try:
-            prepared = await asyncio.to_thread(
-                prepare_conversation,
-                conversation_id=request.conversation_id,
-                user_id=user_id,
-                question=request.question,
-                source=http_request.headers.get("x-auto-ontology-source") or "api",
-                query_context=query_context,
-            )
-        except ConversationAccessError as exc:
-            _release(slot)
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            ) from exc
-        except Exception as exc:
-            logger.exception("Failed to prepare conversation history")
-            _release(slot)
-            raise HTTPException(
-                status_code=503, detail="Conversation storage unavailable"
-            ) from exc
-
-        slot.analytics_id = prepared.analytics_id
-        slot.query_context["turn_id"] = prepared.analytics_id
-        conversation_history = [
-            {
-                "question": turn.question,
-                "response": turn.response,
-                "sql_code": turn.sql_code,
-                "query_context": turn.query_context,
-            }
-            for turn in prepared.history
-        ]
-    elif user_id is not None:
-        try:
-            slot.analytics_id = await asyncio.to_thread(
-                create_stateless_analytics,
-                user_id=user_id,
-                question=request.question,
-                source=http_request.headers.get("x-auto-ontology-source") or "api",
-            )
-        except Exception:  # noqa: BLE001 — analytics is best-effort
-            logger.exception("Failed to create stateless conversation analytics")
-
-    try:
         if request.query_mode == "metrics":
             worker.submit(
                 request.question,
                 metric_context=request.metric_context.model_dump(mode="json"),
                 user_id=user_id,
                 persistent=request.conversation_id is not None,
-                turn_id=slot.analytics_id,
-                conversation_history=conversation_history,
+                turn_id=analytics_id,
+                conversation_history=history,
             )
         else:
             worker.submit(
@@ -820,23 +808,56 @@ async def chat_completions(
                 prediction=request.prediction,
                 target_db=target_db,
                 subject_token=subject_token,
-                conversation_history=conversation_history,
+                conversation_history=history,
                 evidence=request.evidence,
             )
-    except Exception as exc:
-        slot.cancelled.set()
-        _release(slot)
+        threading.Thread(target=_pump, args=(slot,), daemon=True).start()
+        launched = True
+        asyncio.create_task(_watch_disconnect(http_request, slot))
+        return StreamingResponse(
+            _stream_slot(slot),
+            media_type="text/event-stream",
+            headers={**_SSE_HEADERS, "X-Chat-Run-Id": ticket.run_id},
+        )
+    except chat_runs.AdmissionDenied as exc:
         raise HTTPException(
-            503, detail="Chat worker could not accept the request"
+            exc.status, detail=str(exc), headers={"Retry-After": "2"}
         ) from exc
-    threading.Thread(target=_pump, args=(slot,), daemon=True).start()
-    asyncio.create_task(_watch_disconnect(http_request, slot))
-
-    return StreamingResponse(
-        _stream_slot(slot),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
+    except ConversationAccessError as exc:
+        raise HTTPException(404, detail="Conversation not found") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Chat admission failed error_class=%s", type(exc).__name__)
+        raise HTTPException(
+            503,
+            detail="Chat worker or run storage unavailable; retry shortly",
+            headers={"Retry-After": "2"},
+        ) from exc
+    finally:
+        if not launched:
+            with _slot_lock:
+                _pending_slots.pop(key, None)
+            if ticket:
+                try:
+                    await asyncio.to_thread(
+                        chat_runs.finish,
+                        ticket,
+                        "failed",
+                        message="查询未能启动，请稍后重试。",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Pending run recovery deferred error_class=%s",
+                        type(exc).__name__,
+                    )
+            if guard:
+                await asyncio.to_thread(guard.close)
+            if slot:
+                slot.cancelled.set()
+                await asyncio.to_thread(_release, slot)
+            elif worker is not None and pool is not None:
+                await asyncio.to_thread(pool.replace, worker)
 
 
 @router.get(
@@ -844,7 +865,16 @@ async def chat_completions(
     response_class=EventStreamResponse,
     responses=SSE_RESPONSES,
 )
-async def chat_watch(conversation_id: UUID, request: Request) -> StreamingResponse:
+async def chat_watch(
+    conversation_id: UUID,
+    request: Request,
+    last_event_id: Annotated[
+        str | None,
+        Header(
+            description="Resume after <run UUID>:<sequence>, including completed retained runs."
+        ),
+    ] = None,
+) -> StreamingResponse:
     """Reattach to an in-flight run for ``conversation_id``, if any.
 
     Purely a passive observer: it never submits a question, never touches
@@ -852,8 +882,9 @@ async def chat_watch(conversation_id: UUID, request: Request) -> StreamingRespon
     "Conversation in progress" logic in `_try_claim_slot`), and has no
     effect on the run if it disconnects. This is what lets a reloaded or
     reopened browser tab recover the live progress UI (and, once it lands,
-    the final answer) for a run it didn't itself start — replaying every
-    buffered step from the beginning, then tailing new ones as they arrive.
+    the final answer) for a run it didn't itself start — replaying retained steps from the beginning, then tailing new ones as they arrive.
+    Last-Event-ID accepts <run UUID>:<sequence> to resume after an acknowledged
+    event, including a completed run retained for the configured replay window.
 
     If nothing is running for this conversation, the stream ends
     immediately with `[DONE]` and no events, which the frontend treats
@@ -862,18 +893,43 @@ async def chat_watch(conversation_id: UUID, request: Request) -> StreamingRespon
     """
 
     user_id = resolve_internal_user(request, required=True)
-    key = f"{user_id}:{conversation_id}"
-    with _slot_lock:
-        slot = _active_slots.get(key)
-
-    if slot is None:
+    after = 0
+    run_id = None
+    last_id = last_event_id or ""
+    if last_id:
+        try:
+            run_id, sequence = last_id.rsplit(":", 1)
+            run_id = str(UUID(run_id))
+            after = int(sequence)
+            if after < 0:
+                raise ValueError
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, detail="Invalid Last-Event-ID") from exc
+    row = await asyncio.to_thread(
+        chat_runs.latest,
+        user_id=user_id,
+        conversation_id=str(conversation_id),
+        run_id=run_id,
+    )
+    if row is None:
+        if run_id:
+            raise HTTPException(404, detail="Run not found")
         return StreamingResponse(
             iter(["data: [DONE]\n\n"]),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
-
-    if slot.query_mode == "metrics":
+    if after > row["event_count"]:
+        raise HTTPException(422, detail="Event cursor is ahead of this run")
+    if not run_id and row["status"] not in chat_runs.ACTIVE:
+        # The browser already loaded persisted history before probing. An
+        # explicit Last-Event-ID can still resume a completed retained run.
+        return StreamingResponse(
+            iter(["data: [DONE]\n\n"]),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    if row["query_mode"] == "metrics":
         try:
             await asyncio.to_thread(require_metric_access, user_id, persistent=True)
         except ContractError as exc:
@@ -881,7 +937,7 @@ async def chat_watch(conversation_id: UUID, request: Request) -> StreamingRespon
                 403, detail={"code": exc.code, "message": exc.message}
             ) from exc
     return StreamingResponse(
-        _stream_slot(slot),
+        _stream_run(row["id"], user_id, after),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
@@ -895,8 +951,9 @@ async def chat_cancel(conversation_id: UUID, request: Request) -> dict[str, bool
     the browser while the agent kept running and holding the slot, so the
     very next question in the same conversation was rejected with 409.
 
-    The worker is killed and the route waits briefly for its pump to finish
-    persistence. Metric runs record an untrusted cancellation result tied to
+    Cancellation is persisted for every replica. The owner heartbeat kills
+    the worker; a local owner is also interrupted immediately. The run remains
+    reserved until terminal persistence or lease expiry. Metric runs record an untrusted cancellation result tied to
     their server-generated turn ID; exploratory runs retain their existing
     partial-stream behavior. The slot remains unavailable while terminal
     persistence is unfinished, so a subsequent question cannot consume a late
@@ -907,16 +964,14 @@ async def chat_cancel(conversation_id: UUID, request: Request) -> dict[str, bool
     """
 
     user_id = resolve_internal_user(request, required=True)
+    cancelled = await asyncio.to_thread(
+        chat_runs.cancel, user_id=user_id, conversation_id=str(conversation_id)
+    )
     key = f"{user_id}:{conversation_id}"
     with _slot_lock:
         slot = _active_slots.get(key)
-
-    if slot is None:
-        return {"cancelled": False}
-
-    slot.cancelled.set()
-    await asyncio.to_thread(slot.worker.kill)
-    # Pump owns terminal persistence and release. Do not admit the next user
-    # turn before the cancelled assistant has been attached to its own turn.
-    await asyncio.to_thread(slot.finished.wait, 5)
-    return {"cancelled": True}
+    if cancelled and slot is not None:
+        slot.cancelled.set()
+        await asyncio.to_thread(slot.worker.kill)
+        await asyncio.to_thread(slot.finished.wait, 5)
+    return {"cancelled": cancelled}

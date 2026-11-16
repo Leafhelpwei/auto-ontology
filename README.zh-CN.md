@@ -474,3 +474,5 @@ mysql://reader:password@mysql.example:3306/sales?ssl_mode=VERIFY_IDENTITY&ssl_ca
 编辑连接时，秘密字段留空表示保持原值；使用“Clear stored credential on save”显式清空；输入新内容表示替换，包括内容原有的首尾空白。连接响应不会返回密码、私钥、运行时联邦 token 或未知秘密字段。
 
 跨服务 SSO 调用必须使用配置的 OIDC clientId 或 `AUTO_ONTOLOGY_SSO_AUDIENCES` 中的 audience，且账号已绑定到相同 provider 和 subject。不会仅凭同名邮箱关联管理员。封禁和角色变更在下一次请求重新校验。
+
+Chat 的共享运行状态、取消、断点恢复及容量配置见 [Chat 运行说明](docs/CHAT_RUNTIME.zh-CN.md)。

@@ -134,7 +134,7 @@ backend:
   # wait-for-catalog-schema init container blocks until public.alembic_version
   # matches it, so new Pods never serve against a schema the migration Job has
   # not finished applying. Bump this with the migration, in the same commit.
-  alembicRevision: 7d4a8e2c91b0
+  alembicRevision: 8704a3c4ca74
   # Governed metric queries default on; false disables runtime but retains models.
   # Standard queries still require a migrated catalog and a reviewed active model.
   governedMetricsEnabled: true

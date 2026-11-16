@@ -132,6 +132,7 @@
           "evidence": {
             "anyOf": [
               {
+                "maxLength": 64000,
                 "type": "string"
               },
               {
@@ -172,6 +173,7 @@
             "type": "string"
           },
           "question": {
+            "maxLength": 32000,
             "minLength": 1,
             "title": "Question",
             "type": "string"
@@ -179,6 +181,7 @@
           "target_db": {
             "anyOf": [
               {
+                "maxLength": 512,
                 "type": "string"
               },
               {
@@ -3475,6 +3478,7 @@
           "revision": {
             "anyOf": [
               {
+                "maximum": 2147483647.0,
                 "minimum": 1.0,
                 "type": "integer"
               },
@@ -3488,8 +3492,10 @@
             "anyOf": [
               {
                 "items": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
                   "type": "string"
                 },
+                "maxItems": 100,
                 "type": "array"
               },
               {
@@ -7416,7 +7422,7 @@
   "paths": {
     "/api/chat/cancel": {
       "post": {
-        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nThe worker is killed and the route waits briefly for its pump to finish\npersistence. Metric runs record an untrusted cancellation result tied to\ntheir server-generated turn ID; exploratory runs retain their existing\npartial-stream behavior. The slot remains unavailable while terminal\npersistence is unfinished, so a subsequent question cannot consume a late\nassistant result. PostgreSQL 14+ detects the dead client during execution;\nolder versions retain the governed statement-timeout bound. MySQL workers\nrequest same-account KILL CONNECTION before exiting; the server timeout\nremains a fallback when cancellation cannot reach the database.",
+        "description": "Abort the in-flight run for ``conversation_id``, if any.\n\nBacks the chat UI's Stop button. Without this, stopping only detached\nthe browser while the agent kept running and holding the slot, so the\nvery next question in the same conversation was rejected with 409.\n\nCancellation is persisted for every replica. The owner heartbeat kills\nthe worker; a local owner is also interrupted immediately. The run remains\nreserved until terminal persistence or lease expiry. Metric runs record an untrusted cancellation result tied to\ntheir server-generated turn ID; exploratory runs retain their existing\npartial-stream behavior. The slot remains unavailable while terminal\npersistence is unfinished, so a subsequent question cannot consume a late\nassistant result. PostgreSQL 14+ detects the dead client during execution;\nolder versions retain the governed statement-timeout bound. MySQL workers\nrequest same-account KILL CONNECTION before exiting; the server timeout\nremains a fallback when cancellation cannot reach the database.",
         "operationId": "chat_cancel_api_chat_cancel_post",
         "parameters": [
           {
@@ -7502,7 +7508,7 @@
     },
     "/api/chat/watch": {
       "get": {
-        "description": "Reattach to an in-flight run for ``conversation_id``, if any.\n\nPurely a passive observer: it never submits a question, never touches\n``client_alive``/``cancelled`` (so it can't trigger or block the 409\n\"Conversation in progress\" logic in `_try_claim_slot`), and has no\neffect on the run if it disconnects. This is what lets a reloaded or\nreopened browser tab recover the live progress UI (and, once it lands,\nthe final answer) for a run it didn't itself start \u2014 replaying every\nbuffered step from the beginning, then tailing new ones as they arrive.\n\nIf nothing is running for this conversation, the stream ends\nimmediately with `[DONE]` and no events, which the frontend treats\nidentically to \"nothing to resume\" \u2014 no separate status endpoint\nneeded.",
+        "description": "Reattach to an in-flight run for ``conversation_id``, if any.\n\nPurely a passive observer: it never submits a question, never touches\n``client_alive``/``cancelled`` (so it can't trigger or block the 409\n\"Conversation in progress\" logic in `_try_claim_slot`), and has no\neffect on the run if it disconnects. This is what lets a reloaded or\nreopened browser tab recover the live progress UI (and, once it lands,\nthe final answer) for a run it didn't itself start \u2014 replaying retained steps from the beginning, then tailing new ones as they arrive.\nLast-Event-ID accepts <run UUID>:<sequence> to resume after an acknowledged\nevent, including a completed run retained for the configured replay window.\n\nIf nothing is running for this conversation, the stream ends\nimmediately with `[DONE]` and no events, which the frontend treats\nidentically to \"nothing to resume\" \u2014 no separate status endpoint\nneeded.",
         "operationId": "chat_watch_api_chat_watch_get",
         "parameters": [
           {
@@ -7513,6 +7519,24 @@
               "format": "uuid",
               "title": "Conversation Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Resume after <run UUID>:<sequence>, including completed retained runs.",
+            "in": "header",
+            "name": "last-event-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Resume after <run UUID>:<sequence>, including completed retained runs.",
+              "title": "Last-Event-Id"
             }
           }
         ],

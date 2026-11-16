@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,7 @@ from auto_ontology.dal import close_store  # noqa: E402
 from auto_ontology.dal.schema_version import require_current_schema  # noqa: E402
 from auto_ontology.server.chat.router import router as chat_router  # noqa: E402
 from auto_ontology.server.chat.worker import get_pool, shutdown_pool  # noqa: E402
+from auto_ontology.server.chat.run_lifecycle import start_reaper, stop_reaper  # noqa: E402
 from auto_ontology.server.connections.router import router as connections_router  # noqa: E402
 from auto_ontology.server.datasources.router import router as datasources_router  # noqa: E402
 from auto_ontology.server.exploration.router import router as exploration_router  # noqa: E402
@@ -64,11 +66,13 @@ async def lifespan(_app: FastAPI):
     # itself is lazy on first use, but eagerly initialising here means the
     # very first chat request doesn't pay a cold start.
     get_pool()
+    start_reaper()
     try:
         yield
     finally:
         # Tear down warm subprocesses before exiting so we don't leak them.
-        shutdown_pool()
+        await asyncio.to_thread(stop_reaper)
+        await asyncio.to_thread(shutdown_pool)
         close_store()
 
 

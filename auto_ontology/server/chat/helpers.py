@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Literal, Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -34,14 +34,17 @@ class MetricChatContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     model_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-    revision: int | None = Field(default=None, ge=1)
-    selected_metric_ids: tuple[str, ...] | None = None
+    revision: int | None = Field(default=None, ge=1, le=2147483647)
+    selected_metric_ids: (
+        tuple[Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")], ...]
+        | None
+    ) = Field(default=None, max_length=100)
 
 
 class ChatRequest(BaseModel):
     """Payload sent by the frontend to start a chat completion."""
 
-    question: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1, max_length=32000)
     query_mode: Literal["explore", "metrics"] = "explore"
     metric_context: MetricChatContext | None = None
 
@@ -62,6 +65,7 @@ class ChatRequest(BaseModel):
 
     evidence: str | None = Field(
         default=None,
+        max_length=64000,
         description=(
             "Optional authoritative evidence supplied separately from the question."
         ),
@@ -86,6 +90,7 @@ class ChatRequest(BaseModel):
     # than one connector is loaded), the pipeline does not pin a database.
     target_db: str | None = Field(
         default=None,
+        max_length=512,
         description=(
             "Catalog database UUID or database name used to scope retrieval and SQL."
         ),

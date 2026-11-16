@@ -92,6 +92,67 @@ NAMING_CONVENTION = {
 # by luck.
 METADATA = MetaData(naming_convention=NAMING_CONVENTION)
 
+# Shared execution state. Owner tokens fence writes after a lease expires;
+# a partial unique index prevents simultaneous runs for one conversation.
+chat_run = Table(
+    "chat_run",
+    METADATA,
+    Column("id", Text, primary_key=True),
+    Column("run_key", Text, nullable=False),
+    Column("user_id", Text),
+    Column("conversation_id", Text),
+    Column("owner_id", Text, nullable=False),
+    Column("owner_token", Text, nullable=False),
+    Column("query_mode", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("analytics_id", Text),
+    Column("query_context", JSONB),
+    Column("cancel_requested", Boolean, nullable=False, server_default=text("false")),
+    Column("lease_until", DateTime(timezone=True), nullable=False),
+    Column("deadline_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    Column("finished_at", DateTime(timezone=True)),
+    Column("event_count", Integer, nullable=False, server_default=text("0")),
+    Column("event_bytes", BigInteger, nullable=False, server_default=text("0")),
+    CheckConstraint(
+        "status IN ('pending','running','succeeded','failed','cancelled','interrupted')",
+        name="status",
+    ),
+    CheckConstraint("event_count >= 0 AND event_bytes >= 0", name="event_budget"),
+)
+Index(
+    "uq_chat_run_active_key",
+    chat_run.c.run_key,
+    unique=True,
+    postgresql_where=chat_run.c.status.in_(["pending", "running"]),
+)
+Index(
+    "ix_chat_run_user_conversation",
+    chat_run.c.user_id,
+    chat_run.c.conversation_id,
+    chat_run.c.created_at,
+)
+Index("ix_chat_run_expiry", chat_run.c.status, chat_run.c.lease_until)
+
+chat_run_event = Table(
+    "chat_run_event",
+    METADATA,
+    Column(
+        "run_id", Text, ForeignKey("chat_run.id", ondelete="CASCADE"), primary_key=True
+    ),
+    Column("sequence", Integer, primary_key=True),
+    Column("event", JSONB, nullable=False),
+)
+
+runtime_revision = Table(
+    "runtime_revision",
+    METADATA,
+    Column("name", Text, primary_key=True),
+    Column("generation", BigInteger, nullable=False, server_default=text("0")),
+)
+
 #: ``gen_random_uuid()`` is built into Postgres from 13; no pgcrypto needed.
 #:
 #: Parenthesised to match how Postgres *stores* the expression. Written as

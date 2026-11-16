@@ -63,6 +63,7 @@ _cache_lock = threading.Lock()
 _SSO_FEDERATION_TTL_S = 30.0
 _sso_federation_result: bool | None = None
 _sso_federation_expires: float = 0.0
+_sso_federation_generation: int = -1
 _sso_federation_lock = threading.Lock()
 
 
@@ -83,29 +84,41 @@ def any_connection_uses_sso_federation() -> bool:
 
     Drives the chat endpoint's fail-closed check: when nothing is federated the
     request proceeds without a token, exactly as before this feature existed.
-    Lookup failures return False so a storage blip degrades to the stored access
-    token rather than taking chat down.
+    Lookup failures refuse execution: they cannot downgrade user credentials
+    to a more privileged shared token. A durable revision invalidates every
+    replica's cached decision as soon as connection settings change.
 
     The result is cached for :data:`_SSO_FEDERATION_TTL_S` seconds to avoid a
     catalog + Vault round-trip on every chat completion request.
     """
-    global _sso_federation_result, _sso_federation_expires
+    global _sso_federation_result, _sso_federation_expires, _sso_federation_generation
+
+    from auto_ontology.dal.connections import connection_generation, list_connections
+
+    try:
+        generation = connection_generation()
+    except Exception as exc:
+        raise DatabricksOAuthError(
+            "Cannot verify current connection authorization"
+        ) from exc
 
     now = time.monotonic()
     with _sso_federation_lock:
-        if _sso_federation_result is not None and now < _sso_federation_expires:
+        if (
+            _sso_federation_result is not None
+            and now < _sso_federation_expires
+            and generation == _sso_federation_generation
+        ):
             return _sso_federation_result
 
     try:
-        from auto_ontology.dal.connections import list_connections
-
         result = any(uses_sso_federation(conn) for conn in list_connections())
-    except Exception:
-        logger.exception("Failed to check connections for SSO federation")
-        result = False
+    except Exception as exc:
+        raise DatabricksOAuthError("Cannot verify connection authorization") from exc
 
     with _sso_federation_lock:
         _sso_federation_result = result
+        _sso_federation_generation = generation
         _sso_federation_expires = now + _SSO_FEDERATION_TTL_S
 
     return result

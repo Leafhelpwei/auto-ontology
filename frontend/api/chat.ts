@@ -41,6 +41,7 @@ export type ChatEventCallbacks = {
 	onMetricContext?: (event: MetricContextEvent) => void;
 	onError: (event: ErrorEvent) => void;
 	onDone?: () => void;
+	onEventId?: (id: string) => void;
 };
 
 export type StreamChatCallbacks = ChatEventCallbacks & {
@@ -75,65 +76,78 @@ const consumeSseStream = async (res: Response, callbacks: ChatEventCallbacks): P
 	let buffer = '';
 	let streamCompleted = false;
 
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
 
-		buffer += decoder.decode(value, { stream: true });
-		const lines = buffer.split('\n');
-		buffer = lines.pop() ?? '';
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split('\n');
+			buffer = lines.pop() ?? '';
+			if (buffer.length > 2_200_000)
+				throw new Error('Stream event exceeds the interactive result limit.');
 
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed.startsWith('data: ')) continue;
-
-			const data = trimmed.slice(6);
-			if (data === '[DONE]') {
-				streamCompleted = true;
-				break;
-			}
-
-			try {
-				const event: ChatStreamEvent = JSON.parse(data);
-				switch (event.type) {
-					case 'step':
-						callbacks.onStep(event);
-						break;
-					case 'sql':
-						callbacks.onSql?.(event);
-						break;
-					case 'result':
-						callbacks.onResult(event);
-						break;
-					case 'charts':
-						callbacks.onCharts?.(event);
-						break;
-					case 'metric_context':
-						callbacks.onMetricContext?.(event);
-						break;
-					case 'error':
-						streamCompleted = true;
-						callbacks.onError(event);
-						break;
+			for (const line of lines) {
+				if (line.length > 2_200_000)
+					throw new Error('Stream event exceeds the interactive result limit.');
+				const trimmed = line.trim();
+				if (trimmed.startsWith('id: ')) {
+					callbacks.onEventId?.(trimmed.slice(4));
+					continue;
 				}
-			} catch {
-				// skip malformed lines
+				if (!trimmed.startsWith('data: ')) continue;
+
+				const data = trimmed.slice(6);
+				if (data === '[DONE]') {
+					streamCompleted = true;
+					break;
+				}
+
+				try {
+					const event: ChatStreamEvent = JSON.parse(data);
+					switch (event.type) {
+						case 'step':
+							callbacks.onStep(event);
+							break;
+						case 'sql':
+							callbacks.onSql?.(event);
+							break;
+						case 'result':
+							callbacks.onResult(event);
+							break;
+						case 'charts':
+							callbacks.onCharts?.(event);
+							break;
+						case 'metric_context':
+							callbacks.onMetricContext?.(event);
+							break;
+						case 'error':
+							streamCompleted = true;
+							callbacks.onError(event);
+							break;
+					}
+				} catch {
+					// skip malformed lines
+				}
 			}
+			if (streamCompleted) break;
 		}
-		if (streamCompleted) break;
-	}
 
-	// Stream closed without [DONE]/result/error — surface as an error so
-	// the UI can drop out of loading instead of hanging forever.
-	if (!streamCompleted) {
-		callbacks.onError({
-			type: 'error',
-			message: 'Connection closed before the agent finished.',
-		});
-		return;
-	}
+		// Stream closed without [DONE]/result/error — surface as an error so
+		// the UI can drop out of loading instead of hanging forever.
+		if (!streamCompleted) {
+			callbacks.onError({
+				type: 'error',
+				message: 'Connection closed before the agent finished.',
+			});
+			return;
+		}
 
-	callbacks.onDone?.();
+		callbacks.onDone?.();
+	} finally {
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
 };
 
 /**
@@ -202,6 +216,7 @@ export const streamChat = (
 export const watchChat = (
 	conversationId: string,
 	callbacks: ChatEventCallbacks,
+	lastEventId?: string,
 ): AbortController => {
 	const controller = new AbortController();
 
@@ -209,7 +224,10 @@ export const watchChat = (
 		try {
 			const res = await fetch(
 				`/api/chat/watch?conversation_id=${encodeURIComponent(conversationId)}`,
-				{ signal: controller.signal },
+				{
+					signal: controller.signal,
+					headers: lastEventId ? { 'Last-Event-ID': lastEventId } : undefined,
+				},
 			);
 
 			if (!res.ok || !res.body) {

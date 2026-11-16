@@ -13,7 +13,6 @@
 // history implementation. This route authenticates the caller, forwards its
 // Auto Ontology user identity over the private upstream hop, and otherwise preserves SSE.
 
-import { after } from 'next/server';
 import { withPermission } from '@/auth/with-auth';
 import { userCan } from '@/auth/permissions';
 import { resolveSubjectToken } from '@/auth/sso-token';
@@ -98,6 +97,7 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 			method: 'POST',
 			headers: upstreamHeaders,
 			body,
+			signal: req.signal,
 			// Disable Node's transparent decompression so we can pipe bytes 1:1.
 			// @ts-expect-error — `duplex` is required by Node's fetch when
 			// streaming bodies; not yet in DOM lib types.
@@ -133,15 +133,11 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 		'Cache-Control': 'no-cache, no-transform',
 		Connection: 'keep-alive',
 		'X-Accel-Buffering': 'no',
+		...(upstream.headers.get('x-chat-run-id')
+			? { 'X-Chat-Run-Id': upstream.headers.get('x-chat-run-id')! }
+			: {}),
 	};
 
-	const [toClient, toKeepAlive] = upstream.body.tee();
-	after(async () => {
-		try {
-			await toKeepAlive.pipeTo(new WritableStream());
-		} catch {
-			// The browser-facing stream is already independent of this drain.
-		}
-	});
-	return new Response(toClient, { status: 200, headers: responseHeaders });
+	// The backend pump owns persistence even after this observer disconnects.
+	return new Response(upstream.body, { status: 200, headers: responseHeaders });
 });

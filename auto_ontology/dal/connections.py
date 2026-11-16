@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from auto_ontology.connectors.vault import read_secret
 from auto_ontology.dal import schema as s
-from auto_ontology.dal.session import store
+from auto_ontology.dal.session import store, write_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +75,14 @@ def insert_connection(
     statement = insert(s.catalog_database).values(
         name=database_name, connection=payload
     )
-    rows = store().query_write(
-        statement.on_conflict_do_update(
-            index_elements=[s.catalog_database.c.name],
-            set_={"connection": statement.excluded.connection},
-        ).returning(s.catalog_database)
-    )
+    with write_transaction():
+        rows = store().query_write(
+            statement.on_conflict_do_update(
+                index_elements=[s.catalog_database.c.name],
+                set_={"connection": statement.excluded.connection},
+            ).returning(s.catalog_database)
+        )
+        _advance_generation()
     return dict(rows[0])
 
 
@@ -97,10 +99,32 @@ def clear_connection(*, database_name: str) -> None:
     :func:`auto_ontology.dal.reset.delete_all_data` orders its own deletes to avoid.
     Tearing the graph down is that function's job.
     """
+    with write_transaction():
+        store().query_write(
+            update(s.catalog_database)
+            .where(s.catalog_database.c.name == database_name)
+            .values(connection=None)
+        )
+        _advance_generation()
+
+
+def connection_generation() -> int:
+    """Current durable connection revision, shared by every backend replica."""
+    rows = store().query_read(
+        select(s.runtime_revision.c.generation).where(
+            s.runtime_revision.c.name == "connections"
+        )
+    )
+    return int(rows[0]["generation"]) if rows else 0
+
+
+def _advance_generation() -> None:
+    statement = insert(s.runtime_revision).values(name="connections", generation=1)
     store().query_write(
-        update(s.catalog_database)
-        .where(s.catalog_database.c.name == database_name)
-        .values(connection=None)
+        statement.on_conflict_do_update(
+            index_elements=[s.runtime_revision.c.name],
+            set_={"generation": s.runtime_revision.c.generation + 1},
+        )
     )
 
 

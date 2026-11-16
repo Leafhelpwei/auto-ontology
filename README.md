@@ -543,3 +543,5 @@ MySQL sources verify the CA and server hostname by default (`ssl_mode=VERIFY_IDE
 Blank secret fields in an edit preserve the existing value; the clear action explicitly removes it. Supplied passwords and passphrases retain whitespace. Public connection APIs reject internal federation overrides and return only public fields.
 
 SSO bearer tokens require the configured OIDC client audience or an explicit `AUTO_ONTOLOGY_SSO_AUDIENCES` entry and an existing provider/subject binding. Email alone never grants a local account's permissions. Every credential path checks the current local account status.
+
+Chat admission, cancellation and replay are coordinated through PostgreSQL across backend replicas. See [runtime limits and recovery](docs/CHAT_RUNTIME.zh-CN.md) for configuration and failure semantics.

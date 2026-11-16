@@ -28,7 +28,15 @@ export type MetricsQueryContext = {
 	revision?: number | null;
 	model_fingerprint?: string | null;
 	selected_metric_ids?: string[] | null;
-	status?: 'running' | 'ready' | 'clarification' | 'rejected' | 'error' | 'cancelled';
+	status?:
+		| 'running'
+		| 'ready'
+		| 'clarification'
+		| 'rejected'
+		| 'error'
+		| 'cancelled'
+		| 'failed'
+		| 'interrupted';
 	trusted?: boolean;
 	query?: MetricQueryRequest | null;
 	base_query?: MetricQueryRequest | null;

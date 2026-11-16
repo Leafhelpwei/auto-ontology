@@ -1443,6 +1443,17 @@
               }
             }
           },
+          "422": {
+            "description": "Invalid conversation UUID or Last-Event-ID (<run UUID>:<sequence>) cursor.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "const": "Upstream watch request failed"
+                }
+              }
+            }
+          },
           "502": {
             "description": "The backend refused the watch. The upstream status is used when it has one, 502 otherwise; the body is plain text either way.",
             "content": {

@@ -22,10 +22,12 @@ def echo_loop(incoming: Any, outgoing: Any) -> None:
             question, identity = payload["question"], payload.get("user_id")
         else:
             question, identity = payload[0], payload[3]
-        if question == "error":
+        if question in {"error", "delayed-error"}:
             # Simulate the original broken child that reports ERROR then DONE and
             # continues running. The production parent must kill it before reuse.
             outgoing.put((module._TAG_ERROR, "private exception content"))
+            if question == "delayed-error":
+                time.sleep(0.1)
             outgoing.put((module._TAG_DONE, None))
             continue
         if question == "exit":
@@ -64,7 +66,10 @@ def ready_worker(mode: str = "explore") -> module.PrewarmedWorker:
 
 
 @pytest.mark.parametrize("mode", ["explore", "metrics"])
-def test_distinct_request_identity_and_error_poisoning(mode: str) -> None:
+@pytest.mark.parametrize("error_question", ["error", "delayed-error"])
+def test_distinct_request_identity_and_error_poisoning(
+    mode: str, error_question: str
+) -> None:
     first = ready_worker(mode)
     try:
         first.submit("A", subject_token="token-A", user_id="user-A")
@@ -77,7 +82,7 @@ def test_distinct_request_identity_and_error_poisoning(mode: str) -> None:
             }
         ]
         assert first.reusable()
-        first.submit("error", subject_token="token-A", user_id="user-A")
+        first.submit(error_question, subject_token="token-A", user_id="user-A")
         with pytest.raises(RuntimeError, match="execution failed"):
             list(first.events())
         assert not first.is_alive()
@@ -175,6 +180,27 @@ def test_request_deadline_kills_a_hung_worker(monkeypatch: pytest.MonkeyPatch) -
         worker.kill()
 
 
+def startup_error(incoming: Any, outgoing: Any) -> None:
+    outgoing.put((module._TAG_ERROR, "cannot initialize"))
+
+
+@pytest.mark.parametrize("failure", ["error", "killed"])
+def test_ready_error_or_death_is_rejected_and_capacity_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    monkeypatch.setattr(module, "_PROCESS_PERMITS", threading.BoundedSemaphore(1))
+    worker = module.PrewarmedWorker(
+        loop_override=startup_error if failure == "error" else never_ready
+    )
+    if failure == "killed":
+        worker._proc.kill()
+        worker._proc.join(2)
+    assert not worker.drain_until_ready(5)
+    assert not worker.is_alive()
+    ready_worker().kill()
+
+
 def test_worker_survives_the_thread_that_spawned_it() -> None:
     result = []
     thread = threading.Thread(target=lambda: result.append(ready_worker()))
@@ -250,7 +276,7 @@ def test_refresh_prevents_leased_worker_from_reentering_pool(
         "PrewarmedWorker",
         lambda mode="explore": original(mode, loop_override=echo_loop),
     )
-    pool = module.WarmPool()
+    pool = module.WarmPool(generation_reader=lambda: 0)
     try:
         worker = pool.acquire()
         pool.refresh()
@@ -278,7 +304,7 @@ def test_pool_warmup_failure_does_not_start_a_second_full_wait(
         return worker
 
     monkeypatch.setattr(module, "PrewarmedWorker", create)
-    pool = module.WarmPool()
+    pool = module.WarmPool(generation_reader=lambda: 0)
     try:
         with pool._condition:
             assert pool._condition.wait_for(lambda: not pool._warming, timeout=4)
@@ -305,7 +331,7 @@ def test_shutdown_rejects_a_worker_finishing_warmup_late(
         return worker
 
     monkeypatch.setattr(module, "PrewarmedWorker", create)
-    pool = module.WarmPool()
+    pool = module.WarmPool(generation_reader=lambda: 0)
     try:
         assert created.wait(3)
         pool.shutdown()

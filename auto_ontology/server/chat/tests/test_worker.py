@@ -60,6 +60,10 @@ def _run_loop(
         return remaining.pop(0) if remaining else []
 
     captured: dict = {}
+    monkeypatch.setattr(
+        "auto_ontology.connectors.databricks_oauth.any_connection_uses_sso_federation",
+        lambda: False,
+    )
 
     def fake_stream(payload: dict) -> Any:
         captured.update(payload)

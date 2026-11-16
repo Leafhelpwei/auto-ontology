@@ -240,7 +240,11 @@ def _worker_loop(
             # Per-user Databricks auth trades the prewarmed connectors for ones
             # bound to the caller's exchanged token. Databricks connectors open
             # connections per operation, so rebuilding them here is cheap.
-            if subject_token is not None:
+            from auto_ontology.connectors.databricks_oauth import (
+                any_connection_uses_sso_federation,
+            )
+
+            if subject_token is not None or any_connection_uses_sso_federation():
                 from auto_ontology.connectors.registry import (
                     get_connectors_for_subject_token,
                 )
@@ -504,7 +508,16 @@ class PrewarmedWorker:
 class WarmPool:
     """One standby per mode, one warming task, and a shared process capacity bound."""
 
-    def __init__(self, mode: str = "explore") -> None:
+    def __init__(
+        self,
+        mode: str = "explore",
+        *,
+        generation_reader: Callable[[], int] | None = None,
+    ) -> None:
+        from auto_ontology.dal.connections import connection_generation
+
+        self._generation_reader = generation_reader or connection_generation
+        self._connection_generation = self._generation_reader()
         self._mode = mode
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -517,6 +530,17 @@ class WarmPool:
         with _POOLS_LOCK:
             _POOLS.add(self)
         self._spawn_async()
+
+    def _sync_generation(self, *, force: bool = False) -> None:
+        current = self._generation_reader()
+        with self._lock:
+            if not force and current == self._connection_generation:
+                return
+            self._connection_generation = current
+            self._generation += 1
+            worker, self._standby = self._standby, None
+        if worker is not None:
+            worker.kill()
 
     def _spawn_async(self) -> None:
         with self._lock:
@@ -571,6 +595,7 @@ class WarmPool:
         return False
 
     def acquire(self) -> PrewarmedWorker:
+        self._sync_generation()
         with self._condition:
             if self._closed:
                 raise WorkerBusy("Chat worker pool is closed")
@@ -604,6 +629,11 @@ class WarmPool:
             worker._generation = generation
             if not worker.drain_until_ready():
                 raise WorkerStartupError("Worker startup failed")
+        try:
+            self._sync_generation()
+        except Exception:
+            worker.kill()
+            raise
         with self._lock:
             if self._closed or generation != self._generation:
                 worker.kill()
@@ -612,6 +642,14 @@ class WarmPool:
         return worker
 
     def return_alive(self, worker: PrewarmedWorker) -> None:
+        try:
+            self._sync_generation()
+        except Exception:
+            # An unverified credential generation must never enter standby.
+            with self._lock:
+                self._leased.discard(worker)
+            worker.kill()
+            raise
         with self._lock:
             if self._standby is worker:
                 return
@@ -637,11 +675,7 @@ class WarmPool:
         self._spawn_async()
 
     def refresh(self) -> None:
-        with self._lock:
-            self._generation += 1
-            worker, self._standby = self._standby, None
-        if worker is not None:
-            worker.kill()
+        self._sync_generation(force=True)
         self._spawn_async()
 
     def shutdown(self) -> None:

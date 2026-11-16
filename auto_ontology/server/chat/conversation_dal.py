@@ -11,11 +11,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-import psycopg
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
-from auto_ontology.infra.postgres import FRONTEND_SCHEMA, get_postgres_connection_string
+from sqlalchemy import select, update, func
+from sqlalchemy.dialects.postgresql import insert
+from auto_ontology.dal.chat_history import conversations, messages, analytics
+from auto_ontology.dal.session import store, write_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -174,74 +173,71 @@ def prepare_conversation(
     source: str,
     query_context: dict[str, Any] | None = None,
 ) -> PreparedConversation:
-    """Verify/create a conversation, load prior turns, then persist the user turn."""
-
+    """Verify ownership and persist the user turn in the caller's transaction."""
     conversation_str = str(conversation_id)
     analytics_id = str(uuid.uuid4())
-    if query_context is not None:
-        query_context = {**query_context, "turn_id": analytics_id}
-    with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.conversations (id, user_id, title, created_at, updated_at)
-                VALUES (%s, %s, %s, NOW(), NOW())
-                ON CONFLICT (id) DO NOTHING
-                RETURNING user_id
-                """,
-                (conversation_str, user_id, question[:50] or "New conversation"),
+    context = {**(query_context or {}), "turn_id": analytics_id}
+    with write_transaction():
+        store().query_write(
+            insert(conversations)
+            .values(
+                id=conversation_str,
+                user_id=user_id,
+                title=question[:50] or "New conversation",
+                created_at=func.now(),
+                updated_at=func.now(),
             )
-            owner = cur.fetchone()
-            if owner is None:
-                cur.execute(
-                    f"SELECT user_id FROM {FRONTEND_SCHEMA}.conversations WHERE id = %s FOR UPDATE",
-                    (conversation_str,),
-                )
-                owner = cur.fetchone()
-            if owner is None or owner["user_id"] != user_id:
-                raise ConversationAccessError(conversation_str)
-
-            cur.execute(
-                f"""
-                SELECT role, content, sql_code, sql_response, query_context
-                FROM {FRONTEND_SCHEMA}.messages
-                WHERE conversation_id = %s
-                ORDER BY created_at ASC, id ASC
-                """,
-                (conversation_str,),
+            .on_conflict_do_nothing()
+        )
+        _require_owner(conversation_str, user_id, lock=True)
+        # Load the newest bounded window. Retained turn context must carry any
+        # older normalized metric constraints; it cannot rely on unlimited SQL.
+        rows = store().query_read(
+            select(messages)
+            .where(messages.c.conversation_id == conversation_str)
+            .order_by(messages.c.created_at.desc(), messages.c.id.desc())
+            .limit(128)
+        )
+        history = _rows_to_history(
+            list(reversed(rows)),
+            include_incomplete=context.get("query_mode") == "metrics",
+        )
+        store().query_write(
+            insert(messages).values(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation_str,
+                role="user",
+                content=question,
+                query_context=context,
+                created_at=func.now(),
             )
-            history = _rows_to_history(
-                [dict(row) for row in cur.fetchall()],
-                include_incomplete=(query_context or {}).get("query_mode") == "metrics",
+        )
+        store().query_write(
+            insert(analytics).values(
+                id=analytics_id,
+                user_id=user_id,
+                source=source,
+                question=question,
+                question_timestamp=func.now(),
             )
-
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, query_context, created_at)
-                VALUES (%s, %s, 'user', %s, %s, NOW())
-                """,
-                (
-                    str(uuid.uuid4()),
-                    conversation_str,
-                    question,
-                    Jsonb(query_context) if query_context is not None else None,
-                ),
-            )
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.conversation_analytics
-                    (id, user_id, source, question, question_timestamp)
-                VALUES (%s, %s, %s, %s, NOW())
-                """,
-                (analytics_id, user_id, source, question),
-            )
-            cur.execute(
-                f"UPDATE {FRONTEND_SCHEMA}.conversations SET updated_at = NOW() WHERE id = %s",
-                (conversation_str,),
-            )
-
+        )
+        store().query_write(
+            update(conversations)
+            .where(conversations.c.id == conversation_str)
+            .values(updated_at=func.now())
+        )
     return PreparedConversation(history=history, analytics_id=analytics_id)
+
+
+def _require_owner(conversation_id: str, user_id: str, *, lock: bool = False) -> None:
+    statement = select(conversations.c.user_id).where(
+        conversations.c.id == conversation_id
+    )
+    if lock:
+        statement = statement.with_for_update()
+    rows = store().query_read(statement)
+    if not rows or rows[0]["user_id"] != user_id:
+        raise ConversationAccessError(conversation_id)
 
 
 def persist_assistant_result(
@@ -253,43 +249,34 @@ def persist_assistant_result(
     sql_code: str | None,
     query_context: dict[str, Any] | None = None,
 ) -> None:
-    """Persist one final assistant turn and complete its analytics row."""
-
-    conversation_str = str(conversation_id)
-    with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT 1 FROM {FRONTEND_SCHEMA}.conversations WHERE id = %s AND user_id = %s",
-                (conversation_str, user_id),
+    """Atomically, idempotently persist one answer and its analytics."""
+    with write_transaction():
+        _require_owner(str(conversation_id), user_id)
+        context = {**(query_context or {}), "turn_id": analytics_id}
+        store().query_write(
+            insert(messages)
+            .values(
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, analytics_id + ":answer")),
+                conversation_id=str(conversation_id),
+                role="assistant",
+                content=response,
+                sql_code=sql_code,
+                query_context=context,
+                created_at=func.now(),
             )
-            if cur.fetchone() is None:
-                raise ConversationAccessError(conversation_str)
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, sql_code, query_context, created_at)
-                VALUES (%s, %s, 'assistant', %s, %s, %s, NOW())
-                """,
-                (
-                    str(uuid.uuid4()),
-                    conversation_str,
-                    response,
-                    sql_code,
-                    Jsonb(query_context) if query_context is not None else None,
-                ),
-            )
-            cur.execute(
-                f"""
-                UPDATE {FRONTEND_SCHEMA}.conversation_analytics
-                SET response = %s, sql = %s, response_timestamp = NOW()
-                WHERE id = %s AND user_id = %s
-                """,
-                (response, sql_code, analytics_id, user_id),
-            )
-            cur.execute(
-                f"UPDATE {FRONTEND_SCHEMA}.conversations SET updated_at = NOW() WHERE id = %s",
-                (conversation_str,),
-            )
+            .on_conflict_do_nothing()
+        )
+        persist_analytics_result(
+            analytics_id=analytics_id,
+            user_id=user_id,
+            response=response,
+            sql_code=sql_code,
+        )
+        store().query_write(
+            update(conversations)
+            .where(conversations.c.id == str(conversation_id))
+            .values(updated_at=func.now())
+        )
 
 
 def persist_result_message(
@@ -300,59 +287,47 @@ def persist_result_message(
     sql_response: str | None,
     query_context: dict[str, Any] | None = None,
 ) -> None:
-    """Persist the chart/table bubble ("Message 2") for a completed turn.
-
-    Called unconditionally from ``_pump`` so this bubble is guaranteed to
-    exist — same guarantee ``persist_assistant_result`` already gives the
-    SQL answer — instead of depending on a browser tab staying around to
-    ask for it.
-    """
-
-    conversation_str = str(conversation_id)
-    with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT 1 FROM {FRONTEND_SCHEMA}.conversations "
-                "WHERE id = %s AND user_id = %s",
-                (conversation_str, user_id),
+    """Persist the chart/table bubble, sharing the owner's fenced transaction."""
+    with write_transaction():
+        _require_owner(str(conversation_id), user_id)
+        turn_id = (query_context or {}).get("turn_id")
+        message_id = (
+            str(uuid.uuid5(uuid.NAMESPACE_URL, turn_id + ":table"))
+            if turn_id
+            else str(uuid.uuid4())
+        )
+        store().query_write(
+            insert(messages)
+            .values(
+                id=message_id,
+                conversation_id=str(conversation_id),
+                role="assistant",
+                content=content,
+                sql_response=sql_response,
+                query_context=query_context,
+                created_at=func.now(),
             )
-            if cur.fetchone() is None:
-                raise ConversationAccessError(conversation_str)
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.messages
-                    (id, conversation_id, role, content, sql_response, query_context, created_at)
-                VALUES (%s, %s, 'assistant', %s, %s, %s, NOW())
-                """,
-                (
-                    str(uuid.uuid4()),
-                    conversation_str,
-                    content,
-                    sql_response,
-                    Jsonb(query_context) if query_context is not None else None,
-                ),
-            )
-            cur.execute(
-                f"UPDATE {FRONTEND_SCHEMA}.conversations "
-                "SET updated_at = NOW() WHERE id = %s",
-                (conversation_str,),
-            )
+            .on_conflict_do_nothing()
+        )
+        store().query_write(
+            update(conversations)
+            .where(conversations.c.id == str(conversation_id))
+            .values(updated_at=func.now())
+        )
 
 
 def create_stateless_analytics(*, user_id: str, question: str, source: str) -> str:
     """Create analytics for an authenticated one-shot request."""
-
     analytics_id = str(uuid.uuid4())
-    with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {FRONTEND_SCHEMA}.conversation_analytics
-                    (id, user_id, source, question, question_timestamp)
-                VALUES (%s, %s, %s, %s, NOW())
-                """,
-                (analytics_id, user_id, source, question),
-            )
+    store().query_write(
+        insert(analytics).values(
+            id=analytics_id,
+            user_id=user_id,
+            source=source,
+            question=question,
+            question_timestamp=func.now(),
+        )
+    )
     return analytics_id
 
 
@@ -363,18 +338,16 @@ def persist_analytics_result(
     response: str,
     sql_code: str | None,
 ) -> None:
-    """Complete an analytics row for a stateless authenticated request."""
-
-    with psycopg.connect(get_postgres_connection_string(), connect_timeout=3) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE {FRONTEND_SCHEMA}.conversation_analytics
-                SET response = %s, sql = %s, response_timestamp = NOW()
-                WHERE id = %s AND user_id = %s
-                """,
-                (response, sql_code, analytics_id, user_id),
-            )
+    """Complete an analytics row once; repeated terminal delivery is harmless."""
+    store().query_write(
+        update(analytics)
+        .where(
+            analytics.c.id == analytics_id,
+            analytics.c.user_id == user_id,
+            analytics.c.response_timestamp.is_(None),
+        )
+        .values(response=response, sql=sql_code, response_timestamp=func.now())
+    )
 
 
 __all__ = [

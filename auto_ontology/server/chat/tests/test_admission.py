@@ -84,6 +84,14 @@ def test_admission_counts_pending_requests_per_user_and_globally() -> None:
 def test_startup_failure_removes_pending_reservation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        router.chat_runs,
+        "reserve",
+        Mock(return_value=router.chat_runs.Ticket("fixture", "token")),
+    )
+    monkeypatch.setattr(router.chat_runs, "finish", Mock())
+    monkeypatch.setattr(router, "LeaseGuard", Mock())
+    monkeypatch.setattr(router, "_prepare_run", lambda *args: (None, []))
     pool = Mock()
     pool.acquire.side_effect = WorkerStartupError("unavailable")
     monkeypatch.setattr(router, "get_metrics_pool", lambda: pool)
@@ -94,6 +102,7 @@ def test_startup_failure_removes_pending_reservation(
     with pytest.raises(HTTPException) as error:
         asyncio.run(router.chat_completions(request, http))
     assert error.value.status_code == 503
+    pool.acquire.assert_called_once()
     assert router._pending_slots == router._active_slots == {}
 
 

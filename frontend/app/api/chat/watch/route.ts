@@ -39,9 +39,13 @@ export const GET = withPermission({ conversation: ['read'] })(async (req, { user
 	const upstream = await fetch(
 		`${PYTHON_API_URL}/api/chat/watch?conversation_id=${encodeURIComponent(conversationId)}`,
 		{
+			signal: req.signal,
 			headers: {
 				Accept: 'text/event-stream',
 				...buildInternalIdentityHeaders(user.id),
+				...(req.headers.get('last-event-id')
+					? { 'Last-Event-ID': req.headers.get('last-event-id')! }
+					: {}),
 			},
 		},
 	);
