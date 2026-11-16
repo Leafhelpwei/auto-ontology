@@ -342,7 +342,12 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
 
     charts: list[dict[str, Any]] | None = None
     llm = _non_reasoning_llm or _reasoning_llm
-    if llm is not None and slot.query_mode != "metrics":
+    result_metadata = answer.get("result_metadata") or {}
+    if (
+        llm is not None
+        and slot.query_mode != "metrics"
+        and not result_metadata.get("truncated")
+    ):
         try:
             if is_visualization_enabled():
                 charts = analyze_and_visualize(
@@ -361,6 +366,11 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
     if built is None:
         return None
     content, sql_response = built
+    if result_metadata.get("truncated"):
+        content = (
+            f"Partial result: {result_metadata.get('returned_rows', 0)} rows shown; "
+            "the interactive result limit was reached. Narrow the query to obtain complete data."
+        )
 
     if slot.cancelled.is_set():
         return None
@@ -376,6 +386,8 @@ def _build_charts_event(slot: _Slot, answer: dict[str, Any]) -> dict[str, Any] |
         )
 
     event = {"type": "charts", "content": content, "sql_response": sql_response}
+    if result_metadata:
+        event["result_metadata"] = result_metadata
     event["query_context"] = answer.get("query_context") or slot.query_context
     return event
 

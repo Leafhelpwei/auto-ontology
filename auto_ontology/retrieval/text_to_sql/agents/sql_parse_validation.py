@@ -30,6 +30,7 @@ import sqlglot
 from sqlglot import expressions as exp
 
 from auto_ontology.catalog.sql_parse import parse_query_single
+from auto_ontology.connectors.query_policy import UnsafeQuery, validate_read_query
 from auto_ontology.dal.datasources import find_table_key_columns
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
 from auto_ontology.retrieval.text_to_sql.numeric_types import (
@@ -796,9 +797,24 @@ class SQLValidationAgent(BaseAgent):
         connector = resolve_connector_from_tables(
             path_state.get("relevant_tables"), connectors
         )
+        degenerate_dialect = getattr(connector, "dialect", None)
+        try:
+            validate_read_query(response.sql_code, degenerate_dialect)
+        except UnsafeQuery as exc:
+            reason = str(exc)
+            return {
+                "decision": "unconstructable",
+                "path_state": {
+                    **path_state,
+                    "sql_code": None,
+                    "sql_generation_result": None,
+                    "query_policy_rejected": True,
+                    "unconstructable_explanation": reason,
+                    "final_response": {"response": reason, "sql_code": None},
+                },
+            }
         schemas_ids = fetch_all_schema_ids()
         schemas = get_schemas_by_ids(schemas_ids)
-        degenerate_dialect = getattr(connector, "dialect", None)
 
         # Every constructed/reconstructed SQL passes through this node before
         # execution (see the graph: construct_sql_from_candidates,
@@ -861,11 +877,24 @@ class SQLValidationAgent(BaseAgent):
                 }
 
         validation_result = self._sql_parse_validation(
-            schemas, response.sql_code, dialects
+            schemas,
+            response.sql_code,
+            [degenerate_dialect] if degenerate_dialect else dialects,
         )
 
         if validation_result.get("error"):
             error_msg = validation_result["error"]
+            if validation_result.get("query_policy_rejected"):
+                return {
+                    "decision": "unconstructable",
+                    "path_state": {
+                        **path_state,
+                        "sql_code": None,
+                        "sql_generation_result": None,
+                        "query_policy_rejected": True,
+                        "unconstructable_explanation": error_msg,
+                    },
+                }
             self.logger.info(f"SQL validation failed: {error_msg}")
             path_state["error"] = error_msg
             return {
@@ -961,6 +990,7 @@ class SQLValidationAgent(BaseAgent):
     def _sql_parse_validation(schemas, sql: str, dialects: list[str]) -> dict:
         result: dict = {}
         try:
+            validate_read_query(sql, dialects[0] if len(dialects) == 1 else None)
             query_obj = parse_query_single(
                 sql=sql,
                 schemas=schemas,
@@ -978,6 +1008,15 @@ class SQLValidationAgent(BaseAgent):
             result["sql_columns"] = column_ids
             result["used_tables"] = _qualified_catalog_names(schemas, table_ids)
             result["used_columns"] = _qualified_catalog_names(schemas, column_ids)
+        except UnsafeQuery as error:
+            result.update(
+                {
+                    "success": False,
+                    "error": str(error),
+                    "another_try": 0,
+                    "query_policy_rejected": True,
+                }
+            )
         except Exception as error:
             result.update({"error": str(error), "another_try": 1})
         return result

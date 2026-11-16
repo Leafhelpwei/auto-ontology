@@ -312,6 +312,35 @@ def test_table_persistence_uses_no_chart_llm_and_cancel_keeps_history(
     assert list(router._stream_slot(slot))[-1] == "data: [DONE]\n\n"
 
 
+def test_partial_exploration_table_keeps_notice_and_skips_chart_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chart = Mock(
+        side_effect=AssertionError(
+            "Partial results cannot be interpreted as complete charts"
+        )
+    )
+    monkeypatch.setattr(router, "analyze_and_visualize", chart)
+    monkeypatch.setattr(router, "_non_reasoning_llm", object())
+    saved = Mock()
+    monkeypatch.setattr(router, "persist_result_message", saved)
+    slot = _slot([])
+    slot.query_mode = "explore"
+    slot.query_context = None
+    metadata = {"truncated": True, "reason": "row_limit", "returned_rows": 1}
+    event = router._build_charts_event(
+        slot,
+        {
+            "sql_response_from_db": '[{"id":1}]',
+            "result_metadata": metadata,
+        },
+    )
+    assert event["result_metadata"] == metadata
+    assert "Partial result" in event["content"]
+    assert saved.call_args.kwargs["content"] == event["content"]
+    chart.assert_not_called()
+
+
 def test_metrics_route_bypasses_exploration_prerequisites_but_checks_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

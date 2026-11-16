@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, Optional
 
 from auto_ontology.connectors.db_errors import is_infrastructure_error
+from auto_ontology.connectors.query_policy import UnsafeQuery, ResultLimitExceeded
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
 from auto_ontology.retrieval.text_to_sql.connector_routing import (
     resolve_connector_from_tables,
@@ -67,6 +68,8 @@ class QueryResponse:
         numeric_kinds: Optional[list] = None,
         values_digest: Optional[str] = None,
         sql_correction: Optional[str] = None,
+        result_metadata: dict[str, Any] | None = None,
+        policy_error: bool = False,
     ):
         # Per output column ``"float"`` / ``"decimal"`` / ``None``; lets a caller
         # that needs a predictable numeric type know what this SQL returned.
@@ -83,6 +86,8 @@ class QueryResponse:
         # Set when the statement that should be submitted is not the statement
         # that was generated. Execution reports it; reconstruction installs it.
         self.sql_correction = sql_correction
+        self.result_metadata = result_metadata or {}
+        self.policy_error = policy_error
 
 
 def _sanitize_sql_for_dialect(sql: str, dialect: str) -> str:
@@ -182,16 +187,23 @@ def _run_sql(
             else "[]"
         )
     except Exception as e:
-        logger.exception("SQL execution failed (injected connector)")
-        return QueryResponse(result=None, sliced=False, error=str(e), statement=sql)
+        logger.warning("SQL execution failed error_class=%s", type(e).__name__)
+        return QueryResponse(
+            result=None,
+            sliced=False,
+            error=str(e),
+            statement=sql,
+            policy_error=isinstance(e, (UnsafeQuery, ResultLimitExceeded)),
+        )
     return QueryResponse(
         result=[payload],
-        sliced=False,
+        sliced=bool(df.attrs.get("query_result", {}).get("truncated")),
         error=None,
         statement=sql,
         numeric_kinds=numeric_kinds,
         values_digest=values_digest,
         sql_correction=sql_correction,
+        result_metadata=df.attrs.get("query_result", {}),
     )
 
 
@@ -259,12 +271,21 @@ class SQLExecutionAgent(BaseAgent):
             return {"decision": "invalid_sql", "path_state": path_state}
 
         if response_from_db.error:
-            self.logger.info(
-                "SQL execution failed\n  SQL: %s\n  Error: %s",
-                sql_code[:300],
-                response_from_db.error,
-            )
             path_state["error"] = response_from_db.error
+            if response_from_db.policy_error:
+                return {
+                    "decision": "unconstructable",
+                    "path_state": {
+                        **path_state,
+                        "sql_response_from_db": None,
+                        "unconstructable_explanation": response_from_db.error,
+                        "query_policy_rejected": True,
+                        "final_response": {
+                            "response": response_from_db.error,
+                            "sql_code": None,
+                        },
+                    },
+                }
             if is_infrastructure_error(
                 response_from_db.error, response_from_db.statement or sql_code
             ):
@@ -276,8 +297,7 @@ class SQLExecutionAgent(BaseAgent):
                 # this path deliberately does not do.
                 self.logger.error(
                     "SQL execution failed for infrastructure reasons; "
-                    "not attempting reconstruction: %s",
-                    response_from_db.error,
+                    "not attempting reconstruction",
                 )
                 record_thought(
                     path_state,
@@ -306,6 +326,7 @@ class SQLExecutionAgent(BaseAgent):
         updated_path_state = {
             **path_state,
             "sql_response_from_db": response_from_db.result,
+            "result_metadata": response_from_db.result_metadata,
         }
         if record_kinds:
             # Numeric types of what just ran, tagged with that SQL so a reader

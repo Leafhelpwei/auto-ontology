@@ -351,7 +351,7 @@ def test_jsonb_numeric_text_is_reported_for_reconstruction(monkeypatch) -> None:
     assert "CAST(" in path_state["sql_correction"]
     assert "buy_pressure" in path_state["sql_correction"]
     assert "result_numeric_kinds" not in path_state
-    assert connector.executed == [sql]
+    assert connector.executed == [sql + " LIMIT 1001"]
 
 
 def test_sqlite_qualifier_strip_is_reported_for_reconstruction(monkeypatch) -> None:
@@ -375,7 +375,7 @@ def test_sqlite_qualifier_strip_is_reported_for_reconstruction(monkeypatch) -> N
     assert update["decision"] == "invalid_sql"
     assert update["path_state"]["error"] == SQL_CORRECTION_ERROR
     assert update["path_state"]["sql_correction"] == "SELECT a FROM t"
-    assert connector.executed == ["SELECT a FROM t"]
+    assert connector.executed == ["SELECT a FROM t LIMIT 1001"]
 
 
 # ── result values digest ────────────────────────────────────────────────────

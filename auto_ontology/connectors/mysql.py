@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import socket
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -16,12 +17,20 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import mysql.connector
 from mysql.connector.conversion import MySQLConverter
+from mysql.connector.network import NetworkBrokerPlain
 import pandas as pd
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
 
 from auto_ontology.connectors.mysql_tls import TLS_FIELDS, mysql_tls_options
+from auto_ontology.connectors.query_policy import (
+    QueryBudget,
+    ResultCollector,
+    ResultLimitExceeded,
+    bounded_query,
+    validate_read_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +46,45 @@ ScopedReader = Callable[[str, QueryParameters], pd.DataFrame]
 # Taking a tuple snapshot is atomic under the GIL; the SIGTERM handler must not
 # acquire a lock that the interrupted thread could itself be holding.
 _ACTIVE_CONNECTIONS: dict[int, tuple[dict[str, Any], int]] = {}
+
+
+class _BoundedNetworkBroker(NetworkBrokerPlain):
+    """Reject an oversized result packet after its header, before allocation.
+
+    Connector/Python's unbuffered cursor still allocates an entire text-protocol
+    row in recv(). All supported budgets are below MySQL's 16 MiB packet split,
+    so no oversized row can bypass this check using continuation packets.
+    This adapter is exercised against the pinned real driver and MySQL 5.7.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__()
+        self.max_bytes = max_bytes
+
+    def _recv_chunk(self, sock: socket.socket, size: int = 0) -> bytearray:
+        if size > self.max_bytes:
+            raise ResultLimitExceeded(
+                "A result row exceeds the interactive byte limit; select fewer or shorter fields."
+            )
+        return super()._recv_chunk(sock, size)
+
+
+def _cancel_connection(kwargs: dict[str, Any], connection_id: int) -> None:
+    connection = mysql.connector.connect(
+        **kwargs, connection_timeout=1, read_timeout=1, write_timeout=1
+    )
+    try:
+        cursor = connection.cursor()
+        try:
+            try:
+                cursor.execute("KILL CONNECTION " + str(int(connection_id)))
+            except mysql.connector.Error as exc:
+                if exc.errno != 1094:  # Already ended by cancellation/timeout.
+                    raise
+        finally:
+            cursor.close()
+    finally:
+        connection.close()
 
 
 class _GovernedMySQLConverter(MySQLConverter):
@@ -234,6 +282,90 @@ class MySQLDatabase(SQLDatabase):
                     cursor.close()
         finally:
             connection.close()
+
+    def execute_readonly(
+        self, sql: str, *, timeout_s: float = 30, budget: QueryBudget | None = None
+    ) -> pd.DataFrame:
+        """Read unbuffered rows with a preallocation packet cap in READ ONLY."""
+        budget = budget or QueryBudget()
+        query = validate_read_query(sql, self.dialect)
+        bounded = bounded_query(query, self.dialect, budget.max_rows + 1)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("A finite positive statement timeout is required")
+        started = time.monotonic()
+        connection = mysql.connector.connect(
+            **self._connect_kwargs,
+            converter_class=_GovernedMySQLConverter,
+            connection_timeout=min(10, math.ceil(timeout_s)),
+            read_timeout=math.ceil(timeout_s) + 1,
+            write_timeout=math.ceil(timeout_s) + 1,
+        )
+        cursor = None
+        complete = False
+        try:
+            with _registered_connection(connection, self._connect_kwargs):
+                # Fail closed if a driver upgrade changes its transport API.
+                transport = connection._socket
+                if type(transport._netbroker) is not NetworkBrokerPlain:
+                    raise RuntimeError(
+                        "The MySQL transport cannot enforce the result packet budget."
+                    )
+                broker = _BoundedNetworkBroker(budget.max_row_bytes)
+                broker._pktnr = transport._netbroker._pktnr
+                transport._netbroker = broker
+                cursor = connection.cursor(buffered=False)
+                self._set_statement_timeout(cursor, timeout_s)
+                if self._timeout_variable is None:
+                    raise ValueError(
+                        "Interactive MySQL queries require statement timeout support"
+                    )
+                cursor.execute("SET SESSION time_zone = '+00:00'")
+                cursor.execute(
+                    "SET SESSION lock_wait_timeout = %s", (math.ceil(timeout_s),)
+                )
+                connection.start_transaction(
+                    readonly=True, isolation_level="REPEATABLE READ"
+                )
+                connection.converter.invalid_temporal = False
+                cursor.execute(bounded)
+                description = cursor.description or ()
+                collector = ResultCollector([str(c[0]) for c in description], budget)
+                while True:
+                    if time.monotonic() - started >= timeout_s:
+                        raise StatementTimeout.since(timeout_s, started)
+                    row = cursor.fetchone()
+                    if row is None:
+                        complete = True
+                        break
+                    if connection.converter.invalid_temporal:
+                        raise mysql.connector.DataError(
+                            "Invalid MySQL date or datetime result", errno=1292
+                        )
+                    if not collector.add(row):
+                        break
+                frame = collector.frame()
+                frame.attrs["mysql_types"] = {c[0]: c[1] for c in description}
+                return frame
+        except mysql.connector.Error as exc:
+            if exc.errno in _TIMEOUT_ERRNOS or exc.errno == 1205:
+                raise StatementTimeout.since(timeout_s, started) from exc
+            raise
+        finally:
+            if not complete:
+                # Never drain a rejected, possibly gigantic row in close() or
+                # rollback(). Kill just this session, then close the socket.
+                try:
+                    _cancel_connection(self._connect_kwargs, connection.connection_id)
+                except Exception:
+                    logger.warning("MySQL bounded reader cleanup failed")
+                connection.disconnect()
+            else:
+                try:
+                    if cursor is not None:
+                        cursor.close()
+                    connection.rollback()
+                finally:
+                    connection.close()
 
     @contextmanager
     def read_transaction(self, *, timeout_s: float = 30) -> Iterator[ScopedReader]:

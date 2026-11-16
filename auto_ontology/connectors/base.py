@@ -43,6 +43,7 @@ from auto_ontology.utils.sql_identifiers import qualified_name
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from auto_ontology.catalog.table_filter import TableFilter
+    from auto_ontology.connectors.query_policy import QueryBudget
 
 
 # A cancellation this far short of the caller's cap was not the caller's cap:
@@ -147,6 +148,34 @@ class SQLDatabase(ABC):
         parameters:
             Optional positional parameters for parameterised queries.
         """
+
+    def execute_readonly(
+        self, sql: str, *, timeout_s: float = 30, budget: QueryBudget | None = None
+    ) -> pd.DataFrame:
+        """Interactive boundary for engines without a specialized reader.
+
+        AST enforcement and an outer row limit apply to every connector.
+        Warehouse deployments must use SELECT-only credentials; these engines
+        do not all offer READ ONLY transactions. Specialized readers additionally
+        cap bytes before driver buffering (Postgres, MySQL and SQLite).
+        """
+        from auto_ontology.connectors.query_policy import (
+            QueryBudget,
+            bounded_query,
+            collect_frame,
+            validate_read_query,
+        )
+
+        budget = budget or QueryBudget()
+        dialect = getattr(self, "dialect", "")
+        query = validate_read_query(sql, dialect)
+        bounded = bounded_query(query, dialect, budget.max_rows + 1)
+        kwargs = (
+            {"timeout_s": timeout_s}
+            if getattr(self, "supports_statement_timeout", False)
+            else {}
+        )
+        return collect_frame(self.execute(bounded, **kwargs), budget)
 
     # ------------------------------------------------------------------
     # Schema introspection

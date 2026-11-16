@@ -111,12 +111,22 @@ export type SqlEvent = {
 /** Shape of the executed SQL result, as returned by `sql_response_from_db`. */
 export type SqlResult = string | string[] | { [key: string]: string | number | boolean | null }[];
 
+export type QueryResultMetadata = {
+	truncated: boolean;
+	reason: 'row_limit' | 'byte_limit' | null;
+	returned_rows: number;
+	returned_bytes: number;
+	row_limit: number;
+	byte_limit: number;
+};
+
 export type ResultEvent = {
 	type: 'result';
 	answer: {
 		response: string;
 		sql_code?: string;
 		sql_response_from_db?: SqlResult;
+		result_metadata?: QueryResultMetadata;
 		thoughts?: string;
 		query_context?: ChatQueryContext | null;
 	};
@@ -139,6 +149,7 @@ export type ChartsEvent = {
 	type: 'charts';
 	content: string;
 	sql_response?: string | null;
+	result_metadata?: QueryResultMetadata;
 	query_context?: ChatQueryContext | null;
 };
 

@@ -2,26 +2,23 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the SQL a chat turn issues: logged, and capped in time.
+"""Read-only, bounded SQL execution for Chat and model-issued probes.
 
-Both behaviours deliberately live here rather than in the connectors. A
-connector's ``execute`` is the chokepoint for *all* SQL — ingestion
-introspection and column profiling included — where neither behaviour is
-wanted: logging there buries a question's few statements under hundreds of
-housekeeping queries, and a short timeout would break metadata scans over a
-large ``information_schema``, which legitimately take minutes.
-
-Only agent-issued SQL reaches the calls here.
+Trusted ingestion/introspection keeps the connector's general execute() API.
+Interactive SQL always passes deterministic checks before touching a driver.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
 import pandas as pd
 
 from auto_ontology.infra.feature_flags import get_sql_query_timeout_seconds
+from auto_ontology.connectors.base import SQLDatabase
+from auto_ontology.connectors.query_policy import QueryBudget, validate_read_query
 
 logger = logging.getLogger(__name__)
 
@@ -39,21 +36,14 @@ def truncate_sql(sql: str) -> str:
 
 
 def log_chat_sql(connector: Any, sql: str, *, kind: str = "chat SQL") -> None:
-    """Log one agent-issued statement at INFO, with the credential in use.
-
-    ``auth_mode`` is only exposed by connectors that can run as the calling user
-    (currently Databricks); for the rest the credential is fixed and the clause
-    is left off rather than stating something misleading.
-    """
-    database = getattr(connector, "database_name", None) or "unknown"
-    auth_mode = getattr(connector, "auth_mode", None)
-
-    if auth_mode:
-        logger.info(
-            "[%s] Executing %s as %s:\n%s", database, kind, auth_mode, truncate_sql(sql)
-        )
-    else:
-        logger.info("[%s] Executing %s:\n%s", database, kind, truncate_sql(sql))
+    """Record a fingerprint and size, never SQL literals or database identifiers."""
+    logger.info(
+        "Interactive query kind=%s dialect=%s sha256=%s characters=%d",
+        kind,
+        getattr(connector, "dialect", "unknown"),
+        hashlib.sha256(sql.encode()).hexdigest()[:16],
+        len(sql),
+    )
 
 
 def execute_chat_sql(
@@ -62,25 +52,18 @@ def execute_chat_sql(
     *,
     kind: str = "chat SQL",
     timeout_s: float | None = None,
+    budget: QueryBudget | None = None,
 ) -> pd.DataFrame:
-    """Log and run one agent-issued statement, capped in time.
-
-    A user is waiting on the answer and the pipeline allows one stream at a
-    time, so a runaway query would pin the slot. The cap is *timeout_s*, or
-    when that is ``None`` the SQL Query Timeout from Settings > Agent Settings
-    (30s unless an admin changed it, and always 30s without the frontend).
-    Connecting and warehouse scheduling may sit outside it, so expect roughly
-    the cap plus a couple of seconds of wall clock.
-
-    Every built-in connector honours the cap -- server side where the engine
-    has a statement timeout, client side for DuckDB, SQLite and HeavyDB. One
-    that doesn't advertise ``supports_statement_timeout`` is called unchanged,
-    so the cap never breaks a connector with no way to honour it.
-    """
+    """Validate and execute one interactive query with configured time and result caps."""
+    validate_read_query(sql, getattr(connector, "dialect", None))
     log_chat_sql(connector, sql, kind=kind)
-
-    if not getattr(connector, "supports_statement_timeout", False):
-        return connector.execute(sql)
     if timeout_s is None:
         timeout_s = get_sql_query_timeout_seconds()
-    return connector.execute(sql, timeout_s=timeout_s)
+    reader = getattr(connector, "execute_readonly", None)
+    if callable(reader):
+        return reader(sql, timeout_s=timeout_s, budget=budget or QueryBudget())
+    # Third-party duck-typed connectors retain the same deterministic policy and
+    # result cap. Production built-ins implement/inherit this method directly.
+    return SQLDatabase.execute_readonly(
+        connector, sql, timeout_s=timeout_s, budget=budget
+    )

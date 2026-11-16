@@ -2,36 +2,22 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hardened, read-only probe executor.
-
-This is the single choke point for every live query the probing layer issues.
-It guarantees a probe:
-- is a single ``SELECT`` / ``WITH`` statement (no DDL/DML, no multi-statement),
-- is ``LIMIT``-bounded (auto-appended when missing),
-- counts against a per-question call budget.
-
-Probes run **inline on the calling thread**. The pipeline's connectors are
-shared and long-lived, and thread-affine connectors (e.g. SQLite binds each
-connection to its creating thread) reuse the calling thread's existing
-connection — so inline execution avoids leaking a fresh connection per probe.
-Bounding therefore relies on ``LIMIT`` + the call budget rather than a hard
-wall-clock timeout; per-dialect statement timeouts (Postgres ``statement_timeout``,
-SQLite ``set_progress_handler``) are the right tool once Phase 2 runs arbitrary
-model-authored SQL.
-
-The same executor backs both the Phase-1 deterministic probes and any future
-Phase-2 LLM-driven exploration loop, so all live access inherits these guards.
-"""
+"""Single read-only probe boundary with call, row, byte and time budgets."""
 
 from __future__ import annotations
 
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from auto_ontology.connectors.base import SQLDatabase
+from auto_ontology.connectors.query_policy import (
+    QueryBudget,
+    UnsafeQuery,
+    validate_read_query,
+    bounded_query,
+)
 
 from auto_ontology.retrieval.text_to_sql.db_probe.config import (
     DB_PROBE_MAX_CALLS,
@@ -42,39 +28,18 @@ from auto_ontology.retrieval.text_to_sql.chat_sql import execute_chat_sql
 
 logger = logging.getLogger(__name__)
 
-# Statement keywords that must never appear in a probe (mutations / side effects).
-_FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|drop|alter|create|replace|truncate|grant|revoke|"
-    r"attach|detach|pragma|vacuum|reindex|merge|call|exec|execute|copy|into)\b",
-    re.IGNORECASE,
-)
-_LIMIT_RE = re.compile(r"\blimit\b", re.IGNORECASE)
+
+def is_read_only_select(sql: str, dialect: str | None = None) -> bool:
+    """Use the same AST and function policy as final query execution."""
+    try:
+        validate_read_query(sql, dialect)
+        return True
+    except UnsafeQuery:
+        return False
 
 
-def is_read_only_select(sql: str) -> bool:
-    """Return ``True`` only for a single, side-effect-free ``SELECT``/``WITH`` query."""
-    if not sql:
-        return False
-    stripped = sql.strip().rstrip(";").strip()
-    if not stripped:
-        return False
-    # Reject multi-statement payloads (anything with an interior ';').
-    if ";" in stripped:
-        return False
-    lowered = stripped.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return False
-    if _FORBIDDEN.search(stripped):
-        return False
-    return True
-
-
-def _ensure_limit(sql: str, max_rows: int) -> str:
-    """Append ``LIMIT max_rows`` when the query has no explicit LIMIT."""
-    stripped = sql.strip().rstrip(";").strip()
-    if _LIMIT_RE.search(stripped):
-        return stripped
-    return f"{stripped} LIMIT {max_rows}"
+def _ensure_limit(sql: str, max_rows: int, dialect: str | None = None) -> str:
+    return bounded_query(validate_read_query(sql, dialect), dialect or "", max_rows)
 
 
 @dataclass
@@ -141,23 +106,30 @@ class ProbeExecutor:
             self.log.append(entry)
             return entry
 
-        if not is_read_only_select(sql):
+        if not is_read_only_select(sql, getattr(self.connector, "dialect", None)):
             entry["error"] = "rejected: not a single read-only SELECT"
-            logger.warning("Probe rejected (not read-only): %s", sql)
+            logger.warning("Probe rejected by read-only policy")
             self.log.append(entry)
             return entry
 
-        bounded_sql = _ensure_limit(sql, self.max_rows)
+        bounded_sql = _ensure_limit(
+            sql, self.max_rows + 1, getattr(self.connector, "dialect", None)
+        )
         entry["sql"] = bounded_sql
         self.calls += 1
 
         start = time.perf_counter()
         try:
-            df = execute_chat_sql(self.connector, bounded_sql, kind="probe SQL")
+            df = execute_chat_sql(
+                self.connector,
+                bounded_sql,
+                kind="probe SQL",
+                budget=QueryBudget(max_rows=self.max_rows, max_bytes=64 * 1024),
+            )
         except Exception as exc:  # noqa: BLE001 — probes must never break the pipeline
             entry["error"] = str(exc)
             entry["elapsed_ms"] = int((time.perf_counter() - start) * 1000)
-            logger.info("Probe failed: %s :: %s", bounded_sql, exc)
+            logger.info("Probe failed error_class=%s", type(exc).__name__)
             self.log.append(entry)
             return entry
 
@@ -173,7 +145,9 @@ class ProbeExecutor:
         entry["ok"] = True
         entry["rows"] = records
         entry["row_count"] = total
-        entry["truncated"] = total > self.max_rows
+        entry["truncated"] = total > self.max_rows or bool(
+            df.attrs.get("query_result", {}).get("truncated")
+        )
         self.log.append(entry)
         return entry
 

@@ -18,6 +18,13 @@ import pandas as pd
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.query_policy import (
+    QueryBudget,
+    ResultCollector,
+    ResultLimitExceeded,
+    bounded_query,
+    validate_read_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +141,41 @@ class SQLiteDatabase(SQLDatabase):
         return pd.DataFrame(
             [dict(row) for row in rows], columns=[col[0] for col in cur.description]
         )
+
+    def execute_readonly(
+        self, sql: str, *, timeout_s: float = 30, budget: QueryBudget | None = None
+    ) -> pd.DataFrame:
+        """Use a separate OS read-only handle, row streaming and SQLite limits."""
+        budget = budget or QueryBudget()
+        tree = validate_read_query(sql, self.dialect)
+        bounded = bounded_query(tree, self.dialect, budget.max_rows + 1)
+        conn = sqlite3.connect(self._db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        deadline = time.monotonic() + timeout_s
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, budget.max_row_bytes)
+            conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, budget.max_columns)
+            conn.set_progress_handler(
+                lambda: int(time.monotonic() > deadline), _PROGRESS_INTERVAL
+            )
+            cursor = conn.execute(bounded)
+            collector = ResultCollector(
+                [str(c[0]) for c in cursor.description or ()], budget
+            )
+            for row in cursor:
+                if not collector.add(row):
+                    break
+            return collector.frame()
+        except sqlite3.DataError as exc:
+            raise ResultLimitExceeded(
+                "A result value exceeds the interactive byte limit; select fewer or shorter fields."
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if time.monotonic() > deadline and "interrupted" in str(exc):
+                raise StatementTimeout(timeout_s) from exc
+            raise
+        finally:
+            conn.close()
 
     def get_tables(self) -> pd.DataFrame:
         view_type = TableTypes.VIEW

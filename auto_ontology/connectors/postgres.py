@@ -8,17 +8,28 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import date, datetime, time as datetime_time
+from decimal import Decimal
+import json
 import time
+from uuid import uuid4
 import weakref
 from typing import Any
 
 import pandas as pd
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg_pool import ConnectionPool
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.query_policy import (
+    QueryBudget,
+    ResultCollector,
+    ResultLimitExceeded,
+    bounded_query,
+    validate_read_query,
+)
 
 
 def _fetch_frame(
@@ -173,6 +184,104 @@ class PostgresDatabase(SQLDatabase):
                         return _fetch_frame(conn, sql, parameters, preserve_types=True)
 
                     yield execute_scoped
+            except psycopg.errors.QueryCanceled as exc:
+                if "statement timeout" not in str(exc):
+                    raise
+                raise StatementTimeout.since(timeout_s, started) from exc
+
+    def execute_readonly(
+        self, sql: str, *, timeout_s: float = 30, budget: QueryBudget | None = None
+    ) -> pd.DataFrame:
+        """Read bounded rows through a named server cursor in READ ONLY.
+
+        Server-side JSON size checks happen *before* sending each row. Merely
+        switching to fetchmany on a normal libpq cursor still buffers the whole
+        result; even a server cursor alone can allocate an unbounded single cell.
+        Positional JSON keys preserve duplicate output names. Numeric JSON is
+        decoded as Decimal, avoiding a float round trip.
+        """
+        budget = budget or QueryBudget()
+        query = validate_read_query(sql, self.dialect)
+        bounded = bounded_query(query, self.dialect, budget.max_rows + 1)
+        started = time.monotonic()
+        deadline = started + timeout_s
+        with self._pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    conn.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    )
+                    conn.execute(
+                        "SELECT set_config('search_path', 'pg_catalog,public', true)"
+                    )
+                    conn.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{max(1, int(timeout_s * 1000))}ms",),
+                    )
+                    if conn.info.server_version >= 140000:
+                        conn.execute(
+                            "SET LOCAL client_connection_check_interval = '100ms'"
+                        )
+                    # LIMIT 0 describes the output without materializing any data.
+                    with conn.cursor(row_factory=tuple_row) as metadata:
+                        metadata.execute(
+                            query.copy()
+                            .limit(0)
+                            .sql(dialect=self.dialect, comments=False)
+                        )
+                        description = tuple(metadata.description or ())
+                    columns = [column.name for column in description]
+                    collector = ResultCollector(columns, budget)
+                    encoded_row = "pg_catalog.row_to_json(ROW(_ao_result.*))::text"
+                    checked = (
+                        f"SELECT CASE WHEN pg_catalog.octet_length({encoded_row}) <= {budget.max_row_bytes} "
+                        f"THEN {encoded_row} ELSE NULL END FROM ({bounded}) AS _ao_result"
+                    )
+                    with conn.cursor(
+                        name=f"ao_{uuid4().hex}", row_factory=tuple_row
+                    ) as cursor:
+                        cursor.execute(checked)
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise StatementTimeout.since(timeout_s, started)
+                            conn.execute(
+                                "SELECT set_config('statement_timeout', %s, true)",
+                                (f"{max(1, int(remaining * 1000))}ms",),
+                            )
+                            row = cursor.fetchone()
+                            if row is None:
+                                break
+                            if row[0] is None:
+                                raise ResultLimitExceeded(
+                                    "A result row exceeds the interactive byte limit; select fewer or shorter fields."
+                                )
+                            values = list(
+                                json.loads(row[0], parse_float=Decimal).values()
+                            )
+                            for i, column in enumerate(description):
+                                value = values[i]
+                                if value is None:
+                                    continue
+                                if column.type_code == 1700:
+                                    values[i] = Decimal(str(value))
+                                elif column.type_code in (700, 701):
+                                    values[i] = float(value)
+                                elif column.type_code == 1082:
+                                    values[i] = date.fromisoformat(value)
+                                elif column.type_code in (1114, 1184):
+                                    values[i] = datetime.fromisoformat(value)
+                                elif column.type_code in (1083, 1266):
+                                    values[i] = datetime_time.fromisoformat(value)
+                                elif column.type_code == 17:
+                                    values[i] = bytes.fromhex(value.removeprefix("\\x"))
+                            if not collector.add(values):
+                                break
+                    frame = collector.frame()
+                    frame.attrs["postgres_types"] = {
+                        c.name: c.type_code for c in description
+                    }
+                    return frame
             except psycopg.errors.QueryCanceled as exc:
                 if "statement timeout" not in str(exc):
                     raise

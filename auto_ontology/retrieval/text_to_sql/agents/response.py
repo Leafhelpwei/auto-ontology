@@ -69,6 +69,14 @@ class ResponseAgent(BaseAgent):
             candidates=candidates,
             response=response_explanation,
         )
+        result_metadata = path_state.get("result_metadata") or {}
+        if result_metadata.get("truncated"):
+            formatted_response += (
+                f"\n\n**Partial result:** {result_metadata.get('returned_rows', 0)} rows are shown. "
+                "The interactive row or byte limit was reached. This table is not "
+                "the complete result; totals or trends must not be inferred from it. "
+                "Narrow the filters or request an aggregate query for a complete answer."
+            )
 
         # --- final dict assembly ---
         sql_columns = path_state.get("sql_columns", [])
@@ -81,6 +89,9 @@ class ResponseAgent(BaseAgent):
             "custom_analyses_used": [],
             "sql_response_from_db": sql_response_from_db,
         }
+
+        if result_metadata:
+            response["result_metadata"] = result_metadata
 
         self.logger.info("Calculation response prepared and returned")
 

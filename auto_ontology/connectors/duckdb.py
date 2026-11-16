@@ -34,6 +34,12 @@ import pandas as pd
 from typing import Optional
 
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+from auto_ontology.connectors.query_policy import (
+    QueryBudget,
+    ResultCollector,
+    bounded_query,
+    validate_read_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +158,46 @@ class DuckDBDatabase(SQLDatabase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def execute_readonly(
+        self, sql: str, *, timeout_s: float = 30, budget: QueryBudget | None = None
+    ) -> pd.DataFrame:
+        """Use a read-only transaction and bounded row collection.
+
+        DuckDB evaluates in process; its deployment memory_limit remains the
+        engine allocation bound, separate from this Python result budget.
+        """
+        budget = budget or QueryBudget()
+        query = validate_read_query(sql, self.dialect)
+        bounded = bounded_query(query, self.dialect, budget.max_rows + 1)
+        cursor = self.conn.cursor()
+        fired = threading.Event()
+
+        def interrupt() -> None:
+            fired.set()
+            cursor.interrupt()
+
+        timer = threading.Timer(timeout_s, interrupt)
+        timer.daemon = True
+        timer.start()
+        try:
+            cursor.execute("BEGIN TRANSACTION READ ONLY")
+            cursor.execute(bounded)
+            collector = ResultCollector(
+                [str(c[0]) for c in cursor.description or ()], budget
+            )
+            while (row := cursor.fetchone()) is not None:
+                if not collector.add(row):
+                    break
+            return collector.frame()
+        except duckdb.InterruptException as exc:
+            if fired.is_set():
+                raise StatementTimeout(timeout_s) from exc
+            raise
+        finally:
+            timer.cancel()
+            timer.join()
+            cursor.close()
 
     def get_tables(self) -> pd.DataFrame:
         """Return all tables from information_schema as a DataFrame."""

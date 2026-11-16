@@ -2,13 +2,14 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat SQL logging reports the statement and the credential behind it."""
+"""Chat SQL uses bounded reads and emits no SQL literals in logs."""
 
 from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from pytest import LogCaptureFixture
 
@@ -33,58 +34,32 @@ def configured_timeout(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     return stored
 
 
-def test_logs_sso_federated_credential(caplog: LogCaptureFixture) -> None:
-    connector = SimpleNamespace(database_name="kdc_ca1", auth_mode=AUTH_SSO_FEDERATION)
-
-    with caplog.at_level(logging.INFO, logger=_LOGGER):
-        log_chat_sql(connector, "SELECT 1")
-
-    assert f"[kdc_ca1] Executing chat SQL as {AUTH_SSO_FEDERATION}:\nSELECT 1" in [
-        r.getMessage() for r in caplog.records
-    ]
-
-
-def test_logs_stored_token_credential(caplog: LogCaptureFixture) -> None:
-    connector = SimpleNamespace(database_name="kdc_ca1", auth_mode=AUTH_STORED_TOKEN)
-
-    with caplog.at_level(logging.INFO, logger=_LOGGER):
-        log_chat_sql(connector, "SELECT 1")
-
-    assert f"[kdc_ca1] Executing chat SQL as {AUTH_STORED_TOKEN}:\nSELECT 1" in [
-        r.getMessage() for r in caplog.records
-    ]
-
-
-def test_omits_credential_for_connectors_without_auth_mode(
-    caplog: LogCaptureFixture,
+@pytest.mark.parametrize("auth_mode", [AUTH_SSO_FEDERATION, AUTH_STORED_TOKEN, None])
+def test_logs_fingerprint_without_sql_or_source_identifiers(
+    caplog: LogCaptureFixture, auth_mode: str | None
 ) -> None:
-    """Postgres et al. have one fixed credential — don't imply otherwise."""
-    connector = SimpleNamespace(database_name="mydb")
-
+    connector = SimpleNamespace(
+        database_name="private_customer_db", dialect="postgres", auth_mode=auth_mode
+    )
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        log_chat_sql(connector, "SELECT 1")
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert "[mydb] Executing chat SQL:\nSELECT 1" in messages
-    assert not any("as the" in m for m in messages)
-
-
-def test_probe_queries_are_labelled(caplog: LogCaptureFixture) -> None:
-    connector = SimpleNamespace(database_name="kdc_ca1", auth_mode=AUTH_STORED_TOKEN)
-
-    with caplog.at_level(logging.INFO, logger=_LOGGER):
-        log_chat_sql(connector, "SELECT 1", kind="probe SQL")
-
-    assert any("Executing probe SQL as" in r.getMessage() for r in caplog.records)
+        log_chat_sql(
+            connector,
+            "SELECT * FROM customers WHERE email='sensitive@example.invalid'",
+            kind="probe SQL",
+        )
+    text = " ".join(record.getMessage() for record in caplog.records)
+    assert "sha256=" in text and "kind=probe SQL" in text and "dialect=postgres" in text
+    assert (
+        "sensitive" not in text
+        and "private_customer_db" not in text
+        and "SELECT" not in text
+    )
 
 
 def test_unknown_database_name_does_not_crash(caplog: LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         log_chat_sql(SimpleNamespace(), "SELECT 1")
-
-    assert "[unknown] Executing chat SQL:\nSELECT 1" in [
-        r.getMessage() for r in caplog.records
-    ]
+    assert "dialect=unknown" in caplog.text
 
 
 def test_long_sql_is_truncated() -> None:
@@ -104,17 +79,17 @@ class _Recorder:
         self.supports_statement_timeout = supports_timeout
         self.calls: list[tuple[str, dict]] = []
 
-    def execute(self, sql: str, **kwargs: object) -> str:
+    def execute(self, sql: str, **kwargs: object) -> pd.DataFrame:
         self.calls.append((sql, kwargs))
-        return "df"
+        return pd.DataFrame({"value": [1]})
 
 
 def test_chat_sql_is_capped_at_30_seconds(configured_timeout: list[int]) -> None:
     connector = _Recorder(supports_timeout=True)
 
-    assert execute_chat_sql(connector, "SELECT 1") == "df"
+    assert execute_chat_sql(connector, "SELECT 1")["value"].tolist() == [1]
     assert connector.calls == [
-        ("SELECT 1", {"timeout_s": DEFAULT_SQL_QUERY_TIMEOUT_SECONDS})
+        ("SELECT 1 LIMIT 1001", {"timeout_s": DEFAULT_SQL_QUERY_TIMEOUT_SECONDS})
     ]
     assert DEFAULT_SQL_QUERY_TIMEOUT_SECONDS == 30
 
@@ -149,7 +124,7 @@ def test_without_settings_the_default_is_30_seconds(
 
     execute_chat_sql(connector, "SELECT 1")
 
-    assert connector.calls == [("SELECT 1", {"timeout_s": 30})]
+    assert connector.calls == [("SELECT 1 LIMIT 1001", {"timeout_s": 30})]
 
 
 def test_connectors_without_timeout_support_are_called_unchanged() -> None:
@@ -158,7 +133,7 @@ def test_connectors_without_timeout_support_are_called_unchanged() -> None:
 
     execute_chat_sql(connector, "SELECT 1")
 
-    assert connector.calls == [("SELECT 1", {})]
+    assert connector.calls == [("SELECT 1 LIMIT 1001", {})]
 
 
 def test_probe_sql_is_also_capped(configured_timeout: list[int]) -> None:
@@ -176,4 +151,4 @@ def test_an_explicit_timeout_overrides_the_configured_one(
 
     execute_chat_sql(connector, "SELECT 1", timeout_s=7)
 
-    assert connector.calls == [("SELECT 1", {"timeout_s": 7})]
+    assert connector.calls == [("SELECT 1 LIMIT 1001", {"timeout_s": 7})]
