@@ -76,7 +76,7 @@ export const ModalWithSteps = ({
 	}, [activeStep]);
 
 	return (
-		<Modal open={open} onClose={onClose} className={className}>
+		<Modal open={open} onClose={onClose} className={className} ariaLabel={title}>
 			<div className="flex items-center justify-between border-b border-zinc-200 px-5 py-4 dark:border-zinc-700">
 				<div className="flex items-center gap-2">
 					<Icon name={titleIcon} className="h-5 w-5 text-body dark:text-zinc-300" />

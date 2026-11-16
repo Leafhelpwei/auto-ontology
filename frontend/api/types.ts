@@ -11,6 +11,7 @@ export type ApiError = {
 	status?: number;
 	code?: string;
 	details?: unknown;
+	fieldErrors?: { path: string; message: string }[];
 };
 
 export type ResponseWithError<T> = T & Partial<ApiError>;

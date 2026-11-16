@@ -14,7 +14,7 @@ import type {
 
 const scalar = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
 const fieldRef = z.object({ source_id: z.string(), field_id: z.string() }).strict();
-const predicate = z
+export const predicateSchema = z
 	.object({
 		field: fieldRef,
 		operator: z.enum([
@@ -98,7 +98,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 								.strict(),
 						)
 						.default([]),
-					required_filters: z.array(predicate).default([]),
+					required_filters: z.array(predicateSchema).default([]),
 					priority: z.number().int().default(100),
 					pre_aggregated: z.boolean().default(false),
 					structure_fingerprint: z.string().default(''),
@@ -128,7 +128,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 							'many_to_many',
 						]),
 						join_type: z.enum(['inner', 'left']).default('left'),
-						predicates: z.array(predicate).default([]),
+						predicates: z.array(predicateSchema).default([]),
 					})
 					.strict(),
 			)
@@ -147,7 +147,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 						.nullable()
 						.default(null),
 					expression: expression.nullable().default(null),
-					required_filters: z.array(predicate).default([]),
+					required_filters: z.array(predicateSchema).default([]),
 					supported_dimensions: z.array(z.string()).default([]),
 					time_field_id: z.string().nullable().default(null),
 					time_role: z.string().nullable().default(null),

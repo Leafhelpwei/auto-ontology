@@ -2,7 +2,10 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { queryFieldErrors } from '@/lib/metricQueryValidation';
+import { validationErrors, type FieldError } from '@/api/validationErrors';
 import { useState } from 'react';
+import { DynamicTable } from '@/components/chatPage/DynamicTable';
 import { ResultColumnDetails } from './ResultColumnDetails';
 import { governedMetricsApi } from '@/api/governedMetrics';
 import { Button } from '@/common/Button';
@@ -34,9 +37,6 @@ const initialQuery: MetricQueryRequest = {
 	order_by: [],
 	limit: 100,
 };
-const cellText = (value: unknown) =>
-	value == null ? 'NULL' : typeof value === 'object' ? JSON.stringify(value) : String(value);
-
 const QueryResult = ({ result, executed }: { result: MetricQueryResult; executed: boolean }) => {
 	const rows = result.rows ?? [];
 	const columns =
@@ -67,46 +67,7 @@ const QueryResult = ({ result, executed }: { result: MetricQueryResult; executed
 			{executed && (
 				<div className="space-y-2">
 					<p className="text-sm">{result.row_count ?? rows.length} rows returned</p>
-					{rows.length === 0 ? (
-						<p className="text-sm text-secondary">No rows matched this query.</p>
-					) : (
-						<div className="max-h-96 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
-							<table className="w-full border-collapse text-left text-sm">
-								<thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
-									<tr>
-										{columns.map((column) => (
-											<th
-												key={column}
-												scope="col"
-												className="px-4 py-2 font-medium"
-											>
-												{column}
-											</th>
-										))}
-									</tr>
-								</thead>
-								<tbody>
-									{rows.map((row, index) => (
-										<tr
-											key={index}
-											className="border-t border-zinc-200 dark:border-zinc-800"
-										>
-											{columns.map((column, at) => (
-												<td
-													key={column}
-													className="px-4 py-2 whitespace-nowrap"
-												>
-													{cellText(
-														Array.isArray(row) ? row[at] : row[column],
-													)}
-												</td>
-											))}
-										</tr>
-									))}
-								</tbody>
-							</table>
-						</div>
-					)}
+					<DynamicTable table={{ columns, rows }} />
 				</div>
 			)}
 			<ResultColumnDetails columns={result.column_metadata} />
@@ -165,8 +126,16 @@ export const MetricQueryPanel = ({
 	const [executed, setExecuted] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
+	const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
+	const fieldError = (path: string) =>
+		fieldErrors
+			.filter((item) => item.path === path)
+			.map((item) => item.message)
+			.join(' ');
 	const patch = (value: Partial<MetricQueryRequest>) => {
-		setQuery({ ...query, ...value });
+		const next = { ...query, ...value };
+		setQuery(next);
+		if (fieldErrors.length) setFieldErrors(queryFieldErrors(next));
 		setResult(null);
 		setError('');
 	};
@@ -183,21 +152,10 @@ export const MetricQueryPanel = ({
 	const run = async (action: 'compile' | 'execute', preview: boolean) => {
 		setError('');
 		setResult(null);
-		if (!query.metric_ids.length) {
-			setError('Select at least one metric variant.');
-			return;
-		}
-		if (!query.all_time && !query.time) {
-			setError('Choose an explicit time range or All time.');
-			return;
-		}
-		if (
-			query.time &&
-			(!query.time.start || !query.time.end_exclusive || !query.time.time_role)
-		) {
-			setError(
-				'Enter start, exclusive end, and business time role. Timestamps must include a UTC offset.',
-			);
+		const issues = queryFieldErrors(query);
+		setFieldErrors(issues);
+		if (issues.length) {
+			setError('Correct the marked query fields before sending.');
 			return;
 		}
 		setBusy(true);
@@ -209,11 +167,17 @@ export const MetricQueryPanel = ({
 				revision,
 				preview,
 			);
-			if (response.error)
+			if (response.error) {
+				setFieldErrors(
+					(response.fieldErrors ?? validationErrors(response.details)).map((issue) => ({
+						...issue,
+						path: issue.path.replace(/^query\./, ''),
+					})),
+				);
 				setError(
 					`${response.code ? `${response.code}: ` : ''}${response.message ?? 'Query failed.'}`,
 				);
-			else {
+			} else {
 				setResult(response.data);
 				setExecuted(action === 'execute');
 			}
@@ -414,6 +378,7 @@ export const MetricQueryPanel = ({
 						<div className="grid gap-4 md:grid-cols-2">
 							<TextField
 								label="Start (inclusive)"
+								error={fieldError('time.start')}
 								value={query.time?.start ?? ''}
 								hint="ISO timestamp with offset, e.g. 2026-01-01T00:00:00+08:00"
 								onChange={(start) =>
@@ -433,6 +398,7 @@ export const MetricQueryPanel = ({
 							/>
 							<TextField
 								label="End (exclusive)"
+								error={fieldError('time.end_exclusive')}
 								value={query.time?.end_exclusive ?? ''}
 								hint="ISO timestamp with offset, e.g. 2026-02-01T00:00:00+08:00"
 								onChange={(end_exclusive) =>
@@ -452,6 +418,7 @@ export const MetricQueryPanel = ({
 							/>
 							<TextField
 								label="Timezone"
+								error={fieldError('time.timezone')}
 								value={query.time?.timezone ?? 'UTC'}
 								hint="IANA timezone, e.g. Asia/Shanghai"
 								onChange={(timezone) =>
@@ -471,6 +438,7 @@ export const MetricQueryPanel = ({
 							/>
 							<TextField
 								label="Business time role"
+								error={fieldError('time.time_role')}
 								value={query.time?.time_role ?? ''}
 								hint="Must match selected metrics"
 								onChange={(time_role) =>
@@ -522,7 +490,11 @@ export const MetricQueryPanel = ({
 					<div className="grid gap-4 md:grid-cols-3">
 						<TextField
 							label="Row limit (1–10,000)"
+							error={fieldError('limit')}
 							type="number"
+							min={1}
+							max={10000}
+							step={1}
 							value={query.limit}
 							onChange={(limit) => patch({ limit: Number(limit) })}
 						/>
@@ -599,6 +571,18 @@ export const MetricQueryPanel = ({
 				<p role="status" className="text-sm">
 					Processing governed query…
 				</p>
+			)}
+			{fieldErrors.length > 0 && (
+				<ul
+					aria-label="Query field errors"
+					className="list-disc pl-5 text-sm text-red-700 dark:text-red-300"
+				>
+					{fieldErrors.map((issue, index) => (
+						<li key={index}>
+							{issue.path}: {issue.message}
+						</li>
+					))}
+				</ul>
 			)}
 			{error && (
 				<p

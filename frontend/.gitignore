@@ -49,3 +49,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# browser regression artifacts and temporary auth state
+/test-results/
+/playwright-report/

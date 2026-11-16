@@ -74,6 +74,7 @@ export const Table = <T,>({
 	onRowClick,
 	rowClickIsPointerShortcut = false,
 	emptyMessage,
+	showEmptyHeaders = false,
 }: TableProps<T>) => {
 	const baseRowClassName = rowClassName ?? DEFAULT_ROW;
 	const interactiveRowClassName = onRowClick
@@ -82,7 +83,7 @@ export const Table = <T,>({
 	// A row answers the keyboard only when it is the sole way into its target.
 	const rowIsButton = onRowClick != null && !rowClickIsPointerShortcut;
 
-	if (rows.length === 0) {
+	if (rows.length === 0 && !showEmptyHeaders) {
 		return (
 			<div className={cx(containerClassName ?? DEFAULT_CONTAINER, className)}>
 				<EmptyState variant={EmptyStateVariant.Inline} title={emptyMessage ?? '—'} />
@@ -112,6 +113,13 @@ export const Table = <T,>({
 				</tr>
 			</thead>
 			<tbody className={bodyClassName ?? DEFAULT_TBODY}>
+				{rows.length === 0 && (
+					<tr>
+						<td colSpan={Math.max(1, columns.length)} className={cellClassName}>
+							{emptyMessage ?? 'No rows'}
+						</td>
+					</tr>
+				)}
 				{rows.map((row, index) => (
 					<tr
 						key={rowKey(row, index)}

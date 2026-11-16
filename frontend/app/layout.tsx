@@ -4,7 +4,6 @@
 
 import type { Metadata } from 'next';
 import { headers } from 'next/headers';
-import { Geist, Geist_Mono } from 'next/font/google';
 import { TooltipProvider } from '@nvidia/foundations-react-core';
 import {
 	HydrationBoundary,
@@ -31,16 +30,6 @@ const isLoginOrOauthPath = (pathname: string): boolean =>
 	pathname.startsWith('/invite/') ||
 	pathname === '/oauth' ||
 	pathname.startsWith('/oauth/');
-
-const geistSans = Geist({
-	variable: '--font-geist-sans',
-	subsets: ['latin'],
-});
-
-const geistMono = Geist_Mono({
-	variable: '--font-geist-mono',
-	subsets: ['latin'],
-});
 
 export const metadata: Metadata = {
 	title: {
@@ -101,10 +90,7 @@ export default async function RootLayout({
 	const userId = session?.user.id ?? '';
 
 	return (
-		<html
-			lang="en"
-			className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-		>
+		<html lang="en" className="h-full antialiased">
 			<body className="flex h-full flex-col bg-white text-heading dark:bg-zinc-950 dark:text-zinc-100">
 				<QueryProvider>
 					<TooltipProvider openDelayDuration={400} skipDelayDuration={0}>

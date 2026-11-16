@@ -43,6 +43,7 @@ export const ChatView = () => {
 	const [selection, setSelection] = useState<ChatSelection>(exploreSelection);
 	const metricModels = useMetricChatModels(selection, canReadMetrics);
 	const [activeConvId, setActiveConvId] = useState<string | null>(focusId);
+	const [composerEpoch, setComposerEpoch] = useState(0);
 	const [observedFocus, setObservedFocus] = useState(focusId);
 	const [sidebarOpen, setSidebarOpen] = useState(false);
 	const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -75,6 +76,7 @@ export const ChatView = () => {
 	if (observedFocus !== focusId) {
 		setObservedFocus(focusId);
 		if (activeConvId !== focusId) {
+			setComposerEpoch((value) => value + 1);
 			setActiveConvId(focusId);
 			setSelection(exploreSelection());
 			setNotice(null);
@@ -152,6 +154,7 @@ export const ChatView = () => {
 	}, [focusId, historyRetry, setMessages, resumeIfRunning, clearConversation]);
 
 	const handleNewChat = useCallback(async () => {
+		setComposerEpoch((value) => value + 1);
 		viewEpochRef.current += 1;
 		setSubmitting(false);
 		clearConversation();
@@ -277,7 +280,7 @@ export const ChatView = () => {
 	const exploreBlocked =
 		selection.query_mode === 'explore' && semanticReady !== true && !messageListLoading;
 	return (
-		<div className="flex h-full bg-white dark:bg-zinc-950">
+		<div className="flex h-full min-h-0 overflow-hidden bg-white dark:bg-zinc-950">
 			<ChatSidebar
 				conversations={conversations}
 				activeId={activeConvId}
@@ -289,7 +292,7 @@ export const ChatView = () => {
 				onToggle={() => setSidebarOpen((open) => !open)}
 				sidebarLoading={sidebarLoading}
 			/>
-			<main className="flex min-w-0 flex-1 flex-col">
+			<main className="flex min-h-0 min-w-0 flex-1 flex-col">
 				<ChatModeControls
 					selection={selection}
 					onChange={(next) => {
@@ -336,6 +339,7 @@ export const ChatView = () => {
 							onSelectMetric={selectClarificationMetric}
 						/>
 						<ChatInput
+							key={composerEpoch}
 							onSend={handleSend}
 							onStop={() => {
 								viewEpochRef.current += 1;

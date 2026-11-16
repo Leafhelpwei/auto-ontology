@@ -6,11 +6,13 @@ name: Client CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "fix/**"]
   pull_request:
     branches: [main]
     paths:
-      - 'frontend/**'
+      - "frontend/**"
+      - "docs/openapi/backend.json"
+      - ".github/workflows/ci-client.yml"
 
 defaults:
   run:
@@ -18,7 +20,7 @@ defaults:
 
 jobs:
   lint_and_build:
-    name: Prettier, ESLint & Build
+    name: Prettier, ESLint, Vitest, TypeScript & Build
     runs-on: ubuntu-latest
 
     steps:
@@ -33,13 +35,13 @@ jobs:
         # deprecation warning it emits is the lesser cost.
         uses: pnpm/action-setup@v4
         with:
-          version: '10.33.0'
+          version: "10.34.3"
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: "24"
 
       - name: Get pnpm store directory
         shell: bash
@@ -61,6 +63,12 @@ jobs:
 
       - name: ESLint
         run: pnpm lint
+
+      - name: Unit and component regressions
+        run: pnpm test
+
+      - name: TypeScript
+        run: pnpm typecheck
 
       - name: Build
         run: pnpm build
@@ -99,7 +107,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: nvcr.io
-          username: '$oauthtoken'
+          username: "$oauthtoken"
           password: ${{ env.NGC_API_KEY }}
 
       - name: Build frontend image (no push)
@@ -115,3 +123,75 @@ jobs:
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
           provenance: false
+
+  browser_regressions:
+    name: Authenticated browser regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: auto_ontology
+          POSTGRES_PASSWORD: fixture_ci_only
+          POSTGRES_DB: auto_ontology
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U auto_ontology -d auto_ontology"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: auto_ontology
+      POSTGRES_PASSWORD: fixture_ci_only
+      POSTGRES_DATABASE: auto_ontology
+      APP_URL: http://127.0.0.1:3000
+      PYTHON_API_URL: http://127.0.0.1:3001
+      AUTH_SECRET: isolated-ci-auth-secret-at-least-thirty-two-characters
+      AUTO_ONTOLOGY_ADMIN_EMAIL: fixture-admin@example.test
+      AUTO_ONTOLOGY_ADMIN_PASSWORD: isolated-ci-admin-password
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.34.3"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          uv sync --locked --project ..
+          pnpm exec playwright install --with-deps chromium
+      - name: Prepare isolated schemas
+        run: |
+          cd ..
+          uv run --no-sync alembic upgrade head
+          cd frontend
+          pnpm db:push
+      - name: Build without external font downloads
+        run: pnpm build
+      - name: Start application services
+        run: |
+          cd ..
+          uv run --no-sync uvicorn auto_ontology.server.__main__:create_app --factory --host 127.0.0.1 --port 3001 > /tmp/ontology-backend.log 2>&1 &
+          cd frontend
+          pnpm exec next start --hostname 127.0.0.1 --port 3000 > /tmp/ontology-frontend.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3000/login > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Browser checks (no skip or retry)
+        run: pnpm exec playwright test
+      - name: Upload browser measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-browser-results
+          path: frontend/test-results/
+          retention-days: 7

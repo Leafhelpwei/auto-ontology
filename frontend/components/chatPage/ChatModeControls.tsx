@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChatSelection } from '@/types/chat';
+import { useState } from 'react';
 import type { useMetricChatModels } from '@/lib/useMetricChatModels';
 import { dialectLabel } from '@/lib/governedMetrics';
 import { Button } from '@/common/Button';
 import { ButtonTheme, Size } from '@/enums/button';
-import { CheckField, SelectField } from '@/components/metricsPage/MetricFields';
+import { CheckField, SelectField, TextField } from '@/components/metricsPage/MetricFields';
 
 export const ChatModeControls = ({
 	selection,
@@ -23,11 +24,18 @@ export const ChatModeControls = ({
 	canReadMetrics: boolean;
 }) => {
 	const context = selection.metric_context;
+	const [search, setSearch] = useState('');
+	const visibleMetrics =
+		metrics.revision?.payload.metrics.filter((metric) =>
+			`${metric.name} ${metric.metric_id} ${metric.family_id ?? ''} ${metric.description}`
+				.toLocaleLowerCase()
+				.includes(search.toLocaleLowerCase()),
+		) ?? [];
 	const missingChoice =
 		context && !metrics.activeModels.some((model) => model.model_id === context.model_id);
 	return (
 		<section
-			className="border-b border-zinc-200 px-4 py-3 dark:border-zinc-700"
+			className="max-h-[42dvh] shrink-0 overflow-y-auto border-b border-zinc-200 px-4 py-3 dark:border-zinc-700"
 			aria-label="Chat query mode"
 		>
 			<div className="mx-auto max-w-3xl space-y-3">
@@ -156,14 +164,22 @@ export const ChatModeControls = ({
 									{metrics.revision.revision} ·{' '}
 									{dialectLabel(metrics.revision.payload.dialect)}
 									{(context.selected_metric_ids ?? []).length
-										? ` · ${(context.selected_metric_ids ?? []).join(', ')}`
+										? ` · ${context.selected_metric_ids?.length} selected`
 										: ''}
 								</summary>
+								<TextField
+									label="Search metric variants"
+									value={search}
+									onChange={setSearch}
+								/>
+								<p role="status" className="mt-2 text-xs text-secondary">
+									{visibleMetrics.length} matching variants
+								</p>
 								<fieldset
 									disabled={disabled}
-									className="mt-3 grid gap-3 sm:grid-cols-2"
+									className="mt-3 grid max-h-[20dvh] gap-3 overflow-y-auto break-words sm:grid-cols-2"
 								>
-									{metrics.revision.payload.metrics.map((metric) => (
+									{visibleMetrics.map((metric) => (
 										<div key={metric.metric_id}>
 											<CheckField
 												label={`${metric.name} (${metric.metric_id})`}
@@ -195,6 +211,8 @@ export const ChatModeControls = ({
 											/>
 											<p className="mt-1 pl-6 text-xs text-secondary">
 												{metric.description}
+												{metric.family_id &&
+													` · Family: ${metric.family_id}`}
 											</p>
 										</div>
 									))}

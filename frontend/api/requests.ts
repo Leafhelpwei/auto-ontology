@@ -4,6 +4,7 @@
 
 import axios, { AxiosError, AxiosResponse } from 'axios';
 import { ApiError, PageParams, ResponseWithError } from './types';
+import { validationErrors } from './validationErrors';
 
 // Query params accepted by `requests.get`. Numbers/booleans are serialised by
 // axios at request time, so callers can pass them without stringifying first.
@@ -37,6 +38,8 @@ const extractServerMessage = (data: unknown): string | undefined => {
 	// out of their way to produce surfaced as "Request failed with status 400".
 	const { detail, error } = data as { detail?: unknown; error?: unknown };
 	if (typeof detail === 'string') return detail;
+	const fields = validationErrors(detail);
+	if (fields.length) return fields.map((field) => `${field.path}: ${field.message}`).join('; ');
 	if (
 		detail != null &&
 		typeof detail === 'object' &&
@@ -56,6 +59,7 @@ const errorHandler = (err: AxiosError): ApiError => {
 		error: true,
 		status: err.response?.status,
 		details,
+		fieldErrors: validationErrors(details),
 		code:
 			details != null &&
 			typeof details === 'object' &&

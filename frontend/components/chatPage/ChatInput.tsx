@@ -33,6 +33,9 @@ export const ChatInput = ({
 	placeholder = 'Ask a Question…',
 }: ChatInputProps) => {
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const composingRef = useRef(false);
+	const pendingRef = useRef(false);
+	const draftRevisionRef = useRef(0);
 	// Track whether the textarea currently has any non-whitespace text so the
 	// Send button can be disabled/greyed-out when there's nothing to send.
 	// We intentionally keep the textarea uncontrolled (perf + caret behaviour)
@@ -47,6 +50,7 @@ export const ChatInput = ({
 	};
 
 	const handleInput = useCallback((e: FormEvent<HTMLTextAreaElement>) => {
+		draftRevisionRef.current += 1;
 		resetHeight();
 		setHasText(e.currentTarget.value.trim().length > 0);
 	}, []);
@@ -56,8 +60,12 @@ export const ChatInput = ({
 			e?.preventDefault();
 			const el = textareaRef.current;
 			if (!el) return;
-			const text = el.value.trim();
-			if (!text || isLoading || disabled) return;
+			const draft = el.value;
+			const text = draft.trim();
+			if (!text || isLoading || disabled || pendingRef.current || composingRef.current)
+				return;
+			const revision = draftRevisionRef.current;
+			pendingRef.current = true;
 
 			// Clear straight away so sending feels immediate, then put the text
 			// back if the backend refused it — a rejected question is never added
@@ -66,12 +74,19 @@ export const ChatInput = ({
 			el.style.height = 'auto';
 			setHasText(false);
 
-			const accepted = await onSend(text);
+			let accepted = false;
+			try {
+				accepted = await onSend(text);
+			} catch {
+				accepted = false;
+			} finally {
+				pendingRef.current = false;
+			}
 			if (accepted) return;
 
 			const target = textareaRef.current;
-			if (!target || target.value.trim()) return;
-			target.value = text;
+			if (!target || target.value.trim() || revision !== draftRevisionRef.current) return;
+			target.value = draft;
 			resetHeight();
 			setHasText(true);
 		},
@@ -80,6 +95,8 @@ export const ChatInput = ({
 
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent<HTMLTextAreaElement>) => {
+			if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)
+				return;
 			if (e.key === 'Enter' && !e.shiftKey) {
 				e.preventDefault();
 				handleSubmit();
@@ -99,7 +116,7 @@ export const ChatInput = ({
 	return (
 		<form
 			onSubmit={handleSubmit}
-			className="border-t border-zinc-200 bg-white px-4 py-3 dark:border-zinc-700 dark:bg-zinc-900"
+			className="shrink-0 border-t border-zinc-200 bg-white px-4 py-3 dark:border-zinc-700 dark:bg-zinc-900"
 		>
 			<div className="mx-auto flex max-w-3xl items-end gap-2">
 				<textarea
@@ -108,8 +125,14 @@ export const ChatInput = ({
 					placeholder={placeholder}
 					disabled={disabled}
 					onInput={handleInput}
+					onCompositionStart={() => {
+						composingRef.current = true;
+					}}
+					onCompositionEnd={() => {
+						composingRef.current = false;
+					}}
 					onKeyDown={handleKeyDown}
-					className="flex-1 resize-none rounded-xl border border-zinc-300 bg-zinc-50 px-4 py-2.5 text-sm text-heading outline-none transition-colors placeholder:text-secondary focus:border-[#76b900] focus:ring-1 focus:ring-[#76b900] dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+					className="min-w-0 flex-1 resize-none rounded-xl border border-zinc-300 bg-zinc-50 px-4 py-2.5 text-sm text-heading outline-none transition-colors placeholder:text-secondary focus:border-[#76b900] focus:ring-1 focus:ring-[#76b900] dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-500"
 				/>
 
 				{isLoading ? (

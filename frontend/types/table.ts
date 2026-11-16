@@ -87,4 +87,6 @@ export type TableProps<T> = {
 	rowClickIsPointerShortcut?: boolean;
 	/** Empty-state title shown instead of the table when `rows` is empty. Defaults to `—`. */
 	emptyMessage?: ReactNode;
+	/** Retain query column headers on empty results. */
+	showEmptyHeaders?: boolean;
 };

@@ -5,7 +5,9 @@
 'use client';
 
 import { useMemo } from 'react';
-import type { ParsedTable, TableRow } from '@/lib/parseSqlResponse';
+type QueryRow = Record<string, unknown> | unknown[];
+const cellText = (value: unknown): string =>
+	value == null ? 'NULL' : typeof value === 'object' ? JSON.stringify(value) : String(value);
 import { EmptyState } from '@/common/EmptyState';
 import { Table, TABLE_THEAD_CLASSNAME } from '@/common/Table';
 import { EmptyStateVariant } from '@/enums/emptyState';
@@ -13,7 +15,7 @@ import { usePagination } from '@/hooks/usePagination';
 import type { TableColumn } from '@/types/table';
 
 type DynamicTableProps = {
-	table: ParsedTable;
+	table: { columns: string[]; rows: QueryRow[] };
 };
 
 export const DynamicTable = ({ table }: DynamicTableProps) => {
@@ -23,21 +25,21 @@ export const DynamicTable = ({ table }: DynamicTableProps) => {
 	// which chat result sets are large enough to feel.
 	const pageRows = useMemo(() => rows.slice(skip, skip + pageSize), [rows, skip, pageSize]);
 
-	const tableColumns = useMemo<TableColumn<TableRow>[]>(
+	const tableColumns = useMemo<TableColumn<QueryRow>[]>(
 		() =>
-			columns.map((col) => ({
-				key: col,
+			columns.map((col, index) => ({
+				key: String(index),
 				header: col,
 				truncate: true,
 				maxWidthClass: 'max-w-[240px]',
 				className: 'text-body dark:text-zinc-300',
-				cell: (row) => row[col],
-				title: (row) => row[col],
+				cell: (row) => cellText(Array.isArray(row) ? row[index] : row[col]),
+				title: (row) => cellText(Array.isArray(row) ? row[index] : row[col]),
 			})),
 		[columns],
 	);
 
-	if (columns.length === 0 || rows.length === 0) {
+	if (columns.length === 0) {
 		return <EmptyState variant={EmptyStateVariant.Inline} title="No Data Available" />;
 	}
 
@@ -45,6 +47,8 @@ export const DynamicTable = ({ table }: DynamicTableProps) => {
 		<Table
 			columns={tableColumns}
 			rows={pageRows}
+			showEmptyHeaders
+			emptyMessage="No rows matched this query."
 			rowKey={(_, index) => String(index)}
 			layout="auto"
 			textClassName="text-xs"

@@ -29,6 +29,13 @@ import type {
 import { Field, inputClass, panelClass, SelectField } from './MetricFields';
 import { ModelEditor } from './ModelEditor';
 import { MetricQueryPanel } from './MetricQueryPanel';
+import {
+	draftEvent,
+	readModelDrafts,
+	writeModelDraft,
+	removeModelDraft,
+	type ModelDraft,
+} from '@/lib/modelDrafts';
 
 const messageOf = (error: ApiError) => `${error.code ? `${error.code}: ` : ''}${error.message}`;
 const latestRevision = (detail: ModelDetail): ModelRevision | undefined =>
@@ -42,6 +49,7 @@ const ModelWorkspace = ({
 	onSaved,
 	onDirty,
 	onClose,
+	userId,
 }: {
 	detail?: ModelDetail;
 	initialModel?: GovernedModel;
@@ -50,8 +58,18 @@ const ModelWorkspace = ({
 	onSaved: (detail: ModelDetail) => void;
 	onDirty: (dirty: boolean) => void;
 	onClose: () => void;
+	userId: string;
 }) => {
 	const first = detail ? latestRevision(detail) : undefined;
+	const modelId = detail?.model_id ?? initialModel!.model_id;
+	const [recovery, setRecovery] = useState(() =>
+		readModelDrafts(userId).drafts.find((item) => item.model.model_id === modelId),
+	);
+	const draftToken = useRef(crypto.randomUUID());
+	const [baseVersion, setBaseVersion] = useState(detail?.version ?? null);
+	const [recoveryNotice, setRecoveryNotice] = useState('');
+	const [storageError, setStorageError] = useState('');
+	const [advancedJson, setAdvancedJson] = useState<string | null>(null);
 	const [revisionNumber, setRevisionNumber] = useState(first?.revision ?? 0);
 	const [model, setModel] = useState<GovernedModel>(first?.payload ?? initialModel!);
 	const [pendingJson, setPendingJson] = useState(false);
@@ -63,6 +81,46 @@ const ModelWorkspace = ({
 	const revision = detail?.revisions.find((item) => item.revision === revisionNumber);
 	const dirty = revision ? JSON.stringify(model) !== JSON.stringify(revision.payload) : true;
 	const hasUnsaved = dirty || pendingJson;
+	const versionConflict = Boolean(detail && baseVersion !== detail.version);
+	useEffect(() => {
+		if (!canEdit || recovery || (!hasUnsaved && !evidence)) return;
+		setStorageError(
+			writeModelDraft(userId, {
+				format: 1,
+				token: draftToken.current,
+				updatedAt: Date.now(),
+				baseVersion,
+				revision: revisionNumber,
+				model,
+				advanced: advancedJson,
+				evidence,
+			}),
+		);
+	}, [
+		userId,
+		canEdit,
+		recovery,
+		hasUnsaved,
+		evidence,
+		baseVersion,
+		revisionNumber,
+		model,
+		advancedJson,
+	]);
+	useEffect(() => {
+		if (!hasUnsaved && !evidence) return;
+		const warn = (event: BeforeUnloadEvent) => {
+			event.preventDefault();
+			event.returnValue = '';
+		};
+		window.addEventListener('beforeunload', warn);
+		return () => window.removeEventListener('beforeunload', warn);
+	}, [hasUnsaved, evidence]);
+	const clearRecovery = (token = draftToken.current) => {
+		setStorageError(removeModelDraft(userId, modelId, token));
+		setRecovery(undefined);
+		setRecoveryNotice('');
+	};
 	// Keep the parent navigation lock in sync even when applying JSON changes
 	// both the model and its pending buffer in one batched render.
 	useEffect(() => onDirty(hasUnsaved), [hasUnsaved, onDirty]);
@@ -74,11 +132,16 @@ const ModelWorkspace = ({
 			!revision || JSON.stringify(value) !== JSON.stringify(revision.payload) || pendingJson,
 		);
 	};
-	const updatePending = (pending: boolean) => {
+	const updatePending = (pending: boolean, json?: string) => {
 		setPendingJson(pending);
+		setAdvancedJson(pending ? (json ?? '') : null);
 		onDirty(dirty || pending);
 	};
 	const discard = () => {
+		clearRecovery(recovery?.token);
+		setEvidence('');
+		setAdvancedJson(null);
+		setBaseVersion(detail?.version ?? null);
 		if (!revision) {
 			onDirty(false);
 			onClose();
@@ -95,10 +158,11 @@ const ModelWorkspace = ({
 		setError(null);
 		try {
 			const response = detail
-				? await governedMetricsApi.save(model, detail.version)
+				? await governedMetricsApi.save(model, baseVersion ?? 0)
 				: await governedMetricsApi.create(model);
 			if (response.error) setError(response as ApiError);
 			else {
+				clearRecovery();
 				onDirty(false);
 				onSaved(response.data);
 			}
@@ -110,6 +174,8 @@ const ModelWorkspace = ({
 		if (
 			!detail ||
 			!revision ||
+			recovery ||
+			versionConflict ||
 			!canTransitionRevision(action, {
 				status: revision.status,
 				dirty,
@@ -131,7 +197,10 @@ const ModelWorkspace = ({
 				evidence,
 			);
 			if (response.error) setError(response as ApiError);
-			else onSaved(response.data);
+			else {
+				clearRecovery();
+				onSaved(response.data);
+			}
 		} finally {
 			setBusy(false);
 		}
@@ -150,6 +219,8 @@ const ModelWorkspace = ({
 	};
 	const allowed = (action: 'validate' | 'certify' | 'activate' | 'deprecate') =>
 		revision &&
+		!recovery &&
+		!versionConflict &&
 		canTransitionRevision(action, {
 			status: revision.status,
 			dirty,
@@ -189,7 +260,7 @@ const ModelWorkspace = ({
 								Discard edits
 							</Button>
 							<Button
-								disabled={busy || !dirty || pendingJson}
+								disabled={busy || !dirty || pendingJson || Boolean(recovery)}
 								loading={busy}
 								onClick={() => void save()}
 							>
@@ -199,6 +270,79 @@ const ModelWorkspace = ({
 					)}
 				</div>
 			</div>
+			{recovery && (
+				<section role="status" className={`${panelClass} space-y-3`}>
+					<p>
+						A recoverable draft from {new Date(recovery.updatedAt).toLocaleString()} is
+						available. It includes unapplied JSON. Restoring keeps its original server
+						version.
+					</p>
+					<div className="flex flex-wrap gap-2">
+						<Button
+							disabled={!canEdit}
+							onClick={() => {
+								setModel(recovery.model);
+								setRevisionNumber(recovery.revision);
+								setBaseVersion(recovery.baseVersion);
+								setAdvancedJson(recovery.advanced);
+								setPendingJson(recovery.advanced !== null);
+								setEvidence(recovery.evidence);
+								setEditorEpoch((value) => value + 1);
+								setRecovery(undefined);
+								setRecoveryNotice(
+									'Browser draft restored. Review and save it as a new draft revision.',
+								);
+							}}
+						>
+							Restore browser draft
+						</Button>
+						<Button
+							theme={ButtonTheme.Secondary}
+							onClick={() => clearRecovery(recovery.token)}
+						>
+							Discard recovery copy
+						</Button>
+						<Button
+							theme={ButtonTheme.Secondary}
+							onClick={() => downloadJson(`${modelId}-recovery.json`, recovery)}
+						>
+							Download recovery copy
+						</Button>
+					</div>
+				</section>
+			)}
+			{recoveryNotice && (
+				<p role="status" className="text-sm">
+					{recoveryNotice}
+				</p>
+			)}
+			{versionConflict && (
+				<p role="alert" className="text-sm text-amber-700 dark:text-amber-300">
+					The recovered draft was based on server version {baseVersion}. The server is now
+					at version {detail?.version}. Your edits are retained; saving uses the original
+					version and cannot overwrite newer work. Download edits or discard to use the
+					latest version.
+				</p>
+			)}
+			{storageError && (
+				<div role="alert" className="space-y-2 text-sm text-red-700 dark:text-red-300">
+					<p>{storageError}</p>
+					<Button
+						theme={ButtonTheme.Secondary}
+						onClick={() =>
+							downloadJson(`${modelId}-local-edits.json`, {
+								model,
+								advanced: advancedJson,
+								baseVersion,
+								revision: revisionNumber,
+								evidence,
+							})
+						}
+					>
+						Download local recovery
+					</Button>
+				</div>
+			)}
 			{error && (
 				<div
 					role="alert"
@@ -229,6 +373,7 @@ const ModelWorkspace = ({
 										);
 										if (response.error) setError(response as ApiError);
 										else {
+											clearRecovery();
 											onDirty(false);
 											onSaved(response.data);
 										}
@@ -268,6 +413,8 @@ const ModelWorkspace = ({
 									setRevisionNumber(next.revision);
 									setModel(next.payload);
 									setPendingJson(false);
+									setAdvancedJson(null);
+									setEvidence('');
 									setEditorEpoch((value) => value + 1);
 									setError(null);
 								}
@@ -401,7 +548,8 @@ const ModelWorkspace = ({
 					model={model}
 					onChange={handleModel}
 					onPendingChange={updatePending}
-					disabled={!canEdit || busy || Boolean(detail?.archived)}
+					initialAdvanced={advancedJson}
+					disabled={!canEdit || busy || Boolean(detail?.archived) || Boolean(recovery)}
 				/>
 			</div>
 			{revision && (
@@ -435,6 +583,32 @@ export const MetricsWorkspace = () => {
 	const [importing, setImporting] = useState(false);
 	const [notice, setNotice] = useState('');
 	const [error, setError] = useState('');
+	const userId = session?.user.id ?? '';
+	const [localDrafts, setLocalDrafts] = useState<ModelDraft[]>([]);
+	useEffect(() => {
+		const refresh = () => setLocalDrafts(userId ? readModelDrafts(userId).drafts : []);
+		refresh();
+		window.addEventListener(draftEvent, refresh);
+		window.addEventListener('storage', refresh);
+		return () => {
+			window.removeEventListener(draftEvent, refresh);
+			window.removeEventListener('storage', refresh);
+		};
+	}, [userId]);
+	const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
+	const activeEpoch = useRef(0);
+	const mounted = useRef(true);
+	useEffect(() => {
+		mounted.current = true;
+		return () => {
+			mounted.current = false;
+		};
+	}, []);
+	const changeWorkspace = () => {
+		activeEpoch.current += 1;
+		setWorkspaceEpoch(activeEpoch.current);
+	};
+	const currentWorkspace = (epoch: number) => mounted.current && activeEpoch.current === epoch;
 	const config = useQuery({
 		queryKey: ['governed-metrics', 'config'],
 		queryFn: async () => {
@@ -461,14 +635,19 @@ export const MetricsWorkspace = () => {
 			return response.data;
 		},
 	});
-	const saved = (value: ModelDetail) => {
-		queryClient.setQueryData(['governed-metrics', 'model', value.model_id], value);
+	const saved = (value: ModelDetail, epoch: number) => {
+		const key = ['governed-metrics', 'model', value.model_id];
+		const cached = queryClient.getQueryData<ModelDetail>(key);
+		if (cached && cached.version > value.version) return;
+		queryClient.setQueryData(key, value);
 		void queryClient.invalidateQueries({ queryKey: ['governed-metrics', 'models'] });
+		if (!currentWorkspace(epoch)) return;
 		setSelectedId(value.model_id);
 		setCreating(null);
 		setDirty(false);
 	};
 	const importFile = async (file: File) => {
+		const epoch = activeEpoch.current;
 		setImporting(true);
 		setError('');
 		setNotice('');
@@ -477,14 +656,16 @@ export const MetricsWorkspace = () => {
 			const model = prepareDraftImport(await file.text());
 			const response = await governedMetricsApi.import(model);
 			if (response.error) throw new Error(response.message);
-			saved(response.data);
+			saved(response.data, epoch);
+			if (!currentWorkspace(epoch)) return;
 			setNotice(
 				'Imported as a new draft. Exported certification and active status were not applied. Rebind Catalog identifiers and validate before certification.',
 			);
 		} catch (error) {
-			setError(error instanceof Error ? error.message : 'Import failed.');
+			if (currentWorkspace(epoch))
+				setError(error instanceof Error ? error.message : 'Import failed.');
 		} finally {
-			setImporting(false);
+			if (mounted.current) setImporting(false);
 			if (fileRef.current) fileRef.current.value = '';
 		}
 	};
@@ -545,6 +726,7 @@ export const MetricsWorkspace = () => {
 							<Button
 								disabled={dirty || importing}
 								onClick={() => {
+									changeWorkspace();
 									setCreating(newModel(dialect));
 									setSelectedId(null);
 									setDirty(true);
@@ -585,6 +767,27 @@ export const MetricsWorkspace = () => {
 				<div className="grid gap-6 xl:grid-cols-[240px_minmax(0,1fr)]">
 					<aside className="space-y-3">
 						<h2 className="text-sm font-semibold">Models</h2>
+						{canEdit && localDrafts.some((draft) => draft.baseVersion === null) && (
+							<section className="space-y-2">
+								<h3 className="text-sm font-medium">Unsaved new models</h3>
+								{localDrafts
+									.filter((draft) => draft.baseVersion === null)
+									.map((draft) => (
+										<Button
+											key={draft.model.model_id}
+											theme={ButtonTheme.Secondary}
+											disabled={dirty || importing}
+											onClick={() => {
+												changeWorkspace();
+												setCreating(draft.model);
+												setSelectedId(null);
+											}}
+										>
+											Recover {draft.model.name}
+										</Button>
+									))}
+							</section>
+						)}
 						{list.isPending && (
 							<p role="status" className="text-sm text-secondary">
 								Loading models…
@@ -602,6 +805,7 @@ export const MetricsWorkspace = () => {
 										type="button"
 										disabled={dirty || importing}
 										onClick={() => {
+											changeWorkspace();
 											setSelectedId(model.model_id);
 											setCreating(null);
 											setNotice('');
@@ -638,21 +842,33 @@ export const MetricsWorkspace = () => {
 							<ModelWorkspace
 								key={creating.model_id}
 								initialModel={creating}
+								userId={userId}
 								canEdit={canEdit}
 								enabled={config.data?.enabled === true}
-								onSaved={saved}
-								onDirty={setDirty}
-								onClose={() => setCreating(null)}
+								onSaved={(value) => saved(value, workspaceEpoch)}
+								onDirty={(value) => {
+									if (currentWorkspace(workspaceEpoch)) setDirty(value);
+								}}
+								onClose={() => {
+									changeWorkspace();
+									setCreating(null);
+								}}
 							/>
 						) : detail.data ? (
 							<ModelWorkspace
 								key={`${detail.data.model_id}:${detail.data.version}`}
 								detail={detail.data}
+								userId={userId}
 								canEdit={canEdit}
 								enabled={config.data?.enabled === true}
-								onSaved={saved}
-								onDirty={setDirty}
-								onClose={() => setSelectedId(null)}
+								onSaved={(value) => saved(value, workspaceEpoch)}
+								onDirty={(value) => {
+									if (currentWorkspace(workspaceEpoch)) setDirty(value);
+								}}
+								onClose={() => {
+									changeWorkspace();
+									setSelectedId(null);
+								}}
 							/>
 						) : selectedId && detail.isPending ? (
 							<p role="status" className="text-sm">

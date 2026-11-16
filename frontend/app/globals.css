@@ -8,6 +8,9 @@
 @import 'tailwindcss';
 
 @theme {
+	/* Local system fonts keep builds and private deployments independent of Google Fonts. */
+	--font-sans: 'Segoe UI', 'Noto Sans', 'Microsoft YaHei', Arial, sans-serif;
+	--font-mono: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
 	--color-foreground: #09090b;
 
 	/*

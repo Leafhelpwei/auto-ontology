@@ -37,6 +37,10 @@ export const TextField = ({
 	hint,
 	disabled = false,
 	type = 'text',
+	error,
+	min,
+	max,
+	step,
 }: {
 	label: string;
 	value: string | number;
@@ -44,17 +48,40 @@ export const TextField = ({
 	hint?: string;
 	disabled?: boolean;
 	type?: string;
-}) => (
-	<Field label={label} hint={hint}>
-		<input
-			className={inputClass}
-			type={type}
-			value={value}
-			onChange={(event) => onChange(event.target.value)}
-			disabled={disabled}
-		/>
-	</Field>
-);
+	error?: string;
+	min?: number;
+	max?: number;
+	step?: number;
+}) => {
+	const id = useId();
+	return (
+		<div>
+			<Field label={label} hint={hint}>
+				<input
+					className={inputClass}
+					type={type}
+					value={value}
+					min={min}
+					max={max}
+					step={step}
+					aria-invalid={Boolean(error)}
+					aria-describedby={error ? `${id}-error` : undefined}
+					onChange={(event) => onChange(event.target.value)}
+					disabled={disabled}
+				/>
+			</Field>
+			{error && (
+				<p
+					id={`${id}-error`}
+					role="alert"
+					className="mt-1 text-xs text-red-700 dark:text-red-300"
+				>
+					{error}
+				</p>
+			)}
+		</div>
+	);
+};
 export const SelectField = ({
 	label,
 	value,

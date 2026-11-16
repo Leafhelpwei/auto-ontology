@@ -226,30 +226,36 @@ export const auth = betterAuth({
 		//
 		// `loginPage` is where an unauthenticated authorize request is sent; from
 		// there the existing SSO flow takes over, so human login is unchanged.
-		mcp({
-			loginPage: '/login',
-			consentPage: '/oauth/consent',
-			resource: mcpResource(),
-			// UserInfo requires `openid`. Advertise it so MCP clients that copy
-			// `scopes_supported` from authorization-server metadata include it.
-			scopes: ['openid', 'profile', 'email', 'offline_access'],
-			// The MCP server checks every token against Auto Ontology, so opaque tokens retain
-			// immediate revocation without distributing resource-server credentials.
-			disableJwtPlugin: true,
-			// Keep RFC 7591 registration for existing MCP clients. Both switches are
-			// required in 1.7; registration is no longer enabled by `mcp()` itself.
-			allowDynamicClientRegistration: true,
-			allowUnauthenticatedClientRegistration: true,
-			// UserInfo is the bearer-authenticated replacement for getMcpSession.
-			// Include the grant metadata FastMCP needs under private claim names.
-			customUserInfoClaims: ({ jwt }) => ({
-				'urn:auto-ontology:oauth:client_id': jwt.client_id,
-				'urn:auto-ontology:oauth:scope': jwt.scope,
+		{
+			...mcp({
+				loginPage: '/login',
+				consentPage: '/oauth/consent',
+				resource: mcpResource(),
+				// UserInfo requires `openid`. Advertise it so MCP clients that copy
+				// `scopes_supported` from authorization-server metadata include it.
+				scopes: ['openid', 'profile', 'email', 'offline_access'],
+				// The MCP server checks every token against Auto Ontology, so opaque tokens retain
+				// immediate revocation without distributing resource-server credentials.
+				disableJwtPlugin: true,
+				// Keep RFC 7591 registration for existing MCP clients. Both switches are
+				// required in 1.7; registration is no longer enabled by `mcp()` itself.
+				allowDynamicClientRegistration: true,
+				allowUnauthenticatedClientRegistration: true,
+				// UserInfo is the bearer-authenticated replacement for getMcpSession.
+				// Include the grant metadata FastMCP needs under private claim names.
+				customUserInfoClaims: ({ jwt }) => ({
+					'urn:auto-ontology:oauth:client_id': jwt.client_id,
+					'urn:auto-ontology:oauth:scope': jwt.scope,
+				}),
+				// Every MCP call validates its token here. The app-wide limiter still
+				// applies; the provider's 60/minute UserInfo limit is too low for agents.
+				rateLimit: { userinfo: false },
 			}),
-			// Every MCP call validates its token here. The app-wide limiter still
-			// applies; the provider's 60/minute UserInfo limit is too low for agents.
-			rateLimit: { userinfo: false },
-		}),
+			// The 1.7 provider seeds oauthResource during init. Build workers only
+			// inspect route modules; no database or authentication request exists.
+			// Runtime keeps the original initializer, including session revocation hooks.
+			...(isBuildPhase ? { init: undefined } : {}),
+		},
 		// Must be the last plugin so it can set cookies on outgoing responses.
 		nextCookies(),
 	],

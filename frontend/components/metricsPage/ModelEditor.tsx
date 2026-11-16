@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useState } from 'react';
+import { nextStableIndex, unsafeModelEdit } from '@/lib/modelIntegrity';
 import { Button } from '@/common/Button';
 import { ButtonTheme, Size } from '@/enums/button';
 import { dialectLabel, newMetric, newSource, parseModel, splitIds } from '@/lib/governedMetrics';
@@ -214,7 +215,10 @@ const SourceEditor = ({
 								fields: [
 									...source.fields,
 									{
-										field_id: `field_${source.fields.length + 1}`,
+										field_id: `field_${nextStableIndex(
+											'field',
+											source.fields.map((item) => item.field_id),
+										)}`,
 										catalog_column_id: '',
 										column_name: '',
 										data_type: 'string',
@@ -307,7 +311,10 @@ const SourceEditor = ({
 								dimensions: [
 									...source.dimensions,
 									{
-										dimension_id: `dimension_${source.dimensions.length + 1}`,
+										dimension_id: `dimension_${nextStableIndex(
+											'dimension',
+											source.dimensions.map((item) => item.dimension_id),
+										)}`,
 										field: { source_id: source.source_id, field_id: '' },
 										relationship_path: [],
 									},
@@ -776,20 +783,46 @@ const MetricEditor = ({
 
 export const ModelEditor = ({
 	model,
-	onChange,
+	onChange: commit,
 	disabled,
 	onPendingChange,
+	initialAdvanced = null,
 }: {
 	model: GovernedModel;
 	onChange: (model: GovernedModel) => void;
 	disabled: boolean;
-	onPendingChange: (pending: boolean) => void;
+	onPendingChange: (pending: boolean, json?: string) => void;
+	initialAdvanced?: string | null;
 }) => {
 	const [section, setSection] = useState('metrics');
-	const [advanced, setAdvanced] = useState<string | null>(null);
+	const [advanced, setAdvanced] = useState<string | null>(initialAdvanced);
 	const [error, setError] = useState('');
+	const [referenceError, setReferenceError] = useState<string[]>([]);
+	const onChange = (next: GovernedModel): boolean => {
+		const problems = unsafeModelEdit(model, next);
+		setReferenceError(problems);
+		if (problems.length) return false;
+		commit(next);
+		return true;
+	};
 	return (
 		<div className="space-y-5">
+			{referenceError.length > 0 && (
+				<div
+					role="alert"
+					className="rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200"
+				>
+					<p>
+						This edit would create duplicate IDs or break references. Update the listed
+						dependencies first, or apply an atomic JSON edit.
+					</p>
+					<ul className="mt-2 list-disc pl-5">
+						{referenceError.map((issue) => (
+							<li key={issue}>{issue}</li>
+						))}
+					</ul>
+				</div>
+			)}
 			<fieldset
 				disabled={disabled || advanced !== null}
 				className="space-y-5 disabled:opacity-70"
@@ -863,7 +896,13 @@ export const ModelEditor = ({
 									...model,
 									sources: [
 										...model.sources,
-										newSource(model.sources.length + 1, model.dialect),
+										newSource(
+											nextStableIndex(
+												'source',
+												model.sources.map((item) => item.source_id),
+											),
+											model.dialect,
+										),
 									],
 								})
 							}
@@ -905,7 +944,12 @@ export const ModelEditor = ({
 									relationships: [
 										...model.relationships,
 										{
-											relationship_id: `relationship_${model.relationships.length + 1}`,
+											relationship_id: `relationship_${nextStableIndex(
+												'relationship',
+												model.relationships.map(
+													(item) => item.relationship_id,
+												),
+											)}`,
 											source_id: '',
 											target_id: '',
 											role: '',
@@ -953,7 +997,10 @@ export const ModelEditor = ({
 									metrics: [
 										...model.metrics,
 										newMetric(
-											model.metrics.length + 1,
+											nextStableIndex(
+												'metric',
+												model.metrics.map((item) => item.metric_id),
+											),
 											model.sources[0]?.source_id,
 										),
 									],
@@ -965,7 +1012,7 @@ export const ModelEditor = ({
 					</div>
 				)}
 			</fieldset>
-			<details className={panelClass}>
+			<details className={panelClass} open={initialAdvanced !== null || undefined}>
 				<summary className="cursor-pointer font-medium">
 					Advanced JSON · typed expressions and full contract
 				</summary>
@@ -983,7 +1030,7 @@ export const ModelEditor = ({
 						disabled={disabled}
 						onChange={(event) => {
 							setAdvanced(event.target.value);
-							onPendingChange(true);
+							onPendingChange(true, event.target.value);
 							setError('');
 						}}
 					/>
@@ -1002,7 +1049,7 @@ export const ModelEditor = ({
 										throw new Error(
 											'Model ID cannot change in an existing editor. Import as a new draft instead.',
 										);
-									onChange(parsed);
+									if (!onChange(parsed)) return;
 									setAdvanced(null);
 									onPendingChange(false);
 									setError('');
