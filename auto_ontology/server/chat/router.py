@@ -630,7 +630,7 @@ async def chat_completions(
     runs the question statelessly: no history, no persisted turn, and no chart
     step (``_build_charts_event`` needs a conversation to save into).
     """
-    logger.info("Chat completions request: %s", request.model_dump())
+    logger.info("Chat request mode=%s question_chars=%d", request.query_mode, len(request.question))
 
     if request.query_mode == "explore" and not semantic_layer_calculated():
         raise HTTPException(status_code=409, detail=_SEMANTIC_MISSING_MSG)

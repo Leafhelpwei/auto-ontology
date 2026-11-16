@@ -15,6 +15,9 @@ from pydantic import BaseModel
 
 from auto_ontology.dal.connections import list_connections as _list_connections
 from auto_ontology.server.connections import service
+from auto_ontology.server.connections.dto import (
+    PUBLIC_FIELDS as PUBLIC_CONNECTION_FIELDS,
+)
 from auto_ontology.server.responses import (
     ConnectionListResponse,
     ConnectionResponse,
@@ -45,7 +48,7 @@ def _serialize_connection(connection: dict[str, Any]) -> PublicConnection:
     public_connection = {
         key: value
         for key, value in connection.items()
-        if key not in service.SECRET_FIELDS
+        if key in PUBLIC_CONNECTION_FIELDS
     }
     return {
         "database_name": str(connection.get("database") or ""),
@@ -94,7 +97,7 @@ def test_connection(body: ConnectionTestBody) -> dict:
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Connection test failed: {exc}",
+            detail="Connection test failed; check endpoint, TLS settings and credentials",
         ) from exc
     return {"success": True, "schemas": schemas}
 
@@ -115,7 +118,7 @@ def create_connection(body: ConnectionBody) -> dict:
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Failed to create connection: {exc}",
+            detail="Failed to create connection",
         ) from exc
 
     return {"data": _serialize_connection(row)}

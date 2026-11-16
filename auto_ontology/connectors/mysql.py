@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Callable, Iterator
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import mysql.connector
 from mysql.connector.conversion import MySQLConverter
@@ -20,6 +20,8 @@ import pandas as pd
 
 from auto_ontology.catalog.constants import TableTypes
 from auto_ontology.connectors.base import SQLDatabase, StatementTimeout
+
+from auto_ontology.connectors.mysql_tls import TLS_FIELDS, mysql_tls_options
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,12 @@ def _parse_connection_string(connection_string: str) -> dict[str, Any]:
     if not database:
         raise ValueError("MySQL connection string is missing a database")
 
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - TLS_FIELDS or any(len(values) != 1 for values in query.values()):
+        raise ValueError("Unsupported or duplicated MySQL connection parameter")
+    tls = mysql_tls_options({key: value[0] for key, value in query.items()})
     return {
+        **tls,
         "host": parsed.hostname,
         "port": parsed.port or 3306,
         "user": unquote(parsed.username or ""),

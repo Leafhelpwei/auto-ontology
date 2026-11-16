@@ -24,6 +24,9 @@ def test_parse_connection_string() -> None:
     )
 
     assert kwargs == {
+        "ssl_disabled": False,
+        "ssl_verify_cert": True,
+        "ssl_verify_identity": True,
         "host": "example.com",
         "port": 3307,
         "user": "user@domain",
@@ -124,6 +127,10 @@ def _live_connection() -> dict[str, Any]:
     port = os.environ.get("MYSQL_PORT")
     if port:
         connection["port"] = port
+    if os.environ.get("MYSQL_SSL_CA"):
+        connection["ssl_ca"] = os.environ["MYSQL_SSL_CA"]
+    if os.environ.get("MYSQL_SSL_MODE"):
+        connection["ssl_mode"] = os.environ["MYSQL_SSL_MODE"]
     return connection
 
 

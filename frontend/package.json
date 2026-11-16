@@ -14,7 +14,9 @@
 		"lint": "eslint .",
 		"openapi": "tsx scripts/generate-openapi.ts",
 		"format": "prettier --write .",
-		"format:check": "prettier --check ."
+		"format:check": "prettier --check .",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@better-auth/api-key": "1.7.4",
@@ -42,8 +44,10 @@
 		"zod": "^4.4.3"
 	},
 	"devDependencies": {
+		"@playwright/test": "1.65.1",
 		"@svgr/webpack": "^8.1.0",
 		"@tailwindcss/postcss": "^4",
+		"@testing-library/react": "16.3.3",
 		"@types/d3-force": "^3.0.10",
 		"@types/node": "^20",
 		"@types/pg": "^8.20.0",
@@ -51,6 +55,7 @@
 		"@types/react-dom": "^19",
 		"eslint": "^9",
 		"eslint-config-next": "16.3.8",
+		"jsdom": "31.0.1",
 		"prettier": "^3.8.1",
 		"prisma": "^7.7.0",
 		"tailwindcss": "^4",

@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import base64
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+from auto_ontology.connectors.mysql_tls import TLS_FIELDS, mysql_tls_options
 
 DEFAULT_POSTGRES_PORT = "5432"
 DEFAULT_MYSQL_PORT = "3306"
@@ -25,7 +26,15 @@ DEFAULT_HEAVYDB_PROTOCOL = "binary"
 
 
 def _require(connection: Mapping[str, Any], key: str) -> str:
-    value = str(connection.get(key) or "").strip()
+    value = str(connection.get(key) or "")
+    if key not in {
+        "password",
+        "private_key",
+        "private_key_passphrase",
+        "truststore_password",
+        "access_token_override",
+    }:
+        value = value.strip()
     if not value:
         raise ValueError(f"Connection is missing required field: {key!r}")
     return value
@@ -70,7 +79,14 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         password = _require(connection, "password")
         database = _require(connection, "database")
         port = str(connection.get("port") or "").strip() or DEFAULT_MYSQL_PORT
-        return f"mysql://{_enc(user)}:{_enc(password)}@{host}:{port}/{_enc(database)}"
+        mysql_tls_options(connection)
+        options = {
+            key: str(value).lower() if isinstance(value, bool) else value
+            for key, value in connection.items()
+            if key in TLS_FIELDS and value not in (None, "")
+        }
+        url = f"mysql://{_enc(user)}:{_enc(password)}@{host}:{port}/{_enc(database)}"
+        return url + ("?" + urlencode(options) if options else "")
 
     if conn_type == "snowflake":
         account = _require(connection, "account")
@@ -83,10 +99,10 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         # forbid them on SERVICE users, so a key pair is the only credential an
         # unattended service can use. Password auth stays supported for accounts
         # that still permit it.
-        private_key = str(connection.get("private_key") or "").strip()
+        private_key = str(connection.get("private_key") or "")
         if private_key:
             params += f"&private_key={_enc(_encode_private_key(private_key))}"
-            passphrase = str(connection.get("private_key_passphrase") or "").strip()
+            passphrase = str(connection.get("private_key_passphrase") or "")
             if passphrase:
                 params += f"&private_key_passphrase={_enc(passphrase)}"
             return f"snowflake://{_enc(user)}@{account}?{params}"
@@ -102,7 +118,7 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         # ``access_token_override`` carries a Databricks token exchanged from the
         # caller's SSO identity, so the query runs with that user's privileges
         # instead of the connection's stored PAT.
-        access_token = str(connection.get("access_token_override") or "").strip()
+        access_token = str(connection.get("access_token_override") or "")
         federated = bool(access_token)
         if not access_token:
             access_token = _require(connection, "password")
@@ -146,9 +162,7 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         elif truststore:
             params.append(f"truststore={_enc(truststore)}")
         if truststore_file or truststore:
-            truststore_password = str(
-                connection.get("truststore_password") or ""
-            ).strip()
+            truststore_password = str(connection.get("truststore_password") or "")
             if truststore_password:
                 params.append(f"truststore_password={_enc(truststore_password)}")
 
@@ -169,7 +183,7 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         # for a development Trino -- takes the username as a plain identity label
         # and rejects any credential, so an empty password must produce a URL with
         # no password rather than an empty one.
-        password = str(connection.get("password") or "").strip()
+        password = str(connection.get("password") or "")
         credentials = f"{_enc(user)}:{_enc(password)}" if password else _enc(user)
 
         params = []
@@ -224,7 +238,7 @@ def build_connection_string(connection: Mapping[str, Any]) -> str:
         # silently downgrade the connection to unauthenticated and surface as an
         # auth failure the form gives no way to explain.
         user = str(connection.get("user") or "").strip()
-        password = str(connection.get("password") or "").strip()
+        password = str(connection.get("password") or "")
         credentials = ""
         if password:
             credentials = f"{_enc(user)}:{_enc(password)}@"

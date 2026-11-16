@@ -533,3 +533,13 @@ External materials Auto-Ontology interacts with at run time:
 ## Security
 
 Report security vulnerabilities as described in [SECURITY.md](./SECURITY.md).
+
+## Audit recovery and connection security
+
+The [60-item rebuild tracker](docs/audit/REBUILD_STATUS.zh-CN.md) records implementation and acceptance separately. Previous unpushed work is not evidence for this branch.
+
+MySQL sources verify the CA and server hostname by default (`ssl_mode=VERIFY_IDENTITY`). Supply `ssl_ca`, optionally a paired `ssl_cert` and `ssl_key`, as paths mounted consistently on the backend and workers. `VERIFY_CA` is available explicitly; plaintext development connections require `ssl_mode=DISABLED`. Unknown or conflicting TLS options are rejected. Tests, queries, snapshots and cancellation connections share the same policy.
+
+Blank secret fields in an edit preserve the existing value; the clear action explicitly removes it. Supplied passwords and passphrases retain whitespace. Public connection APIs reject internal federation overrides and return only public fields.
+
+SSO bearer tokens require the configured OIDC client audience or an explicit `AUTO_ONTOLOGY_SSO_AUDIENCES` entry and an existing provider/subject binding. Email alone never grants a local account's permissions. Every credential path checks the current local account status.

@@ -14,8 +14,7 @@
 //      through Auto Ontology — see auth/oauth-token.ts). Opaque like an API token, so it
 //      is checked after that path has claimed the `auto_ontology_` prefix.
 //   4. An SSO id token (e.g. AI-Q), which authenticates with the same NVIDIA SSO
-//      identity but has no Auto Ontology session, so it is mapped to the Auto Ontology user sharing
-//      the token's email, falling back to the SSO account link by subject.
+//      identity but has no Auto Ontology session, so it is mapped only through an existing provider/subject account link.
 
 import { headers } from 'next/headers';
 import { getCurrentSession } from '@/auth/auth-guards';
@@ -29,14 +28,20 @@ export type ResolvedUser = { id: string; role: string | null };
 /**
  * Resolve the Auto Ontology user behind the current request — from the session cookie, a
  * Auto Ontology API token, a Auto Ontology-issued OAuth access token, or a verified SSO bearer token
- * (matched by email, then by SSO account subject). Returns null when the caller
+ * (matched by provider and SSO subject, never by email). Returns null when the caller
  * is unauthenticated or has no matching Auto Ontology user. This is the single entry point
  * browser, script, and service callers all go through, so every protected API
  * accepts any of the four credentials.
  */
 export async function resolveUser(): Promise<ResolvedUser | null> {
 	const session = await getCurrentSession();
-	if (session?.user.id) return { id: session.user.id, role: session.user.role ?? null };
+	if (session?.user.id) {
+		const user = await getPrisma().user.findUnique({
+			where: { id: session.user.id },
+			select: { id: true, role: true, banned: true },
+		});
+		return user && !user.banned ? { id: user.id, role: user.role } : null;
+	}
 
 	const requestHeaders = await headers();
 
@@ -55,21 +60,12 @@ export async function resolveUser(): Promise<ResolvedUser | null> {
 
 	const prisma = getPrisma();
 
-	if (principal.email) {
-		const user = await prisma.user.findFirst({
-			where: { email: principal.email },
-			select: { id: true, role: true },
-		});
-		if (user) return { id: user.id, role: user.role };
-	}
-
-	if (principal.subject) {
-		const account = await prisma.account.findFirst({
-			where: { accountId: principal.subject },
-			select: { user: { select: { id: true, role: true } } },
-		});
-		if (account?.user) return { id: account.user.id, role: account.user.role };
-	}
+	const account = await prisma.account.findFirst({
+		where: { accountId: principal.subject, providerId: principal.providerId },
+		select: { user: { select: { id: true, role: true, banned: true, emailVerified: true } } },
+	});
+	const user = account?.user;
+	if (user && !user.banned && user.emailVerified) return { id: user.id, role: user.role };
 
 	return null;
 }

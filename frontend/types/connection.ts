@@ -41,6 +41,10 @@ export type MySqlConnectionParams = {
 	user: string;
 	password: string;
 	database: string;
+	ssl_mode?: 'VERIFY_IDENTITY' | 'VERIFY_CA' | 'DISABLED';
+	ssl_ca?: string;
+	ssl_cert?: string;
+	ssl_key?: string;
 };
 
 export type SnowflakeConnectionParams = {

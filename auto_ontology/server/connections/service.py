@@ -29,20 +29,13 @@ from auto_ontology.dal.connections import (
     list_connections,
 )
 
-logger = logging.getLogger(__name__)
-
-# Credentials, stripped from every payload the UI receives. An edit form
-# therefore opens with these blank, which is why the update path reads blank as
-# "unchanged" rather than "clear it".
-SECRET_FIELDS = frozenset(
-    {
-        "password",
-        "password_env",
-        "private_key",
-        "private_key_passphrase",
-        "truststore_password",
-    }
+from auto_ontology.server.connections.dto import (
+    validate_connection_fields,
+    SECRET_FIELDS,
 )
+from auto_ontology.connectors.mysql_tls import mysql_tls_options
+
+logger = logging.getLogger(__name__)
 
 
 def _database_already_connected(database_name: str) -> bool:
@@ -75,8 +68,11 @@ def _with_stored_secrets(
     a hostname, and would silently wipe the credential of anyone who didn't.
     """
     merged = dict(connection)
+    cleared = set(merged.pop("clear_secret_fields", []))
     for field in SECRET_FIELDS:
-        if not str(merged.get(field) or "").strip() and stored.get(field):
+        if field in cleared:
+            merged[field] = ""
+        elif merged.get(field) in (None, "") and stored.get(field):
             merged[field] = stored[field]
     return merged
 
@@ -141,6 +137,8 @@ def test_connection(
     itself, and blank credentials are filled from the stored ones so the test
     exercises exactly what the update would save.
     """
+    validate_connection_fields(connection)
+
     database_name = str(connection.get("database") or "").strip()
     if not database_name:
         raise ValueError("Database name is required")
@@ -193,13 +191,14 @@ def create_connection(
     connection: dict[str, Any],
 ) -> dict[str, Any]:
     """Create a UI-managed connection stored on the catalog database row."""
+    validate_connection_fields(connection)
 
     # ``schema`` is the form's shorthand for a single-schema allowlist; the caller
     # turns it into ``schemas``. Storing the raw field too would leave two sources of
     # truth for what gets ingested, so drop it.
     connection = {key: value for key, value in connection.items() if key != "schema"}
 
-    database_name = str(connection.get("database"))
+    database_name = str(connection.get("database") or "").strip()
     if not database_name:
         raise ValueError("Database name is required")
 
@@ -212,6 +211,9 @@ def create_connection(
 
     # With Vault configured, store credentials in Vault and keep them off the
     # catalog row; otherwise fall back to persisting the JSON on the row.
+    connection = _with_stored_secrets(connection, {})
+    if connection.get("type") == "mysql":
+        mysql_tls_options(connection)
     vault_configured = is_vault_configured()
     if vault_configured:
         write_secret(database_name, connection)
@@ -243,6 +245,7 @@ def update_connection(
     hostname leaves the ingested graph correct, and re-ingesting it would be a
     long, surprising side effect of saving a form.
     """
+
     # Same shorthand the create path drops: `schema` is the single-schema form
     # of `schemas`, and storing both leaves two sources of truth.
     connection = {key: value for key, value in connection.items() if key != "schema"}
@@ -260,6 +263,9 @@ def update_connection(
     if incoming_type and stored_type and incoming_type != stored_type:
         raise ValueError("A connection's type cannot be changed")
 
+    validate_connection_fields(
+        {**connection, "type": connection.get("type") or stored.get("type")}
+    )
     updated = _with_stored_secrets(
         {
             **connection,
@@ -269,6 +275,8 @@ def update_connection(
         stored,
     )
 
+    if updated.get("type") == "mysql":
+        mysql_tls_options(updated)
     if is_vault_configured():
         write_secret(database_name, updated)
         # Blank out any credentials the row still carries from before Vault was

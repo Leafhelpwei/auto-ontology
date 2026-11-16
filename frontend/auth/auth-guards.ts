@@ -5,10 +5,20 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { auth } from '@/auth/auth';
+import { getPrisma } from '@/lib/prisma';
 import { Role } from '@/enums/auth';
 
 /** Authoritative session lookup for server components and route handlers. */
-export const getCurrentSession = async () => auth.api.getSession({ headers: await headers() });
+export const getCurrentSession = async () => {
+	const session = await auth.api.getSession({ headers: await headers() });
+	if (!session) return null;
+	const local = await getPrisma().user.findUnique({
+		where: { id: session.user.id },
+		select: { role: true, banned: true },
+	});
+	if (!local || local.banned) return null;
+	return { ...session, user: { ...session.user, role: local.role } };
+};
 
 /** Require any authenticated user; redirect to /login otherwise. */
 export const requireUser = async () => {

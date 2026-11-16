@@ -4,7 +4,8 @@
 
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { serializeConnectionField } from '@/lib/connectionFields';
 import { connectionsApi } from '@/api/connections';
 import { ModalWithSteps, type StepperFooterAction } from '@/common/modal';
 import { ConnectionConnectStep } from '@/components/connectionsPage/steps/ConnectionConnectStep';
@@ -62,13 +63,21 @@ export type ConnectionModalProps = {
 	onCancel: () => void;
 };
 
-export const ConnectionModal = ({
+const ConnectionModalContent = ({
 	open,
 	connection = null,
 	onConfirm,
 	onCancel,
 }: ConnectionModalProps) => {
 	const editing = connection != null;
+	const requestVersion = useRef(0);
+	useEffect(
+		() => () => {
+			requestVersion.current += 1;
+		},
+		[],
+	);
+	const [clearedSecrets, setClearedSecrets] = useState<ConnectionFieldKey[]>([]);
 
 	const [loading, setLoading] = useState(false);
 	const [testingConnection, setTestingConnection] = useState(false);
@@ -105,10 +114,15 @@ export const ConnectionModal = ({
 		const stored = connection.connection as Record<string, unknown>;
 		return new Set(
 			connectionFieldsFor(connection.connection.type)
-				.filter((field) => field.secret === true && stored[field.key] == null)
+				.filter(
+					(field) =>
+						field.secret === true &&
+						stored[field.key] == null &&
+						!clearedSecrets.includes(field.key),
+				)
 				.map((field) => field.key),
 		);
-	}, [connection]);
+	}, [connection, clearedSecrets]);
 
 	const readOnlyKeys = useMemo<ReadonlySet<ConnectionFieldKey>>(
 		() => (editing ? new Set<ConnectionFieldKey>(['database']) : new Set()),
@@ -138,9 +152,13 @@ export const ConnectionModal = ({
 				field.key,
 				// Checkbox fields go over the wire as real booleans; the form
 				// stores them as 'true'/'' like every other value.
-				field.boolean ? values[field.key] === 'true' : (values[field.key] ?? '').trim(),
+				serializeConnectionField(field, values[field.key]),
 			]);
-			const base = { type: connectionType, ...Object.fromEntries(entries) };
+			const base = {
+				type: connectionType,
+				...Object.fromEntries(entries),
+				...(clearedSecrets.length ? { clear_secret_fields: clearedSecrets } : {}),
+			};
 			if (supportsSchemaSelection) {
 				// A named schema is the allowlist; otherwise use whatever was picked.
 				if (explicitSchema) {
@@ -152,7 +170,14 @@ export const ConnectionModal = ({
 			}
 			return base as ConnectionInput;
 		},
-		[connectionType, values, supportsSchemaSelection, selectedSchemas, explicitSchema],
+		[
+			connectionType,
+			values,
+			supportsSchemaSelection,
+			selectedSchemas,
+			explicitSchema,
+			clearedSecrets,
+		],
 	);
 
 	const fieldsComplete = useMemo(() => {
@@ -160,16 +185,14 @@ export const ConnectionModal = ({
 			(field) =>
 				field.optional ||
 				keepCurrentKeys.has(field.key) ||
-				(values[field.key] ?? '').trim().length > 0,
+				String(serializeConnectionField(field, values[field.key])).length > 0,
 		);
 		// Alternative credentials are each optional on their own, so the "every
 		// required field" check above cannot see that one of them is still needed.
 		const alternatives = CONNECTION_EITHER_FIELDS[connectionType];
 		const alternativeSatisfied =
 			alternatives == null ||
-			alternatives.some(
-				(key) => keepCurrentKeys.has(key) || (values[key] ?? '').trim().length > 0,
-			);
+			alternatives.some((key) => keepCurrentKeys.has(key) || (values[key] ?? '').length > 0);
 
 		return allRequiredPresent && alternativeSatisfied;
 	}, [connectionType, values, keepCurrentKeys]);
@@ -193,6 +216,9 @@ export const ConnectionModal = ({
 	}, [initialSchemas]);
 
 	const handleSelectType = (type: ConnectionType): void => {
+		requestVersion.current += 1;
+		setTestingConnection(false);
+		setClearedSecrets([]);
 		setConnectionType(type);
 		setValues({});
 		setAlert(null);
@@ -203,6 +229,9 @@ export const ConnectionModal = ({
 	};
 
 	const handleFieldChange = (key: ConnectionFieldKey, value: string): void => {
+		requestVersion.current += 1;
+		setTestingConnection(false);
+		setClearedSecrets((prev) => prev.filter((item) => item !== key));
 		setValues((prev) => ({ ...prev, [key]: value }));
 		setIsConnectionTested(false);
 		setTestSuccessMessage(null);
@@ -212,6 +241,7 @@ export const ConnectionModal = ({
 	};
 
 	const handleTestConnection = useCallback(async (): Promise<void> => {
+		const version = ++requestVersion.current;
 		setTestingConnection(true);
 		setAlert(null);
 		setTestSuccessMessage(null);
@@ -220,6 +250,7 @@ export const ConnectionModal = ({
 			buildConnection({ forTest: true }),
 			connection?.database_name,
 		);
+		if (version !== requestVersion.current) return;
 		setTestingConnection(false);
 
 		if ('error' in res && res.error) {
@@ -249,11 +280,13 @@ export const ConnectionModal = ({
 
 		setLoading(true);
 		setAlert(null);
+		const version = requestVersion.current;
 		const input = buildConnection();
 		const res =
 			connection == null
 				? await connectionsApi.create(input)
 				: await connectionsApi.update(connection.database_name, input);
+		if (version !== requestVersion.current) return;
 		setLoading(false);
 
 		if ('error' in res && res.error) {
@@ -271,11 +304,31 @@ export const ConnectionModal = ({
 			case CONNECT_STEP:
 				return (
 					<ConnectionConnectStep
+						loading={loading}
 						connectionType={connectionType}
 						values={values}
 						onFieldChange={handleFieldChange}
 						readOnlyKeys={readOnlyKeys}
 						keepCurrentKeys={keepCurrentKeys}
+						clearedSecrets={clearedSecrets}
+						onClearSecret={
+							editing
+								? (key) => {
+										requestVersion.current += 1;
+										resetSchemaState();
+										setAlert(null);
+										setIsConnectionTested(false);
+										setTestSuccessMessage(null);
+										setTestingConnection(false);
+										setValues((previous) => ({ ...previous, [key]: '' }));
+										setClearedSecrets((previous) =>
+											previous.includes(key)
+												? previous.filter((item) => item !== key)
+												: [...previous, key],
+										);
+									}
+								: undefined
+						}
 						testSuccessMessage={testSuccessMessage}
 						onTestConnection={() => {
 							void handleTestConnection();
@@ -317,20 +370,17 @@ export const ConnectionModal = ({
 		// Require a successful test before advancing so the schema list can load.
 		const blocked = !canContinue || loading || testingConnection || !isConnectionTested;
 
-		actions.push(
+		return [
+			...actions,
 			isLastStep
 				? {
 						label: editing ? 'Save' : 'Create',
-						onClick: () => {
-							void handleSubmit();
-						},
+						onClick: handleSubmit,
 						disabled: blocked,
 						loading,
 					}
 				: { label: 'Next', onClick: handleNext, disabled: blocked, loading },
-		);
-
-		return actions;
+		];
 	}, [
 		activeStep,
 		canContinue,
@@ -361,3 +411,9 @@ export const ConnectionModal = ({
 		</ModalWithSteps>
 	);
 };
+
+// Closing or switching records discards outstanding test callbacks and form state.
+export const ConnectionModal = (props: ConnectionModalProps) =>
+	props.open ? (
+		<ConnectionModalContent key={props.connection?.database_name ?? 'new'} {...props} />
+	) : null;

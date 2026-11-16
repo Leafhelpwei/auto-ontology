@@ -48,7 +48,11 @@ export type ConnectionFieldKey =
 	| 'http_scheme'
 	| 'sso_federation'
 	| 'table_allow_regex'
-	| 'table_deny_regex';
+	| 'table_deny_regex'
+	| 'ssl_mode'
+	| 'ssl_ca'
+	| 'ssl_cert'
+	| 'ssl_key';
 
 export type ConnectionField = {
 	key: ConnectionFieldKey;
@@ -69,6 +73,7 @@ export type ConnectionField = {
 	fileAccept?: string;
 	/** Helper text shown under the field. */
 	hint?: string;
+	choices?: readonly string[];
 };
 
 /**
@@ -128,6 +133,16 @@ export const CONNECTION_FIELDS: Record<ConnectionType, ConnectionField[]> = {
 		{ key: 'user', label: 'User', placeholder: 'root' },
 		{ key: 'password', label: 'Password', secret: true },
 		{ key: 'database', label: 'Database', placeholder: 'my_database' },
+		{
+			key: 'ssl_mode',
+			label: 'TLS verification',
+			optional: true,
+			choices: ['VERIFY_IDENTITY', 'VERIFY_CA', 'DISABLED'],
+			hint: 'Verify certificate and hostname by default. Use DISABLED only for an explicitly trusted local development database.',
+		},
+		{ key: 'ssl_ca', label: 'CA certificate path', optional: true },
+		{ key: 'ssl_cert', label: 'Client certificate path', optional: true },
+		{ key: 'ssl_key', label: 'Client key path', optional: true, secret: true },
 	],
 	[ConnectionType.SNOWFLAKE]: [
 		{ key: 'account', label: 'Account', placeholder: 'xy12345.us-east-1' },

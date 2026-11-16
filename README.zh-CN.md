@@ -458,3 +458,19 @@ Auto Ontology 运行时可能交互的外部资源包括：
 ## 安全
 
 请按照 [SECURITY.md](./SECURITY.md) 中的说明报告安全漏洞。
+
+## 审计修复进度与连接安全
+
+本分支正在重建原有未推送的审计修复。请以 [60 项修复与验收记录](docs/audit/REBUILD_STATUS.zh-CN.md) 为准，未验收的项不会标为完成。
+
+MySQL 5.7 数据源默认验证服务端 CA 和主机名。设置连接时可选择 `VERIFY_IDENTITY`（默认）、`VERIFY_CA` 或 `DISABLED`。严格模式不会因连接失败自动改成明文。CA、客户端证书和客户端密钥路径指向运行后端及工作进程的环境，所有实例均需挂载同样的证书。
+
+```text
+mysql://reader:password@mysql.example:3306/sales?ssl_mode=VERIFY_IDENTITY&ssl_ca=/run/certs/ca.pem
+```
+
+隔离开发库使用明文时必须显式设置 `?ssl_mode=DISABLED`。未知或互相矛盾的 TLS 参数会被拒绝。连接测试、查询、只读事务和取消查询所用控制连接采用相同配置。
+
+编辑连接时，秘密字段留空表示保持原值；使用“Clear stored credential on save”显式清空；输入新内容表示替换，包括内容原有的首尾空白。连接响应不会返回密码、私钥、运行时联邦 token 或未知秘密字段。
+
+跨服务 SSO 调用必须使用配置的 OIDC clientId 或 `AUTO_ONTOLOGY_SSO_AUDIENCES` 中的 audience，且账号已绑定到相同 provider 和 subject。不会仅凭同名邮箱关联管理员。封禁和角色变更在下一次请求重新校验。

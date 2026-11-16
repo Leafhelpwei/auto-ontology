@@ -26,6 +26,8 @@ export type ConnectionConnectStepProps = {
 	/** Blank keeps the stored value, so these are never required. */
 	keepCurrentKeys?: ReadonlySet<ConnectionFieldKey>;
 	loading?: boolean;
+	clearedSecrets?: readonly ConnectionFieldKey[];
+	onClearSecret?: (key: ConnectionFieldKey) => void;
 	testSuccessMessage?: string | null;
 	onTestConnection?: () => void;
 	testDisabled?: boolean;
@@ -39,6 +41,8 @@ export const ConnectionConnectStep = ({
 	readOnlyKeys = EMPTY_KEYS,
 	keepCurrentKeys = EMPTY_KEYS,
 	loading = false,
+	clearedSecrets = [],
+	onClearSecret,
 	testSuccessMessage = null,
 	onTestConnection,
 	testDisabled = false,
@@ -69,6 +73,29 @@ export const ConnectionConnectStep = ({
 					const inputClassName =
 						'rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-sm text-heading outline-none focus:border-[#76b900] focus:ring-2 focus:ring-[#76b900]/30 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100';
 
+					if (field.choices)
+						return (
+							<label key={field.key} className="flex flex-col gap-1.5">
+								<span>{field.label}</span>
+								<select
+									value={values[field.key] || field.choices[0]}
+									onChange={({ target }) =>
+										onFieldChange(field.key, target.value)
+									}
+									className={inputClassName}
+									data-testid={`connection-field-${field.key}`}
+								>
+									{field.choices.map((choice) => (
+										<option key={choice} value={choice}>
+											{choice}
+										</option>
+									))}
+								</select>
+								{field.hint && (
+									<span className="text-xs text-secondary">{field.hint}</span>
+								)}
+							</label>
+						);
 					// Boolean fields render as a checkbox; the modal stores every
 					// value as a string, so 'true'/'' is the on/off representation.
 					if (field.boolean) {
@@ -180,6 +207,21 @@ export const ConnectionConnectStep = ({
 									data-testid={`connection-field-${field.key}`}
 									className={className}
 								/>
+							)}
+							{field.secret && onClearSecret && (
+								<button
+									type="button"
+									className="text-left text-xs underline"
+									aria-pressed={clearedSecrets.includes(field.key)}
+									onClick={(event) => {
+										event.preventDefault();
+										onClearSecret(field.key);
+									}}
+								>
+									{clearedSecrets.includes(field.key)
+										? 'Undo clearing stored credential'
+										: 'Clear stored credential on save'}
+								</button>
 							)}
 							{keepsCurrent && (
 								<span className="text-xs text-secondary dark:text-zinc-400">

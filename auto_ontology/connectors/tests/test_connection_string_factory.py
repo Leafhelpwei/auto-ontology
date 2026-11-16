@@ -51,8 +51,8 @@ def test_private_key_is_base64_encoded_in_the_url() -> None:
 
     encoded = parse_qs(urlparse(result).query)["private_key"][0]
     assert "BEGIN" not in encoded
-    # Surrounding whitespace is trimmed; a PEM parses without a trailing newline.
-    assert base64.urlsafe_b64decode(encoded).decode() == PEM.strip()
+    # Preserve the uploaded PEM bytes, including the trailing newline.
+    assert base64.urlsafe_b64decode(encoded).decode() == PEM
 
 
 def test_already_encoded_key_is_not_double_encoded() -> None:
@@ -72,12 +72,12 @@ def test_passphrase_is_carried_when_present() -> None:
     assert parse_qs(urlparse(result).query)["private_key_passphrase"] == ["s3cret"]
 
 
-def test_passphrase_is_omitted_when_blank() -> None:
+def test_whitespace_passphrase_is_preserved() -> None:
     result = build_connection_string(
         _snowflake(private_key=PEM, private_key_passphrase="   ")
     )
 
-    assert "private_key_passphrase" not in parse_qs(urlparse(result).query)
+    assert parse_qs(urlparse(result).query)["private_key_passphrase"] == ["   "]
 
 
 def test_private_key_takes_precedence_over_a_stale_password() -> None:
