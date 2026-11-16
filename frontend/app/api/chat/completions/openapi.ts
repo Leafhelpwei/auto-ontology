@@ -33,6 +33,19 @@ export const openapi: OpenApiRoute = {
 					.object({
 						model_id: z.string().min(1),
 						revision: z.number().int().positive().optional(),
+						reset_context: z
+							.boolean()
+							.optional()
+							.describe(
+								'Start a complete new question without inheriting earlier constraints. Cannot confirm an older proposal.',
+							),
+						confirm_query_fingerprint: z
+							.string()
+							.regex(/^[a-f0-9]{64}$/)
+							.nullish()
+							.describe(
+								'Confirm only the latest pending query in this owned conversation. The server revalidates the pinned model and request before execution.',
+							),
 						selected_metric_ids: z
 							.array(z.string())
 							.nullish()

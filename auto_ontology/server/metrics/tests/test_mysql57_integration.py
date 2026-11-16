@@ -720,7 +720,46 @@ def test_mysql57_chat_real_permissions_context_and_result_persistence(
         )
     )[-1]["answer"]
     assert captured[0]["context"]["model_fingerprint"] == fixture.model.fingerprint()
+    assert answer["query_context"]["status"] == "confirmation_required"
+    assert "sql_response_from_db" not in answer
+    persist_assistant_result(
+        conversation_id=conversation_id,
+        user_id=fixture.viewer_user,
+        analytics_id=second.analytics_id,
+        response=answer["response"],
+        sql_code=None,
+        query_context=answer["query_context"],
+    )
+    third = prepare_conversation(
+        conversation_id=conversation_id,
+        user_id=fixture.viewer_user,
+        question="确认并执行以上查询",
+        source="mysql57-regression",
+        query_context=scope,
+    )
+    monkeypatch.setattr(
+        interpretation,
+        "invoke_with_structured_output",
+        lambda *a, **k: pytest.fail("Confirmed request must not be reinterpreted"),
+    )
+    answer = list(
+        metrics_flow.stream_metric_response(
+            {
+                **payload,
+                "question": "确认并执行以上查询",
+                "turn_id": third.analytics_id,
+                "metric_context": {
+                    **scope,
+                    "confirm_query_fingerprint": answer["query_context"][
+                        "confirmation_fingerprint"
+                    ],
+                },
+                "conversation_history": [vars(turn) for turn in third.history],
+            }
+        )
+    )[-1]["answer"]
     assert answer["query_context"]["trusted"] is True
+    assert answer["query_context"]["intent_confirmed"] is True
     assert (
         Decimal(json.loads(answer["sql_response_from_db"])[0]["confirmed_amount"])
         == EXACT_AMOUNT
@@ -728,7 +767,7 @@ def test_mysql57_chat_real_permissions_context_and_result_persistence(
     persist_assistant_result(
         conversation_id=conversation_id,
         user_id=fixture.viewer_user,
-        analytics_id=second.analytics_id,
+        analytics_id=third.analytics_id,
         response=answer["response"],
         sql_code=answer["sql_code"],
         query_context=answer["query_context"],
@@ -745,8 +784,8 @@ def test_mysql57_chat_real_permissions_context_and_result_persistence(
             "SELECT query_context,sql_response FROM frontend.messages WHERE conversation_id=%s ORDER BY created_at,id",
             (conversation_id,),
         ).fetchall()
-    assert len(messages) == 5
-    assert messages[-1]["query_context"]["turn_id"] == second.analytics_id
+    assert len(messages) == 7
+    assert messages[-1]["query_context"]["turn_id"] == third.analytics_id
     assert messages[-1]["sql_response"] == answer["sql_response_from_db"]
     denied = list(
         metrics_flow.stream_metric_response({**payload, "user_id": "unknown-user"})

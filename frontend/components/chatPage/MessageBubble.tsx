@@ -63,6 +63,8 @@ const QueryResultsSection = ({
 type MessageBubbleProps = {
 	message: ChatMessage;
 	onSelectMetric?: (context: MetricsQueryContext, metricId: string) => void;
+	onConfirmQuery?: (context: MetricsQueryContext) => void;
+	onRestartQuery?: (context: MetricsQueryContext) => void;
 	disabled?: boolean;
 };
 
@@ -70,7 +72,13 @@ type MessageBubbleProps = {
 const hasEmbeddedChart = (content: string): boolean =>
 	/(^|\n)```(?:chart|chart-carousel)\b/.test(content);
 
-export const MessageBubble = ({ message, onSelectMetric, disabled }: MessageBubbleProps) => {
+export const MessageBubble = ({
+	message,
+	onSelectMetric,
+	onConfirmQuery,
+	onRestartQuery,
+	disabled,
+}: MessageBubbleProps) => {
 	const metricContext =
 		message.queryContext?.query_mode === 'metrics' ? message.queryContext : null;
 	const isUser = message.role === 'user';
@@ -143,6 +151,8 @@ export const MessageBubble = ({ message, onSelectMetric, disabled }: MessageBubb
 						context={metricContext}
 						sqlResponse={message.sqlResponse}
 						onSelectMetric={onSelectMetric}
+						onConfirmQuery={onConfirmQuery}
+						onRestartQuery={onRestartQuery}
 						disabled={disabled}
 					/>
 				)}

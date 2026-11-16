@@ -97,6 +97,10 @@ export const metricRequestContext = (selection: ChatSelection): MetricChatContex
 	return {
 		model_id: context.model_id,
 		revision: context.revision,
+		...(context.reset_context ? { reset_context: true } : {}),
+		...(context.confirm_query_fingerprint
+			? { confirm_query_fingerprint: context.confirm_query_fingerprint }
+			: {}),
 		...(selection.metric_selection_explicit
 			? { selected_metric_ids: context.selected_metric_ids ?? [] }
 			: {}),

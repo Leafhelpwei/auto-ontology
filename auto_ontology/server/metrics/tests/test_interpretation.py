@@ -473,7 +473,7 @@ def test_history_is_a_bounded_exact_suffix_in_untrusted_payload() -> None:
         )
         for index in range(30)
     )
-    context = _context(model, turns=turns)
+    context = _context(model, turns=turns, current_query=_candidate().query)
     with patch(
         "auto_ontology.server.metrics.interpretation.invoke_with_structured_output",
         return_value=InterpretationCandidate(clarification="日期？"),

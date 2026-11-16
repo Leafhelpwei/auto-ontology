@@ -13,6 +13,8 @@ export type QueryMode = 'explore' | 'metrics';
 export type MetricChatContext = {
 	model_id: string;
 	revision?: number;
+	confirm_query_fingerprint?: string;
+	reset_context?: boolean;
 	selected_metric_ids?: string[];
 };
 export type ChatSelection = {
@@ -32,12 +34,18 @@ export type MetricsQueryContext = {
 		| 'running'
 		| 'ready'
 		| 'clarification'
+		| 'confirmation_required'
 		| 'rejected'
 		| 'error'
 		| 'cancelled'
 		| 'failed'
 		| 'interrupted';
 	trusted?: boolean;
+	intent_confirmed?: boolean;
+	context_reset?: boolean;
+	pending_query?: MetricQueryRequest | null;
+	confirmation_fingerprint?: string;
+	metric_names?: Record<string, string>;
 	query?: MetricQueryRequest | null;
 	base_query?: MetricQueryRequest | null;
 	clarification?: {

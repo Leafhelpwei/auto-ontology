@@ -15,10 +15,16 @@ import mysql.connector
 
 from auto_ontology.connectors.base import StatementTimeout
 from auto_ontology.dal.governed_models import ModelNotFound
-from auto_ontology.semantic.contracts.models import ContractError, MetricQueryRequest
+from auto_ontology.semantic.contracts.models import (
+    ContractError,
+    MetricQueryRequest,
+    content_fingerprint,
+)
+from auto_ontology.semantic.contracts.compiler import compile_query
 from auto_ontology.server.metrics import service
 from auto_ontology.server.metrics.interpretation import (
     InterpretRequest,
+    InterpretationResult,
     interpret_question,
 )
 from auto_ontology.server.users.permissions import permissions_for_role
@@ -63,6 +69,8 @@ def _prior_segment(
         if current != pinned:
             break
         selected.append(turn)
+        if context.get("context_reset"):
+            break
     return list(reversed(selected))
 
 
@@ -96,7 +104,9 @@ def _interpretation_context(
             "CONTEXT_REVISION_MISMATCH",
             "The prior question used a different certified model fingerprint; explicitly select the current revision to restart",
         )
-    raw_query = latest.get("query") or latest.get("base_query")
+    raw_query = (
+        latest.get("pending_query") or latest.get("query") or latest.get("base_query")
+    )
     query = MetricQueryRequest.model_validate(raw_query) if raw_query else None
     turns = []
     for turn in history:
@@ -136,6 +146,43 @@ def _answer(
     return {"type": "result", "answer": answer}
 
 
+def _confirmed_request(
+    model: Any,
+    latest: dict[str, Any] | None,
+    token: str,
+    selected: tuple[str, ...] | None,
+) -> InterpretationResult:
+    """Confirm only the latest owned, pinned proposal; never parse approval from prose."""
+    if (
+        not latest
+        or latest.get("status") != "confirmation_required"
+        or not latest.get("pending_query")
+    ):
+        raise ContractError(
+            "CONFIRMATION_EXPIRED",
+            "No pending query is available; ask the complete question again.",
+        )
+    query = MetricQueryRequest.model_validate(latest["pending_query"])
+    if token != latest.get("confirmation_fingerprint") or token != content_fingerprint(
+        query
+    ):
+        raise ContractError(
+            "CONFIRMATION_MISMATCH",
+            "The query changed; review the latest proposal before confirming.",
+        )
+    if selected is not None and set(selected) != set(query.metric_ids):
+        raise ContractError(
+            "CONFIRMATION_MISMATCH",
+            "The selected metrics differ from the query being confirmed.",
+        )
+    return InterpretationResult(
+        status="ready",
+        query=query,
+        plan=compile_query(model, query),
+        selected_metric_ids=tuple(latest.get("selected_metric_ids") or ()),
+    )
+
+
 def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
     """Resolve/clarify a question and execute only a pinned certified request."""
     selection = payload["metric_context"]
@@ -143,7 +190,11 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
     raw_selected = selection.get("selected_metric_ids")
     selected = tuple(raw_selected) if raw_selected is not None else None
     history = _prior_segment(
-        payload.get("conversation_history") or [], model_id, selection.get("revision")
+        []
+        if selection.get("reset_context")
+        else payload.get("conversation_history") or [],
+        model_id,
+        selection.get("revision"),
     )
     latest = history[-1].get("query_context") if history else None
     revision = selection.get("revision") or (latest or {}).get("revision")
@@ -156,13 +207,14 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         "selected_metric_ids": list(selected or ()),
         "status": "running",
         "trusted": False,
+        "context_reset": bool(selection.get("reset_context")),
     }
     if latest:
         for key in ("model_fingerprint", "base_query"):
             if latest.get(key) is not None:
                 context[key] = latest[key]
-        if latest.get("query"):
-            context["base_query"] = latest["query"]
+        if latest.get("pending_query") or latest.get("query"):
+            context["base_query"] = latest.get("pending_query") or latest["query"]
     try:
         require_metric_access(
             payload.get("user_id"), persistent=bool(payload.get("persistent"))
@@ -177,13 +229,18 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         )
         yield {"type": "metric_context", "query_context": dict(context)}
         yield {"type": "step", "node": "metrics_interpret", "label": "解析指标口径"}
-        interpreted = interpret_question(
-            model,
-            InterpretRequest(
-                question=payload["question"], selected_metric_ids=selected
-            ),
-            revision=revision,
-            context=prior,
+        confirmation = selection.get("confirm_query_fingerprint")
+        interpreted = (
+            _confirmed_request(model, latest, confirmation, selected)
+            if confirmation
+            else interpret_question(
+                model,
+                InterpretRequest(
+                    question=payload["question"], selected_metric_ids=selected
+                ),
+                revision=revision,
+                context=prior,
+            )
         )
         context["selected_metric_ids"] = list(interpreted.selected_metric_ids)
         if interpreted.status != "ready":
@@ -204,9 +261,27 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "INVALID_INTERPRETATION",
                 "The interpreter did not return a validated metric request",
             )
+        if not confirmation:
+            context.update(
+                status="confirmation_required",
+                pending_query=interpreted.query.model_dump(mode="json"),
+                confirmation_fingerprint=content_fingerprint(interpreted.query),
+                intent_confirmed=False,
+                metric_names={
+                    metric.metric_id: metric.name
+                    for metric in model.metrics
+                    if metric.metric_id in interpreted.query.metric_ids
+                },
+            )
+            yield _answer(
+                context,
+                "请核对下面的指标、时间、币种和筛选范围，确认后执行；如有偏差，请直接补充或修改条件。",
+            )
+            return
         context.update(
             query=interpreted.query.model_dump(mode="json"),
             plan=interpreted.plan.model_dump(mode="json"),
+            intent_confirmed=True,
         )
         context.pop("base_query", None)
         yield {"type": "metric_context", "query_context": dict(context)}
@@ -263,8 +338,8 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
             clarification={"code": code, "message": message, "options": []},
         )
         yield _answer(context, message)
-    except Exception:
-        logger.exception("Governed Chat failed")
+    except Exception as exc:
+        logger.error("Governed Chat failed error_class=%s", type(exc).__name__)
         message = "Governed metric interpretation or execution failed; no exploratory query was run"
         context.update(
             status="error",

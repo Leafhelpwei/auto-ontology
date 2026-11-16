@@ -22,6 +22,8 @@ type MessageListProps = {
 	messageListLoading?: boolean;
 	queryMode?: QueryMode;
 	onSelectMetric?: (context: MetricsQueryContext, metricId: string) => void;
+	onConfirmQuery?: (context: MetricsQueryContext) => void;
+	onRestartQuery?: (context: MetricsQueryContext) => void;
 };
 
 export const MessageList = ({
@@ -32,6 +34,8 @@ export const MessageList = ({
 	messageListLoading = false,
 	queryMode = 'explore',
 	onSelectMetric,
+	onConfirmQuery,
+	onRestartQuery,
 }: MessageListProps) => {
 	const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -85,6 +89,16 @@ export const MessageList = ({
 						key={msg.id}
 						message={msg}
 						onSelectMetric={onSelectMetric}
+						onRestartQuery={
+							msg.id === messages[messages.length - 1]?.id
+								? onRestartQuery
+								: undefined
+						}
+						onConfirmQuery={
+							msg.id === messages[messages.length - 1]?.id
+								? onConfirmQuery
+								: undefined
+						}
 						disabled={isLoading}
 					/>
 				))}

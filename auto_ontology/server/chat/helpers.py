@@ -35,6 +35,10 @@ class MetricChatContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     revision: int | None = Field(default=None, ge=1, le=2147483647)
+    confirm_query_fingerprint: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    reset_context: bool = False
     selected_metric_ids: (
         tuple[Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")], ...]
         | None

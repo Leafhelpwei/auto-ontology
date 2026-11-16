@@ -249,11 +249,37 @@ def test_success_stream_keeps_exact_results_and_actual_plan(
             }
         )
     )
+    execute.assert_not_called()
+    proposal = events[-1]["answer"]
+    assert proposal["query_context"]["status"] == "confirmation_required"
+    assert not any(event["type"] == "sql" for event in events)
+    events = list(
+        metrics_flow.stream_metric_response(
+            {
+                "question": "确认并执行以上查询",
+                "metric_context": {
+                    "model_id": model.model_id,
+                    "confirm_query_fingerprint": proposal["query_context"][
+                        "confirmation_fingerprint"
+                    ],
+                },
+                "user_id": "u",
+                "conversation_history": [
+                    {
+                        "question": "all time count",
+                        "response": proposal["response"],
+                        "query_context": proposal["query_context"],
+                    }
+                ],
+            }
+        )
+    )
     execute.assert_called_once_with(model.model_id, query, revision=1)
     answer = events[-1]["answer"]
     assert json.loads(answer["sql_response_from_db"])[0]["count"] == "9007199254740993"
     assert answer["query_context"]["plan"] == plan.model_dump(mode="json")
     assert answer["query_context"]["trusted"] is True
+    assert answer["query_context"]["intent_confirmed"] is True
     assert any(event["type"] == "sql" for event in events)
 
 

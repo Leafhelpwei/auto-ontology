@@ -45,9 +45,22 @@ export const chatQueryContextSchema = z.union([
 		model_fingerprint: z.string().nullish(),
 		selected_metric_ids: z.array(z.string()).nullish(),
 		status: z
-			.enum(['running', 'ready', 'clarification', 'rejected', 'error', 'cancelled'])
+			.enum([
+				'running',
+				'ready',
+				'clarification',
+				'confirmation_required',
+				'rejected',
+				'error',
+				'cancelled',
+			])
 			.optional(),
 		trusted: z.boolean().optional(),
+		intent_confirmed: z.boolean().optional(),
+		context_reset: z.boolean().optional(),
+		pending_query: z.record(z.string(), z.unknown()).nullish(),
+		confirmation_fingerprint: z.string().optional(),
+		metric_names: z.record(z.string(), z.string()).optional(),
 		query: z
 			.record(z.string(), z.unknown())
 			.nullish()

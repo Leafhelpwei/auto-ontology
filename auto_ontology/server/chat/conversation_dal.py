@@ -160,8 +160,47 @@ def _rows_to_history(
             break
         selected.append(turn)
         used_chars += turn_chars
+        if include_incomplete and (turn.query_context or {}).get("context_reset"):
+            break
         if len(selected) >= _MAX_HISTORY_TURNS:
             break
+    if include_incomplete and selected:
+        latest_context = selected[0].query_context or {}
+        scope = tuple(
+            latest_context.get(key)
+            for key in ("query_mode", "model_id", "revision", "model_fingerprint")
+        )
+        omitted = turns[: len(turns) - len(selected)]
+        same_scope_omitted = (
+            bool(omitted)
+            and tuple(
+                (omitted[-1].query_context or {}).get(key)
+                for key in ("query_mode", "model_id", "revision", "model_fingerprint")
+            )
+            == scope
+        )
+        normalized = (
+            latest_context.get("status") == "ready" and latest_context.get("query")
+        ) or (
+            latest_context.get("status") == "confirmation_required"
+            and latest_context.get("pending_query")
+        )
+        if (
+            latest_context.get("query_mode") == "metrics"
+            and not normalized
+            and not any(
+                (turn.query_context or {}).get("context_reset") for turn in selected
+            )
+            and (same_scope_omitted or len(rows) >= 128)
+        ):
+            # A valid previous query is not a summary of later unresolved
+            # constraints. Never discard the start of a clarification chain.
+            latest = selected[0]
+            selected[0] = ConversationTurn(
+                question=latest.question,
+                response=latest.response,
+                query_context={**latest_context, "context_too_large": True},
+            )
     return list(reversed(selected))
 
 

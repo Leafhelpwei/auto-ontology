@@ -210,10 +210,11 @@ export const ChatView = () => {
 	);
 
 	const handleSend = useCallback(
-		async (text: string): Promise<boolean> => {
+		async (text: string, override?: ChatSelection): Promise<boolean> => {
+			const sendingSelection = override ?? selection;
 			if (
 				messageListLoading ||
-				(selection.query_mode === 'metrics'
+				(sendingSelection.query_mode === 'metrics'
 					? metricModels.unavailable != null
 					: semanticReady !== true)
 			)
@@ -245,7 +246,7 @@ export const ChatView = () => {
 				}
 			}
 			try {
-				return await sendMessage(text, conversationId, selection);
+				return await sendMessage(text, conversationId, sendingSelection);
 			} finally {
 				if (sendEpoch === viewEpochRef.current) setSubmitting(false);
 			}
@@ -279,6 +280,37 @@ export const ChatView = () => {
 
 	const exploreBlocked =
 		selection.query_mode === 'explore' && semanticReady !== true && !messageListLoading;
+	const confirmQuery = (context: MetricsQueryContext) => {
+		if (
+			isLoading ||
+			submitting ||
+			!context.confirmation_fingerprint ||
+			context.revision == null
+		)
+			return;
+		void handleSend('确认并执行以上查询', {
+			query_mode: 'metrics',
+			metric_context: {
+				model_id: context.model_id,
+				revision: context.revision,
+				confirm_query_fingerprint: context.confirmation_fingerprint,
+			},
+		});
+	};
+	const restartQuery = (context: MetricsQueryContext) => {
+		if (isLoading || submitting) return;
+		setSelection({
+			query_mode: 'metrics',
+			metric_context: {
+				model_id: context.model_id,
+				revision: context.revision ?? undefined,
+				reset_context: true,
+			},
+		});
+		setNotice(
+			'Enter the complete question, including every filter, exclusion, currency and time constraint. Earlier context will not be inherited.',
+		);
+	};
 	return (
 		<div className="flex h-full min-h-0 overflow-hidden bg-white dark:bg-zinc-950">
 			<ChatSidebar
@@ -337,6 +369,8 @@ export const ChatView = () => {
 							messageListLoading={messageListLoading}
 							queryMode={selection.query_mode}
 							onSelectMetric={selectClarificationMetric}
+							onConfirmQuery={confirmQuery}
+							onRestartQuery={restartQuery}
 						/>
 						<ChatInput
 							key={composerEpoch}

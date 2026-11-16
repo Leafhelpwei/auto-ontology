@@ -970,6 +970,22 @@
                             "exclusiveMinimum": 0,
                             "maximum": 9007199254740991
                           },
+                          "reset_context": {
+                            "description": "Start a complete new question without inheriting earlier constraints. Cannot confirm an older proposal.",
+                            "type": "boolean"
+                          },
+                          "confirm_query_fingerprint": {
+                            "description": "Confirm only the latest pending query in this owned conversation. The server revalidates the pinned model and request before execution.",
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "pattern": "^[a-f0-9]{64}$"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "selected_metric_ids": {
                             "description": "Omit to inherit the trusted prior selection; [] explicitly clears it; a nonempty list selects variants for this turn.",
                             "anyOf": [
@@ -1126,6 +1142,7 @@
                               "running",
                               "ready",
                               "clarification",
+                              "confirmation_required",
                               "rejected",
                               "error",
                               "cancelled"
@@ -1133,6 +1150,38 @@
                           },
                           "trusted": {
                             "type": "boolean"
+                          },
+                          "intent_confirmed": {
+                            "type": "boolean"
+                          },
+                          "context_reset": {
+                            "type": "boolean"
+                          },
+                          "pending_query": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {}
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "confirmation_fingerprint": {
+                            "type": "string"
+                          },
+                          "metric_names": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {
+                              "type": "string"
+                            }
                           },
                           "query": {
                             "description": "Validated MetricQueryRequest, never free SQL.",
@@ -2837,6 +2886,7 @@
                                           "running",
                                           "ready",
                                           "clarification",
+                                          "confirmation_required",
                                           "rejected",
                                           "error",
                                           "cancelled"
@@ -2844,6 +2894,38 @@
                                       },
                                       "trusted": {
                                         "type": "boolean"
+                                      },
+                                      "intent_confirmed": {
+                                        "type": "boolean"
+                                      },
+                                      "context_reset": {
+                                        "type": "boolean"
+                                      },
+                                      "pending_query": {
+                                        "anyOf": [
+                                          {
+                                            "type": "object",
+                                            "propertyNames": {
+                                              "type": "string"
+                                            },
+                                            "additionalProperties": {}
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "confirmation_fingerprint": {
+                                        "type": "string"
+                                      },
+                                      "metric_names": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {
+                                          "type": "string"
+                                        }
                                       },
                                       "query": {
                                         "description": "Validated MetricQueryRequest, never free SQL.",
@@ -3381,6 +3463,7 @@
                                     "running",
                                     "ready",
                                     "clarification",
+                                    "confirmation_required",
                                     "rejected",
                                     "error",
                                     "cancelled"
@@ -3388,6 +3471,38 @@
                                 },
                                 "trusted": {
                                   "type": "boolean"
+                                },
+                                "intent_confirmed": {
+                                  "type": "boolean"
+                                },
+                                "context_reset": {
+                                  "type": "boolean"
+                                },
+                                "pending_query": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string"
+                                      },
+                                      "additionalProperties": {}
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "confirmation_fingerprint": {
+                                  "type": "string"
+                                },
+                                "metric_names": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
                                 },
                                 "query": {
                                   "description": "Validated MetricQueryRequest, never free SQL.",

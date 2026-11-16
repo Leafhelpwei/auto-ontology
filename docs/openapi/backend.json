@@ -3479,10 +3479,27 @@
         "additionalProperties": false,
         "description": "User selections only; trusted query state comes from owned history.",
         "properties": {
+          "confirm_query_fingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirm Query Fingerprint"
+          },
           "model_id": {
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
             "title": "Model Id",
             "type": "string"
+          },
+          "reset_context": {
+            "default": false,
+            "title": "Reset Context",
+            "type": "boolean"
           },
           "revision": {
             "anyOf": [

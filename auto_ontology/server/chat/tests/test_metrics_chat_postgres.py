@@ -134,13 +134,55 @@ def test_metric_clarification_execution_and_owned_context_persist(
             }
         )
     )[-1]["answer"]
-    assert '"amount": "350"' in answer["sql_response_from_db"]
-    assert answer["query_context"]["trusted"] is True
+    assert answer["query_context"]["status"] == "confirmation_required"
+    assert "sql_response_from_db" not in answer
     assert captured["context"].turns[0].content == "订单数量和金额"
     persist_assistant_result(
         conversation_id=conversation_id,
         user_id=user_id,
         analytics_id=second.analytics_id,
+        response=answer["response"],
+        sql_code=None,
+        query_context=answer["query_context"],
+    )
+    third = prepare_conversation(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        question="确认并执行以上查询",
+        source="test",
+        query_context=scope,
+    )
+    monkeypatch.setattr(
+        metrics_flow,
+        "interpret_question",
+        lambda *a, **k: pytest.fail(
+            "Confirmation must execute the reviewed request without another LLM interpretation"
+        ),
+    )
+    answer = list(
+        metrics_flow.stream_metric_response(
+            {
+                "question": "确认并执行以上查询",
+                "metric_context": {
+                    **scope,
+                    "confirm_query_fingerprint": answer["query_context"][
+                        "confirmation_fingerprint"
+                    ],
+                },
+                "user_id": user_id,
+                "persistent": True,
+                "turn_id": third.analytics_id,
+                "conversation_history": [vars(turn) for turn in third.history],
+            }
+        )
+    )[-1]["answer"]
+    assert '"amount": "350"' in answer["sql_response_from_db"]
+    assert answer["query_context"]["trusted"] is True
+    assert answer["query_context"]["intent_confirmed"] is True
+    persist_assistant_result(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        analytics_id=third.analytics_id,
         response=answer["response"],
         sql_code=answer["sql_code"],
         query_context=answer["query_context"],
@@ -157,12 +199,12 @@ def test_metric_clarification_execution_and_owned_context_persist(
             "SELECT role,query_context,sql_response FROM frontend.messages WHERE conversation_id=%s ORDER BY created_at,id",
             (conversation_id,),
         ).fetchall()
-    assert len(messages) == 5
+    assert len(messages) == 7
     assert (
         messages[-1]["query_context"]["plan"]["model_fingerprint"]
         == model.fingerprint()
     )
-    assert messages[-1]["query_context"]["turn_id"] == second.analytics_id
+    assert messages[-1]["query_context"]["turn_id"] == third.analytics_id
     with pytest.raises(ConversationAccessError):
         prepare_conversation(
             conversation_id=conversation_id,

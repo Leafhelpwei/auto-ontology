@@ -13,28 +13,35 @@ export const MetricAnswerDetails = ({
 	context,
 	sqlResponse,
 	onSelectMetric,
+	onConfirmQuery,
+	onRestartQuery,
 	disabled = false,
 }: {
 	context: MetricsQueryContext;
 	sqlResponse?: string;
 	onSelectMetric?: (context: MetricsQueryContext, metricId: string) => void;
+	onConfirmQuery?: (context: MetricsQueryContext) => void;
+	onRestartQuery?: (context: MetricsQueryContext) => void;
 	disabled?: boolean;
 }) => {
 	const table = metricResultTable(sqlResponse, context);
 	const executed = context.status === 'ready' && context.trusted === true;
+	const pending = context.status === 'confirmation_required' ? context.pending_query : null;
 	const status = executed
 		? 'Certified metric execution'
-		: context.status === 'clarification'
-			? 'Clarification required · no query executed'
-			: context.status === 'rejected'
-				? 'Request rejected · no query executed'
-				: context.status === 'cancelled'
-					? 'Metric query cancelled'
-					: context.status === 'error'
-						? 'Metric query failed'
-						: context.status === 'running'
-							? 'Metric query in progress'
-							: 'Standard metrics';
+		: pending
+			? 'Review query · no query executed'
+			: context.status === 'clarification'
+				? 'Clarification required · no query executed'
+				: context.status === 'rejected'
+					? 'Request rejected · no query executed'
+					: context.status === 'cancelled'
+						? 'Metric query cancelled'
+						: context.status === 'error'
+							? 'Metric query failed'
+							: context.status === 'running'
+								? 'Metric query in progress'
+								: 'Standard metrics';
 	return (
 		<section
 			className="mt-3 space-y-3 border-t border-zinc-300 pt-3 dark:border-zinc-600"
@@ -55,6 +62,104 @@ export const MetricAnswerDetails = ({
 				<p className="text-xs text-secondary">
 					Metrics: {(context.selected_metric_ids ?? []).join(', ')}
 				</p>
+			)}
+			{executed && (
+				<p className="text-xs text-secondary">
+					{context.intent_confirmed
+						? 'Query scope confirmed by you.'
+						: 'Execution is certified; intent confirmation was not recorded.'}
+				</p>
+			)}
+			{context.clarification?.code === 'CONTEXT_TOO_LARGE' && (
+				<Button
+					size={Size.SMALL}
+					disabled={disabled || !onRestartQuery}
+					onClick={() => onRestartQuery?.(context)}
+				>
+					Restate the complete question
+				</Button>
+			)}
+			{pending && (
+				<div className="space-y-3 rounded-lg border border-zinc-300 bg-white p-3 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+					<h3 className="font-medium">Review the meaning before execution</h3>
+					<dl className="space-y-2">
+						<div>
+							<dt className="font-medium">Metrics</dt>
+							<dd>
+								{pending.metric_ids
+									.map((id) => `${context.metric_names?.[id] ?? id} (${id})`)
+									.join(', ')}
+							</dd>
+						</div>
+						<div>
+							<dt className="font-medium">Period</dt>
+							<dd>
+								{pending.all_time
+									? 'All history'
+									: `${pending.time?.start} ≤ time < ${pending.time?.end_exclusive}`}
+							</dd>
+						</div>
+						{pending.time && (
+							<div>
+								<dt className="font-medium">Timezone and business time</dt>
+								<dd>
+									{pending.time.timezone} ·{' '}
+									{pending.time.metric_roles &&
+									Object.keys(pending.time.metric_roles).length
+										? Object.entries(pending.time.metric_roles)
+												.map(([id, role]) => `${id}: ${role}`)
+												.join(', ')
+										: pending.time.time_role}{' '}
+									· {pending.time.granularity ?? 'No time grouping'}
+								</dd>
+							</div>
+						)}
+						<div>
+							<dt className="font-medium">Group by</dt>
+							<dd>{pending.dimensions.join(', ') || 'No dimensions'}</dd>
+						</div>
+						<div>
+							<dt className="font-medium">Additional filters and exclusions</dt>
+							<dd>
+								{pending.filters.length ? (
+									<ul className="list-inside list-disc">
+										{pending.filters.map((filter, index) => (
+											<li key={index}>
+												{filter.field.source_id}.{filter.field.field_id}
+												{filter.relationship_path?.length
+													? ` [${filter.relationship_path.join(' → ')}]`
+													: ''}{' '}
+												{filter.operator} {JSON.stringify(filter.value)}
+											</li>
+										))}
+									</ul>
+								) : (
+									'None — only the certified definition’s fixed conditions apply'
+								)}
+							</dd>
+						</div>
+						<div>
+							<dt className="font-medium">Ordering and row limit</dt>
+							<dd>
+								{pending.order_by
+									.map((item) => `${item.field_id} ${item.direction}`)
+									.join(', ') || 'Default ordering'}{' '}
+								· {pending.limit} rows
+							</dd>
+						</div>
+					</dl>
+					<p className="text-xs text-secondary">
+						If a date, metric, currency or exclusion is missing, reply with the
+						correction. Confirmation executes exactly this request.
+					</p>
+					<Button
+						size={Size.SMALL}
+						disabled={disabled || !onConfirmQuery}
+						onClick={() => onConfirmQuery?.(context)}
+					>
+						Confirm and execute
+					</Button>
+				</div>
 			)}
 			{context.status === 'clarification' && (
 				<div className="space-y-2">
