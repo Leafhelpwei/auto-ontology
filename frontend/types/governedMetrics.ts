@@ -76,6 +76,7 @@ export type Metric = {
 	description: string;
 	owner_term_id: string;
 	kind: 'atomic' | 'composite';
+	aggregation_strategy?: 'single_fact' | 'independent_facts';
 	source_ids: string[];
 	aggregation: 'sum' | 'count' | 'count_distinct' | null;
 	expression: Expression | null;
@@ -110,6 +111,7 @@ export type MetricQueryRequest = {
 		end_exclusive: string;
 		timezone: string;
 		time_role: string;
+		metric_roles?: Record<string, string>;
 		granularity: Granularity | null;
 	} | null;
 	all_time: boolean;

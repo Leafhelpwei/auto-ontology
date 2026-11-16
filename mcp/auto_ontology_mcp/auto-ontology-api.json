@@ -6264,7 +6264,7 @@
     },
     "/api/metrics/models/{model_id}/certify": {
       "post": {
-        "description": "Record authenticated review evidence and a live PostgreSQL fingerprint.",
+        "description": "Record authenticated review evidence and live dependency fingerprints.",
         "operationId": "post_api_metrics_models_model_id_certify",
         "parameters": [
           {
@@ -13011,6 +13011,12 @@
             ],
             "title": "Aggregation"
           },
+          "aggregation_strategy": {
+            "default": "single_fact",
+            "enum": ["single_fact", "independent_facts"],
+            "title": "Aggregation Strategy",
+            "type": "string"
+          },
           "currency_field_id": {
             "anyOf": [
               {
@@ -13767,6 +13773,20 @@
             ],
             "title": "Operator",
             "type": "string"
+          },
+          "relationship_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Relationship Path"
           },
           "value": {
             "anyOf": [
@@ -16539,6 +16559,13 @@
               }
             ],
             "title": "Granularity"
+          },
+          "metric_roles": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Metric Roles",
+            "type": "object"
           },
           "start": {
             "format": "date-time",

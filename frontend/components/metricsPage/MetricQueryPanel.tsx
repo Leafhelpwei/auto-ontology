@@ -2,6 +2,7 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { atomicMetricDependencies } from '@/lib/governedMetrics';
 import { queryFieldErrors } from '@/lib/metricQueryValidation';
 import { validationErrors, type FieldError } from '@/api/validationErrors';
 import { useState } from 'react';
@@ -132,8 +133,15 @@ export const MetricQueryPanel = ({
 			.filter((item) => item.path === path)
 			.map((item) => item.message)
 			.join(' ');
+	const atomicDependencies = atomicMetricDependencies(model, query.metric_ids);
 	const patch = (value: Partial<MetricQueryRequest>) => {
 		const next = { ...query, ...value };
+		if (value.metric_ids && next.time?.metric_roles)
+			next.time = {
+				...next.time,
+				metric_roles: undefined,
+				time_role: atomicMetricDependencies(model, value.metric_ids)[0]?.time_role ?? '',
+			};
 		setQuery(next);
 		if (fieldErrors.length) setFieldErrors(queryFieldErrors(next));
 		setResult(null);
@@ -384,6 +392,7 @@ export const MetricQueryPanel = ({
 								onChange={(start) =>
 									patch({
 										time: {
+											metric_roles: query.time?.metric_roles,
 											start,
 											end_exclusive: query.time?.end_exclusive ?? '',
 											timezone: query.time?.timezone ?? 'UTC',
@@ -404,6 +413,7 @@ export const MetricQueryPanel = ({
 								onChange={(end_exclusive) =>
 									patch({
 										time: {
+											metric_roles: query.time?.metric_roles,
 											start: query.time?.start ?? '',
 											end_exclusive,
 											timezone: query.time?.timezone ?? 'UTC',
@@ -424,6 +434,7 @@ export const MetricQueryPanel = ({
 								onChange={(timezone) =>
 									patch({
 										time: {
+											metric_roles: query.time?.metric_roles,
 											start: query.time?.start ?? '',
 											end_exclusive: query.time?.end_exclusive ?? '',
 											timezone,
@@ -436,14 +447,62 @@ export const MetricQueryPanel = ({
 									})
 								}
 							/>
+							{query.time && atomicDependencies.length > 1 && (
+								<div className="space-y-2 md:col-span-2">
+									<CheckField
+										label="Use each metric's declared business time role"
+										checked={
+											Object.keys(query.time.metric_roles ?? {}).length > 0
+										}
+										disabled={atomicMetricDependencies(
+											model,
+											query.metric_ids,
+										).some((metric) => !metric.time_role)}
+										onChange={(enabled) => {
+											if (query.time)
+												patch({
+													time: {
+														...query.time,
+														time_role: enabled
+															? 'per_metric'
+															: (atomicMetricDependencies(
+																	model,
+																	query.metric_ids,
+																)[0]?.time_role ?? ''),
+														metric_roles: enabled
+															? Object.fromEntries(
+																	atomicMetricDependencies(
+																		model,
+																		query.metric_ids,
+																	).map((metric) => [
+																		metric.metric_id,
+																		metric.time_role!,
+																	]),
+																)
+															: undefined,
+													},
+												});
+										}}
+									/>
+									<ul className="text-xs text-secondary">
+										{atomicDependencies.map((metric) => (
+											<li key={metric.metric_id}>
+												{metric.name}: {metric.time_role ?? 'No time field'}
+											</li>
+										))}
+									</ul>
+								</div>
+							)}
 							<TextField
 								label="Business time role"
+								disabled={Object.keys(query.time?.metric_roles ?? {}).length > 0}
 								error={fieldError('time.time_role')}
 								value={query.time?.time_role ?? ''}
 								hint="Must match selected metrics"
 								onChange={(time_role) =>
 									patch({
 										time: {
+											metric_roles: query.time?.metric_roles,
 											start: query.time?.start ?? '',
 											end_exclusive: query.time?.end_exclusive ?? '',
 											timezone: query.time?.timezone ?? 'UTC',
@@ -463,6 +522,7 @@ export const MetricQueryPanel = ({
 								onChange={(granularity) =>
 									patch({
 										time: {
+											metric_roles: query.time?.metric_roles,
 											start: query.time?.start ?? '',
 											end_exclusive: query.time?.end_exclusive ?? '',
 											timezone: query.time?.timezone ?? 'UTC',

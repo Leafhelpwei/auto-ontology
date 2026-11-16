@@ -556,7 +556,12 @@ const MetricEditor = ({
 						onChange={(kind) =>
 							patch(
 								kind === 'atomic'
-									? { kind, aggregation: 'count', expression: null }
+									? {
+											kind,
+											aggregation: 'count',
+											expression: null,
+											aggregation_strategy: undefined,
+										}
 									: {
 											kind: 'composite',
 											aggregation: null,
@@ -570,6 +575,25 @@ const MetricEditor = ({
 							)
 						}
 					/>
+					{metric.kind === 'composite' && (
+						<SelectField
+							label="Fact aggregation"
+							value={metric.aggregation_strategy ?? 'single_fact'}
+							options={[
+								{ value: 'single_fact', label: 'One shared fact source' },
+								{
+									value: 'independent_facts',
+									label: 'Aggregate facts separately, then align',
+								},
+							]}
+							hint="Independent facts require registered shared dimensions and explicit time roles."
+							onChange={(value) =>
+								patch({
+									aggregation_strategy: value as Metric['aggregation_strategy'],
+								})
+							}
+						/>
+					)}
 					<TextField
 						label="Unit"
 						value={metric.unit}
@@ -594,7 +618,14 @@ const MetricEditor = ({
 						value={metric.currency_field_id ?? ''}
 						options={[
 							{ value: '', label: 'None' },
-							...options(source?.fields.map((field) => field.field_id) ?? []),
+							...options([
+								...new Set([
+									...(source?.fields.map((field) => field.field_id) ?? []),
+									...(source?.dimensions.map(
+										(dimension) => dimension.field.field_id,
+									) ?? []),
+								]),
+							]),
 						]}
 						onChange={(currency_field_id) =>
 							patch({ currency_field_id: currency_field_id || null })

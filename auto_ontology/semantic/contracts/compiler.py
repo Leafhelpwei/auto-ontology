@@ -41,6 +41,7 @@ from .validator import (
     relationship_path,
     numeric_value,
     logical_field_ref,
+    metric_closure,
     resolve_field,
     storage_timezone,
     validate_query,
@@ -571,6 +572,7 @@ def _compile_source(
     request: MetricQueryRequest,
     closure: list[Metric],
     source: SourceBinding,
+    fact_sources: dict[str, SourceBinding] | None = None,
 ) -> Plan:
     if source.pre_aggregated:
         fail(
@@ -588,7 +590,13 @@ def _compile_source(
     scopes: list[FactScope] = []
     output_dimensions: list[str] = []
     for metric in atomics:
-        scope = FactScope(model, source, metric, request, parameters)
+        scope = FactScope(
+            model,
+            fact_sources.get(metric.metric_id, source) if fact_sources else source,
+            metric,
+            request,
+            parameters,
+        )
         sql, output_dimensions = scope.compile()
         scopes.append(scope)
         ctes.append(f"{atomic_aliases[metric.metric_id]} AS ({sql})")
@@ -597,6 +605,21 @@ def _compile_source(
     atomic_currencies = {
         scope.metric.metric_id: scope.currency_scope for scope in scopes
     }
+    if fact_sources:
+        for scope in scopes:
+            if scope.currency_scope and scope.currency_scope[0] == "group":
+                ref = currency_ref(model, scope.source, scope.metric)
+                dimension_id = next(
+                    dimension
+                    for dimension in request.dimensions
+                    if dimension_path(model, scope.source, dimension)[0] == ref
+                )
+                atomic_currencies[scope.metric.metric_id] = (
+                    "aligned_group",
+                    dimension_id,
+                    ref.source_id,
+                    ref.field_id,
+                )
 
     def effective_currency(metric_id: str) -> tuple[str, ...] | None:
         metric = metrics[metric_id]
@@ -745,6 +768,24 @@ def _compile_source(
         evidence={
             "selected_source_id": source.source_id,
             "source_priority": source.priority,
+            **(
+                {
+                    "fact_aggregation": "independent_before_alignment",
+                    "selected_sources": {
+                        metric_id: fact.source_id
+                        for metric_id, fact in fact_sources.items()
+                    },
+                    "fact_filters": {
+                        fact.source_id: [
+                            predicate.model_dump(mode="json")
+                            for predicate in fact.required_filters
+                        ]
+                        for fact in fact_sources.values()
+                    },
+                }
+                if fact_sources
+                else {}
+            ),
             "metrics": [
                 {
                     "metric_id": metric.metric_id,
@@ -788,6 +829,8 @@ def _compile_source(
 def compile_query(model: GovernedModel, request: MetricQueryRequest) -> Plan:
     """Validate and compile a model snapshot. Never execute or certify it."""
     closure = validate_query(model, request)
+    if any(metric.aggregation_strategy == "independent_facts" for metric in closure):
+        return _compile_independent_facts(model, request, closure)
     common = set.intersection(*(set(metric.source_ids) for metric in closure))
     if not common:
         fail(
@@ -828,3 +871,90 @@ def compile_query(model: GovernedModel, request: MetricQueryRequest) -> Plan:
         "selection_rule": "compatibility_then_priority",
     }
     return best_plan.model_copy(update={"evidence": evidence})
+
+
+def _compile_independent_facts(
+    model: GovernedModel, request: MetricQueryRequest, closure: list[Metric]
+) -> Plan:
+    """Restricted multi-fact plan: one source database and proven shared dimensions.
+
+    Each fact is aggregated independently; no join ever connects fact detail rows.
+    Physical source failures never cause a second candidate-selection pass.
+    """
+    atomics = [metric for metric in closure if metric.kind == "atomic"]
+    selected: dict[str, SourceBinding] = {}
+    excluded: list[dict[str, str]] = []
+    for metric in atomics:
+        viable = []
+        for candidate in sorted(
+            (
+                source
+                for source in model.sources
+                if source.source_id in metric.source_ids
+            ),
+            key=lambda source: (source.priority, source.source_id),
+        ):
+            try:
+                if candidate.pre_aggregated:
+                    fail("UNSUPPORTED_PREAGGREGATION", "Choose a detail fact source")
+                FactScope(model, candidate, metric, request, Parameters()).compile()
+            except ContractError as error:
+                excluded.append(
+                    {
+                        "metric_id": metric.metric_id,
+                        "source_id": candidate.source_id,
+                        "code": error.code,
+                        "reason": error.message,
+                    }
+                )
+            else:
+                viable.append(candidate)
+        if not viable:
+            fail(
+                "NO_COMPATIBLE_SOURCE",
+                f"No compatible fact for {metric.metric_id}: {excluded}",
+            )
+        if len(viable) > 1 and viable[0].priority == viable[1].priority:
+            fail(
+                "AMBIGUOUS_SOURCE",
+                f"Metric {metric.metric_id} has equally preferred fact sources",
+            )
+        selected[metric.metric_id] = viable[0]
+    if len({source.datasource_id for source in selected.values()}) != 1:
+        fail(
+            "CROSS_DATASOURCE",
+            "Independent fact alignment currently requires one database snapshot",
+        )
+    for dimension in request.dimensions:
+        references = {
+            dimension_path(model, source, dimension)[0] for source in selected.values()
+        }
+        if len(references) != 1:
+            fail(
+                "UNPROVEN_DIMENSION_ALIGNMENT",
+                f"Dimension {dimension} must resolve to the same registered field for all facts; matching labels alone are insufficient",
+            )
+    for metric in closure:
+        if metric.kind == "composite" and metric.aggregation_strategy == "single_fact":
+            facts = {
+                selected[dependency.metric_id].source_id
+                for dependency in metric_closure(model, (metric.metric_id,))
+                if dependency.kind == "atomic"
+            }
+            if len(facts) != 1:
+                fail(
+                    "UNSUPPORTED_MULTI_FACT",
+                    f"Composite {metric.metric_id} has not approved independent fact aggregation",
+                )
+    result = _compile_source(
+        model, request, closure, next(iter(selected.values())), selected
+    )
+    return result.model_copy(
+        update={
+            "evidence": {
+                **result.evidence,
+                "excluded_sources": excluded,
+                "selection_rule": "per_metric_compatibility_then_priority",
+            }
+        }
+    )

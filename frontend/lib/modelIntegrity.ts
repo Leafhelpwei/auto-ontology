@@ -99,14 +99,19 @@ export const modelReferenceIssues = (model: GovernedModel): string[] => {
 		);
 		for (const id of metric.supported_dimensions)
 			if (id && !dimensions.has(id)) issues.push(`${owner} references dimension ${id}`);
-		const field = (id: string | null) => {
+		const field = (id: string | null, related = false) => {
 			if (id)
-				metric.source_ids.forEach((source_id) =>
-					fieldRef({ source_id, field_id: id }, owner),
-				);
+				metric.source_ids.forEach((source_id) => {
+					const root = sources.get(source_id);
+					const dimension =
+						related && !root?.fields.some((field) => field.field_id === id)
+							? root?.dimensions.find((dimension) => dimension.field.field_id === id)
+							: undefined;
+					fieldRef(dimension?.field ?? { source_id, field_id: id }, owner);
+				});
 		};
-		field(metric.time_field_id);
-		field(metric.currency_field_id);
+		field(metric.time_field_id, true);
+		field(metric.currency_field_id, true);
 		const expression = (value: Expression | null) => {
 			if (!value) return;
 			if (value.kind === 'field') field(value.field_id);

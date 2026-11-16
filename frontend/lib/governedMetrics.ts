@@ -142,6 +142,7 @@ const modelSchema: z.ZodType<GovernedModel> = z
 					description: z.string(),
 					owner_term_id: z.string(),
 					kind: z.enum(['atomic', 'composite']).default('atomic'),
+					aggregation_strategy: z.enum(['single_fact', 'independent_facts']).optional(),
 					source_ids: z.array(z.string()),
 					aggregation: z
 						.enum(['sum', 'count', 'count_distinct'])
@@ -334,3 +335,27 @@ export const prepareDraftImport = (text: string): GovernedModel => ({
 	...parseModel(text),
 	model_id: crypto.randomUUID(),
 });
+
+/** Resolve the selected expression closure for explicit per-metric time controls. */
+export const atomicMetricDependencies = (model: GovernedModel, selected: string[]): Metric[] => {
+	const byId = new Map(model.metrics.map((metric) => [metric.metric_id, metric]));
+	const visited = new Set<string>(),
+		atomics: Metric[] = [];
+	const expression = (value: Expression | null) => {
+		if (value?.kind === 'metric') visit(value.metric_id);
+		else if (value?.kind === 'binary') {
+			expression(value.left);
+			expression(value.right);
+		}
+	};
+	const visit = (id: string) => {
+		if (visited.has(id)) return;
+		visited.add(id);
+		const metric = byId.get(id);
+		if (!metric) return;
+		if (metric.kind === 'atomic') atomics.push(metric);
+		else expression(metric.expression);
+	};
+	selected.forEach(visit);
+	return atomics;
+};

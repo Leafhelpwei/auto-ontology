@@ -39,6 +39,7 @@ export const metricQuerySchema = z
 						}
 					}, 'Choose a valid IANA timezone.'),
 				time_role: z.string().min(1, 'Enter the business time role.'),
+				metric_roles: z.record(z.string().min(1), z.string().min(1)).optional(),
 				granularity: z.enum(['day', 'month', 'year']).nullable(),
 			})
 			.strict()

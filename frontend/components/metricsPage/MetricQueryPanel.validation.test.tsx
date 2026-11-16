@@ -6,7 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MetricQueryPanel } from './MetricQueryPanel';
 import { governedMetricsApi } from '@/api/governedMetrics';
-import { modelTemplate } from '@/lib/governedMetrics';
+import { modelTemplate, newModel, newMetric } from '@/lib/governedMetrics';
 vi.mock('@/common/icons', () => ({ Icon: () => <span />, IconName: {} }));
 vi.mock('@/api/governedMetrics', () => ({ governedMetricsApi: { query: vi.fn() } }));
 const model = modelTemplate('postgres');
@@ -72,4 +72,73 @@ it('shows invalid time and server validation messages at their fields', async ()
 		).toBe('true'),
 	);
 	expect(screen.getByText('server row policy')).toBeTruthy();
+});
+
+it('preserves explicit per-metric time roles when changing the common interval and resets them on selection changes', async () => {
+	const independent = newModel();
+	const orders = independent.metrics[0];
+	orders.name = 'Orders';
+	orders.time_role = 'created';
+	orders.time_field_id = 'at';
+	const payments = newMetric(2, 'source_1');
+	payments.name = 'Payments';
+	payments.time_role = 'paid';
+	payments.time_field_id = 'at';
+	const ratio = newMetric(3, 'source_1');
+	ratio.name = 'Ratio';
+	ratio.kind = 'composite';
+	ratio.aggregation = null;
+	ratio.aggregation_strategy = 'independent_facts';
+	ratio.expression = {
+		kind: 'binary',
+		operator: 'divide',
+		left: { kind: 'metric', metric_id: payments.metric_id },
+		right: { kind: 'metric', metric_id: orders.metric_id },
+	};
+	independent.metrics.push(payments, ratio);
+	render(
+		<MetricQueryPanel
+			model={independent}
+			revision={1}
+			active
+			enabled
+			canEdit
+			hasUnsaved={false}
+		/>,
+	);
+	fireEvent.click(screen.getByRole('checkbox', { name: /^Ratio \(/ }));
+	fireEvent.change(screen.getByRole('textbox', { name: /Start \(inclusive\)/ }), {
+		target: { value: '2026-01-01T00:00:00Z' },
+	});
+	fireEvent.change(screen.getByRole('textbox', { name: /End \(exclusive\)/ }), {
+		target: { value: '2026-02-01T00:00:00Z' },
+	});
+	fireEvent.click(screen.getByLabelText("Use each metric's declared business time role"));
+	expect(
+		(screen.getByRole('textbox', { name: /Business time role/ }) as HTMLInputElement).disabled,
+	).toBe(true);
+	fireEvent.change(screen.getByRole('textbox', { name: /Timezone/ }), {
+		target: { value: 'Asia/Shanghai' },
+	});
+	fireEvent.click(screen.getByRole('button', { name: 'Execute certified query' }));
+	await waitFor(() =>
+		expect(governedMetricsApi.query).toHaveBeenCalledWith(
+			independent.model_id,
+			'execute',
+			expect.objectContaining({
+				time: expect.objectContaining({
+					timezone: 'Asia/Shanghai',
+					metric_roles: { metric_1: 'created', metric_2: 'paid' },
+				}),
+			}),
+			1,
+			false,
+		),
+	);
+	await waitFor(() => expect(screen.queryByText('Processing governed query…')).toBeNull());
+	fireEvent.click(screen.getByRole('checkbox', { name: /^Orders \(/ }));
+	expect(
+		(screen.getByLabelText("Use each metric's declared business time role") as HTMLInputElement)
+			.checked,
+	).toBe(false);
 });

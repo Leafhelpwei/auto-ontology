@@ -551,6 +551,15 @@ def _validate_model(model: GovernedModel) -> None:
                 )
             validate_predicate(model, predicate)
     for metric in model.metrics:
+        independent = (
+            metric.kind == "composite"
+            and metric.aggregation_strategy == "independent_facts"
+        )
+        if metric.kind == "atomic" and metric.aggregation_strategy != "single_fact":
+            fail(
+                "INVALID_AGGREGATION_STRATEGY",
+                "Independent fact aggregation belongs to a composite metric",
+            )
         output_identifier(metric.metric_id, model.dialect)
         if (
             model.dialect == "mysql"
@@ -569,14 +578,17 @@ def _validate_model(model: GovernedModel) -> None:
             for source_id in metric.source_ids
             if not sources[source_id].pre_aggregated
         ]
-        if len({source_semantics(source) for source in alternatives}) > 1:
+        if (
+            not independent
+            and len({source_semantics(source) for source in alternatives}) > 1
+        ):
             fail(
                 "INCOMPATIBLE_SOURCE_SEMANTICS",
                 "Alternative fact sources require identical logical grain and mandatory row scope",
             )
         logical_types: dict[str, str] = {}
         dimension_types: dict[str, str] = {}
-        for source in alternatives:
+        for source in [] if independent else alternatives:
             for field in source.fields:
                 if (
                     field.field_id in logical_types
@@ -611,7 +623,11 @@ def _validate_model(model: GovernedModel) -> None:
             )
         if (metric.time_field_id is None) != (metric.time_role is None):
             fail("INVALID_TIME", "Time field and time role must be configured together")
-        if metric.supported_granularities and not metric.time_field_id:
+        if (
+            metric.supported_granularities
+            and not metric.time_field_id
+            and not independent
+        ):
             fail("INVALID_TIME", "Time granularities require a configured time field")
         if not alternatives:
             fail(
@@ -723,7 +739,20 @@ def _validate_model(model: GovernedModel) -> None:
             children = [
                 metrics[child] for child in expression_metrics(metric.expression)
             ]
-            if not set.intersection(
+            if metric.aggregation_strategy == "independent_facts":
+                if not children:
+                    fail(
+                        "INVALID_COMPOSITE",
+                        "Independent fact aggregation requires metric dependencies",
+                    )
+                if not set.union(*(set(child.source_ids) for child in children)) <= set(
+                    metric.source_ids
+                ):
+                    fail(
+                        "UNKNOWN_SOURCE",
+                        "An independent composite must declare all dependency source alternatives",
+                    )
+            elif not set.intersection(
                 set(metric.source_ids), *(set(child.source_ids) for child in children)
             ):
                 fail(
@@ -738,7 +767,7 @@ def _validate_model(model: GovernedModel) -> None:
                     "UNSUPPORTED_DIMENSION",
                     "Composite dimensions must be supported by every dependency",
                 )
-            if any(
+            if metric.aggregation_strategy != "independent_facts" and any(
                 (child.time_role, child.time_field_id)
                 != (metric.time_role, metric.time_field_id)
                 for child in children
@@ -819,12 +848,13 @@ def validate_query(model: GovernedModel, request: MetricQueryRequest) -> list[Me
             ZoneInfo(time.timezone)
         except (ZoneInfoNotFoundError, ValueError):
             fail("INVALID_TIMEZONE", f"Unknown timezone: {time.timezone}")
+        atomic_ids = {metric.metric_id for metric in closure if metric.kind == "atomic"}
+        if time.metric_roles and set(time.metric_roles) != atomic_ids:
+            fail(
+                "TIME_ROLE_MISMATCH",
+                "Explicit time roles must cover exactly the atomic metric dependencies",
+            )
         for metric in closure:
-            if not metric.time_field_id or metric.time_role != time.time_role:
-                fail(
-                    "TIME_ROLE_MISMATCH",
-                    f"Metric {metric.metric_id} cannot use requested time role",
-                )
             if (
                 time.granularity
                 and time.granularity not in metric.supported_granularities
@@ -832,6 +862,14 @@ def validate_query(model: GovernedModel, request: MetricQueryRequest) -> list[Me
                 fail(
                     "UNSUPPORTED_GRANULARITY",
                     f"Metric {metric.metric_id} does not support {time.granularity}",
+                )
+            if metric.kind != "atomic":
+                continue
+            selected_role = time.metric_roles.get(metric.metric_id, time.time_role)
+            if not metric.time_field_id or metric.time_role != selected_role:
+                fail(
+                    "TIME_ROLE_MISMATCH",
+                    f"Metric {metric.metric_id} cannot use requested time role",
                 )
     for predicate in request.filters:
         validate_predicate(model, predicate)

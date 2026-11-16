@@ -132,6 +132,9 @@ class Metric(Contract):
     description: str
     owner_term_id: str
     kind: Literal["atomic", "composite"] = "atomic"
+    aggregation_strategy: Literal["single_fact", "independent_facts"] = Field(
+        default="single_fact", exclude_if=lambda value: value == "single_fact"
+    )
     source_ids: tuple[str, ...]
     aggregation: Literal["sum", "count", "count_distinct"] | None = None
     expression: Expression | None = None
@@ -170,6 +173,11 @@ class TimeRange(Contract):
     end_exclusive: datetime
     timezone: str
     time_role: str
+    # Explicit per-atomic roles align a shared interval without silently treating
+    # order creation, payment and refund time as the same business event.
+    metric_roles: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     granularity: Literal["day", "month", "year"] | None = None
 
 

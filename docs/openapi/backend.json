@@ -3270,6 +3270,15 @@
             ],
             "title": "Aggregation"
           },
+          "aggregation_strategy": {
+            "default": "single_fact",
+            "enum": [
+              "single_fact",
+              "independent_facts"
+            ],
+            "title": "Aggregation Strategy",
+            "type": "string"
+          },
           "currency_field_id": {
             "anyOf": [
               {
@@ -7045,6 +7054,13 @@
               }
             ],
             "title": "Granularity"
+          },
+          "metric_roles": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Metric Roles",
+            "type": "object"
           },
           "start": {
             "format": "date-time",
