@@ -12,21 +12,17 @@ pool keeps the cold-start cost off the request path.
 Concurrency model
 -----------------
 Each conversation gets its own warm agent subprocess and may only have one
-in-flight stream at a time; different conversations run fully independently
-(each `WarmPool.acquire()` cold-starts a fresh subprocess if no standby is
-free, so there's no cap on how many conversations can run concurrently).
+in-flight stream at a time. Global and per-user admission limits are checked
+before allocating a worker; process capacity is shared across query modes.
 Slots are keyed by the authenticated user plus ``conversation_id``. Stateless
 calls (no ``conversation_id``, see ``ChatRequest``) get a fresh, unique key
 per request instead and so never contend with anything.
 
 * If the conversation's slot is empty → request runs.
-* If the slot is held by a stream whose **client is still connected**
-  (typical case: a second browser window/tab posting concurrently into the
-  same conversation) → the new request is rejected with HTTP 409.
-* If the slot is held by an **orphaned** stream (its ASGI client disconnected
-  and ``client_alive`` was cleared) → the new request preempts: the orphan
-  worker is killed-and-replaced via the pool, and the new request takes the
-  standby.
+* A reserved, running or finalizing conversation rejects another request
+  with HTTP 409 until its slot has been released.
+* Disconnecting leaves the run active. Use ``/chat/watch`` to reattach or
+  explicitly cancel before submitting a replacement question.
 
   **Web-app caveat:** the Next.js ``/api/chat/completions`` proxy tees the
   upstream SSE stream and keeps the FastAPI connection alive until the run
@@ -42,8 +38,8 @@ tab) only clears ``client_alive`` — it does **not** cancel the run. ``_pump``
 keeps draining the worker and persisting the result independently of any HTTP
 connection, so the agent always finishes and the full answer always lands in
 the conversation, whether or not anyone is still watching. The only things
-that actually kill an in-flight worker are an explicit ``POST /chat/cancel``
-(Stop button) or a genuinely new question preempting an orphaned slot above.
+that kill an in-flight worker are explicit ``POST /chat/cancel`` (Stop),
+request deadlines, process failures or invalid worker messages.
 Reattach with ``/chat/watch`` to see a run that kept going after you left.
 
 The chart/table bubble is guaranteed too
@@ -66,7 +62,7 @@ slow in practice — the kernel buffers small writes and disconnect-triggered
 GeneratorExit only fires when the response object is garbage-collected,
 which can be tens of seconds. We instead spawn a per-request async watchdog
 that polls ASGI ``http.disconnect`` and clears ``client_alive`` within one
-poll interval (~100 ms), freeing the slot for any follow-up request.
+poll interval (~100 ms), without releasing the running conversation.
 """
 
 from __future__ import annotations
@@ -74,6 +70,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -101,7 +98,13 @@ from auto_ontology.server.chat.conversation_dal import (
     prepare_conversation,
 )
 from auto_ontology.server.chat.settings_dal import is_visualization_enabled
-from auto_ontology.server.chat.worker import PrewarmedWorker, get_pool, get_metrics_pool
+from auto_ontology.server.chat.worker import (
+    PrewarmedWorker,
+    get_pool,
+    get_metrics_pool,
+    WorkerBusy,
+    WorkerStartupError,
+)
 from auto_ontology.server.chat.metrics_flow import require_metric_access
 from auto_ontology.semantic.contracts.models import ContractError
 from auto_ontology.server.identity import resolve_internal_user
@@ -247,29 +250,62 @@ class _Slot:
 # for stateless calls), so distinct users and conversations never contend.
 _active_slots: dict[str, _Slot] = {}
 _slot_lock = threading.Lock()
+_pending_slots: dict[str, str | None] = {}
+_MAX_USER_RUNS = max(1, int(os.getenv("CHAT_MAX_RUNS_PER_USER", "2")))
+_MAX_ACTIVE_RUNS = max(1, int(os.getenv("CHAT_MAX_WORKERS", "4")))
+
+
+def _reserve_slot(key: str, user_id: str | None) -> None:
+    """Reject conflicting/over-limit work before allocating threads or processes."""
+    with _slot_lock:
+        previous = _active_slots.get(key)
+        if key in _pending_slots or previous is not None:
+            raise HTTPException(409, detail="Conversation in progress")
+        running = list(_active_slots.values())
+        if len(running) + len(_pending_slots) >= _MAX_ACTIVE_RUNS:
+            raise HTTPException(
+                429, detail="Chat capacity is full", headers={"Retry-After": "2"}
+            )
+        used = sum(slot.user_id == user_id for slot in running) + sum(
+            owner == user_id for owner in _pending_slots.values()
+        )
+        if used >= _MAX_USER_RUNS:
+            raise HTTPException(
+                429, detail="User chat capacity is full", headers={"Retry-After": "2"}
+            )
+        _pending_slots[key] = user_id
+
+
+async def _acquire_worker(pool: Any) -> PrewarmedWorker:
+    task = asyncio.create_task(asyncio.to_thread(pool.acquire))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+
+        def recycle(completed: asyncio.Task) -> None:
+            if not completed.cancelled() and completed.exception() is None:
+                pool.return_alive(completed.result())
+
+        task.add_done_callback(recycle)
+        raise
 
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
-def _try_claim_slot(new_slot: _Slot) -> _Slot | None:
-    """Install ``new_slot`` under its key if the previous holder is gone.
-
-    Returns the displaced slot (caller must replace its worker via the pool)
-    on success. Raises HTTPException(409) if the previous slot for this key
-    still has a live client.
-    """
+def _try_claim_slot(new_slot: _Slot) -> None:
+    """Claim only an empty slot; a finished run must still complete release."""
 
     with _slot_lock:
         prev = _active_slots.get(new_slot.key)
-        if prev is not None and prev.client_alive.is_set():
+        if prev is not None:
             raise HTTPException(
                 status_code=409,
                 detail="Conversation in progress",
             )
         _active_slots[new_slot.key] = new_slot
-        return prev
+        _pending_slots.pop(new_slot.key, None)
 
 
 def _release(slot: _Slot) -> None:
@@ -280,12 +316,11 @@ def _release(slot: _Slot) -> None:
     second is a no-op via ``slot.released``.
     """
 
-    if slot.released.is_set():
-        return
-    slot.released.set()
-    slot.client_alive.clear()
-
     with _slot_lock:
+        if slot.released.is_set():
+            return
+        slot.released.set()
+        slot.client_alive.clear()
         if _active_slots.get(slot.key) is slot:
             del _active_slots[slot.key]
 
@@ -310,10 +345,8 @@ async def _watch_disconnect(http_request: Request, slot: _Slot) -> None:
     the agent off mid-answer: ``_pump`` keeps draining the worker and
     persisting the result regardless of whether anyone is watching, so the
     run always finishes and the full answer always lands in the
-    conversation. Clearing ``client_alive`` only makes the slot eligible
-    for preemption — i.e. a genuinely new question posted into the same
-    conversation (see ``_try_claim_slot``) is what actually cancels an
-    orphaned run, not the mere act of disconnecting.
+    conversation. The slot remains reserved until persistence and release
+    finish; reconnecting never implicitly cancels or replaces a run.
     """
 
     while slot.client_alive.is_set():
@@ -489,17 +522,26 @@ def _pump(slot: _Slot) -> None:
                 if charts_event is not None:
                     with slot.buffer_lock:
                         slot.buffer.append(charts_event)
-    except RuntimeError as exc:
-        logger.exception("Agent stream failed")
-        error_event = {"type": "error", "message": f"Agent stream failed: {exc}"}
+    except Exception as exc:
+        was_cancelled = slot.cancelled.is_set()
+        slot.cancelled.set()
+        logger.error("Agent stream failed error_class=%s", type(exc).__name__)
+        error_event = {
+            "type": "error",
+            "message": "Request cancelled" if was_cancelled else "Agent stream failed",
+        }
         if slot.query_mode == "metrics":
-            message = "标准指标查询失败。未运行探索查询。"
+            message = (
+                "标准指标查询已取消。"
+                if was_cancelled
+                else "标准指标查询失败。未运行探索查询。"
+            )
             context = {
                 **(slot.query_context or {}),
-                "status": "error",
+                "status": "cancelled" if was_cancelled else "error",
                 "trusted": False,
                 "clarification": {
-                    "code": "WORKER_FAILED",
+                    "code": "QUERY_CANCELLED" if was_cancelled else "WORKER_FAILED",
                     "message": message,
                     "options": [],
                 },
@@ -630,7 +672,11 @@ async def chat_completions(
     runs the question statelessly: no history, no persisted turn, and no chart
     step (``_build_charts_event`` needs a conversation to save into).
     """
-    logger.info("Chat request mode=%s question_chars=%d", request.query_mode, len(request.question))
+    logger.info(
+        "Chat request mode=%s question_chars=%d",
+        request.query_mode,
+        len(request.question),
+    )
 
     if request.query_mode == "explore" and not semantic_layer_calculated():
         raise HTTPException(status_code=409, detail=_SEMANTIC_MISSING_MSG)
@@ -662,8 +708,22 @@ async def chat_completions(
     subject_token = (
         _subject_token(http_request) if request.query_mode == "explore" else None
     )
-    pool = get_metrics_pool() if request.query_mode == "metrics" else get_pool()
-    worker = await asyncio.to_thread(pool.acquire)
+    _reserve_slot(key, user_id)
+    try:
+        pool = get_metrics_pool() if request.query_mode == "metrics" else get_pool()
+        worker = await _acquire_worker(pool)
+    except (WorkerBusy, WorkerStartupError) as exc:
+        with _slot_lock:
+            _pending_slots.pop(key, None)
+        raise HTTPException(
+            503,
+            detail="Chat worker unavailable; retry shortly",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except BaseException:
+        with _slot_lock:
+            _pending_slots.pop(key, None)
+        raise
     query_context: dict[str, Any] = {"version": 1, "query_mode": request.query_mode}
     if request.metric_context is not None:
         query_context.update(
@@ -690,29 +750,14 @@ async def chat_completions(
     slot.client_alive.set()
 
     try:
-        displaced = _try_claim_slot(slot)
+        _try_claim_slot(slot)
     except HTTPException:
+        with _slot_lock:
+            _pending_slots.pop(key, None)
         # Lost the race against a still-connected sibling — return the
         # acquired worker to the pool so we don't waste its warm state.
         pool.return_alive(worker)
         raise
-
-    if displaced is not None:
-        # Previous client was gone — replace the orphan via the pool so a
-        # fresh standby is on its way for the next request.
-        displaced.cancelled.set()
-        await asyncio.to_thread(displaced.worker.kill)
-        if not await asyncio.to_thread(displaced.finished.wait, 5):
-            # Preserve the old finalization barrier after returning 409. A
-            # subsequent request must still wait for its terminal DB write.
-            with _slot_lock:
-                if _active_slots.get(key) is slot and not displaced.finished.is_set():
-                    _active_slots[key] = displaced
-            _release(slot)
-            raise HTTPException(
-                409,
-                detail="Previous conversation turn is still being finalized; retry shortly",
-            )
 
     conversation_history: list[dict[str, Any]] = []
     if request.conversation_id is not None and user_id is not None:
@@ -759,24 +804,31 @@ async def chat_completions(
         except Exception:  # noqa: BLE001 — analytics is best-effort
             logger.exception("Failed to create stateless conversation analytics")
 
-    if request.query_mode == "metrics":
-        worker.submit(
-            request.question,
-            metric_context=request.metric_context.model_dump(mode="json"),
-            user_id=user_id,
-            persistent=request.conversation_id is not None,
-            turn_id=slot.analytics_id,
-            conversation_history=conversation_history,
-        )
-    else:
-        worker.submit(
-            request.question,
-            prediction=request.prediction,
-            target_db=target_db,
-            subject_token=subject_token,
-            conversation_history=conversation_history,
-            evidence=request.evidence,
-        )
+    try:
+        if request.query_mode == "metrics":
+            worker.submit(
+                request.question,
+                metric_context=request.metric_context.model_dump(mode="json"),
+                user_id=user_id,
+                persistent=request.conversation_id is not None,
+                turn_id=slot.analytics_id,
+                conversation_history=conversation_history,
+            )
+        else:
+            worker.submit(
+                request.question,
+                prediction=request.prediction,
+                target_db=target_db,
+                subject_token=subject_token,
+                conversation_history=conversation_history,
+                evidence=request.evidence,
+            )
+    except Exception as exc:
+        slot.cancelled.set()
+        _release(slot)
+        raise HTTPException(
+            503, detail="Chat worker could not accept the request"
+        ) from exc
     threading.Thread(target=_pump, args=(slot,), daemon=True).start()
     asyncio.create_task(_watch_disconnect(http_request, slot))
 

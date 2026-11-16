@@ -34,18 +34,30 @@ SPDX-License-Identifier: Apache-2.0
 
 已核对 Contributor Covenant 2.1 的上游许可，使用 sidecar 修复 `CODE_OF_CONDUCT.md` 的 SPDX 缺失，保留原文归属及联系方式；许可检查 11 passed。
 
+## 批次 3：Chat 请求隔离与工作进程生命周期
+
+- 输入/输出均绑定服务器生成的 request ID；ERROR、错配消息、异常退出和请求超时会淘汰工作进程，不能复用遗留 DONE 或其他用户结果。
+- 会话互斥、每用户运行数和总运行数在创建工作进程之前检查。完成但尚未释放的任务仍保留互斥，断开浏览器不会隐式抢占。
+- 初始化有独立时限和 READY 检查；失败返回 503。全局进程容量包含预热进程，队列和单条 IPC 消息有上限。
+- 取消、初始化期间取消、刷新配置、停机、父进程 SIGKILL 均有资源回收路径；本地 generation 阻止旧配置进程重新入池。跨副本 generation 和运行状态仍待实现。
+- 使用实际 spawn 子进程验证不同用户/token 的 A/B/C 隔离、错误后的旧 DONE、错配 ID、突然退出、启动/请求超时、并发拒绝、句柄回收及父进程死亡；未用这些结果替代真实 SSO/生产验收。
+
+运行预算可通过 `CHAT_MAX_WORKERS`（默认 4）、`CHAT_MAX_RUNS_PER_USER`（默认 2）、`CHAT_WORKER_STARTUP_TIMEOUT_S`（默认 60）、`CHAT_REQUEST_TIMEOUT_S`（默认 180）和 `CHAT_MAX_EVENT_BYTES`（默认 2097152）调整。仍需完成查询结果流式预算及共享运行存储。
+
+验证（2026-11-16）：隔离 PostgreSQL 16.2（Alembic + Prisma）和 MySQL 5.7.44 上执行 `pytest auto_ontology/server/chat/tests auto_ontology/connectors/tests/test_mysql57_read_transaction.py -q -W error::pytest.PytestUnhandledThreadExceptionWarning`，60 passed / 0 failed / 0 skipped，覆盖会话持久化、查询取消和实际子进程。另有一条 Starlette 测试客户端依赖弃用提示，无线程回收警告。后端全量 Ruff 检查、OpenAPI 重建与 diff 检查通过。这是本批测试数量，不是 60 项审计全部完成的声明。
+
 ## 按原始编号跟踪
 
 “已实现，待完整验收”只表示当前代码与局部回归具备对应修复；必须逐条满足原始验收条件才能关闭。其余条目仍需实现或重验。
 
 | 编号 | 原问题 | 当前状态 |
 | --- | --- | --- |
-| RUNTIME-01 | 报错后的旧 DONE 标记污染下一请求，工作进程复用可错配后续用户结果 | 待重建/验证 |
+| RUNTIME-01 | 报错后的旧 DONE 标记污染下一请求，工作进程复用可错配后续用户结果 | 已实现，待完整验收 |
 | RUNTIME-02 | Chat 在途状态仅存进程内，多副本时取消、重连和会话互斥不一致 | 待重建/验证 |
-| RUNTIME-03 | 会话并发无总量限制，且重复请求在检查409之前已创建工作进程 | 待重建/验证 |
-| RUNTIME-04 | 工作进程初始化等待无截止时间，也不检查死亡或READY失败 | 待重建/验证 |
+| RUNTIME-03 | 会话并发无总量限制，且重复请求在检查409之前已创建工作进程 | 单实例已实现，待跨实例验收 |
+| RUNTIME-04 | 工作进程初始化等待无截止时间，也不检查死亡或READY失败 | 已实现，待完整验收 |
 | RUNTIME-05 | 探索SQL结果全量读取和序列化，缺少行数及字节预算 | 待重建/验证 |
-| RUNTIME-06 | 刷新连接配置后，在途旧worker可重新成为standby并继续使用旧配置 | 待重建/验证 |
+| RUNTIME-06 | 刷新连接配置后，在途旧worker可重新成为standby并继续使用旧配置 | 本地 generation 已实现，跨实例待实现 |
 | RUNTIME-07 | 摄取202仅表示进程内启动，缺少可恢复任务与可区分的中断状态 | 待重建/验证 |
 | RUNTIME-08 | 同源摄取、删除和多副本调度之间没有统一的分布式互斥 | 待重建/验证 |
 | RUNTIME-09 | Embedding按首个成功chunk删除旧索引，后续失败会暴露不完整新索引 | 待重建/验证 |

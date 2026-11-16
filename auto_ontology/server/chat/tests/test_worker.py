@@ -138,10 +138,9 @@ def test_worker_entrypoint_installs_cleanup_only_in_child(
     )
     incoming, outgoing = _FakeQueue(), _FakeQueue()
     worker_module._worker_entrypoint(incoming, outgoing, "metrics")
-    assert calls == [
-        (signal.SIGTERM, worker_module._terminate_worker),
-        (incoming, outgoing),
-    ]
+    assert calls[0] == (signal.SIGTERM, worker_module._terminate_worker)
+    assert calls[1][0].queue is incoming
+    assert calls[1][1].queue is outgoing
 
 
 def test_worker_sigterm_cancels_mysql_before_exiting(monkeypatch: MonkeyPatch) -> None:

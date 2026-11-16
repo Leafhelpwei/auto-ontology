@@ -2,38 +2,22 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Long-lived prewarmed agent subprocess + a single-slot warm pool.
-
-The agent pipeline is sync Python that spends most of its time inside
-C-level calls (psycopg, httpx, embedding clients). We can't interrupt
-those from another Python thread, so cancellation has to go through the
-OS via process kill — same constraint as before.
-
-What's new vs. spawn-per-request: we keep **one** subprocess alive
-between requests. It imports the agent and builds the
-retriever/connector singletons once, then loops on an input queue:
-``("ask", question)`` → stream agent events on the output queue → idle
-again. The cold-start cost is paid at server boot and at each cancel
-(when we kill+respawn), not per request.
-
-The router (see ``router.py``) now allows one in-flight stream *per
-conversation* rather than one globally, so any number of conversations may
-run concurrently. This pool still only keeps a single warm standby: the
-first conversation to ask finds it prewarmed, and any additional concurrent
-conversations simply pay a cold start (``acquire()`` spawns a fresh
-subprocess on demand) — there is no cap on how many can run at once, just
-no more than one pre-warmed spare at a time.
-"""
+"""Bounded subprocess workers with request-scoped messages and poisoned-worker eviction."""
 
 from __future__ import annotations
 
 import logging
+import json
+import select
+import time
+import uuid
+import weakref
 import multiprocessing as mp
 import os
 import signal
 import threading
 from queue import Empty
-from typing import Any, Generator
+from typing import Any, Generator, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +54,90 @@ def _terminate_worker(signum: int, _frame: Any) -> None:
         os._exit(128 + signum)
 
 
+class WorkerBusy(RuntimeError):
+    """No capacity is available before spawning another process."""
+
+
+class WorkerStartupError(RuntimeError):
+    """A worker failed its bounded startup handshake."""
+
+
+_MAX_WORKERS = max(1, int(os.getenv("CHAT_MAX_WORKERS", "4")))
+_PROCESS_PERMITS = threading.BoundedSemaphore(_MAX_WORKERS)
+_STARTUP_TIMEOUT_S = float(os.getenv("CHAT_WORKER_STARTUP_TIMEOUT_S", "60"))
+_REQUEST_TIMEOUT_S = float(os.getenv("CHAT_REQUEST_TIMEOUT_S", "180"))
+_MAX_IPC_BYTES = int(os.getenv("CHAT_MAX_EVENT_BYTES", "2097152"))
+_POOLS: weakref.WeakSet = weakref.WeakSet()
+_POOLS_LOCK = threading.Lock()
+
+
+class _RequestInput:
+    def __init__(self, queue: Any, context: dict[str, str | None]) -> None:
+        self.queue, self.context = queue, context
+
+    def get(self) -> tuple[str, Any]:
+        frame = self.queue.get()
+        if not isinstance(frame, tuple) or len(frame) != 3:
+            raise EOFError("Invalid request envelope")
+        tag, request_id, payload = frame
+        if tag != _MSG_ASK or not isinstance(request_id, str) or not request_id:
+            raise EOFError("Invalid request identifier")
+        self.context["request_id"] = request_id
+        return tag, payload
+
+
+class _RequestOutput:
+    def __init__(self, queue: Any, context: dict[str, str | None]) -> None:
+        self.queue, self.context = queue, context
+
+    def put(self, item: tuple[str, Any]) -> None:
+        tag, payload = item
+        if len(json.dumps(payload, default=str).encode()) > _MAX_IPC_BYTES:
+            raise RuntimeError("Worker event byte budget exceeded")
+        self.queue.put((tag, self.context["request_id"], payload))
+
+
+def _watch_parent(parent_pid: int) -> None:
+    """pidfd avoids the thread-parent trap of PR_SET_PDEATHSIG and PID reuse."""
+    descriptor = None
+    try:
+        try:
+            descriptor = os.pidfd_open(parent_pid)
+        except (AttributeError, OSError):
+            pass
+        while True:
+            if descriptor is not None:
+                if select.select([descriptor], [], [], 0.5)[0]:
+                    break
+            elif os.getppid() != parent_pid:
+                break
+            else:
+                time.sleep(0.5)
+        # A dead parent cannot enforce the usual SIGKILL grace period.
+        timer = threading.Timer(_TERMINATE_GRACE_S, os._exit, args=(143,))
+        timer.daemon = True
+        timer.start()
+        _terminate_worker(signal.SIGTERM, None)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _worker_entrypoint(
-    in_q: "mp.Queue[tuple[str, Any]]",
-    out_q: "mp.Queue[tuple[str, Any]]",
+    in_q: Any,
+    out_q: Any,
     mode: str,
+    parent_pid: int | None = None,
+    loop_override: Callable | None = None,
 ) -> None:
-    # Install only inside the subprocess, never in the server or test caller.
     signal.signal(signal.SIGTERM, _terminate_worker)
-    loop = _metrics_worker_loop if mode == "metrics" else _worker_loop
-    loop(in_q, out_q)
+    if parent_pid is not None:
+        threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
+    context: dict[str, str | None] = {"request_id": None}
+    loop = loop_override or (
+        _metrics_worker_loop if mode == "metrics" else _worker_loop
+    )
+    loop(_RequestInput(in_q, context), _RequestOutput(out_q, context))
 
 
 def _worker_loop(
@@ -108,7 +167,6 @@ def _worker_loop(
 
         from auto_ontology.connectors import get_connectors
         from auto_ontology.utils.llm_invoke import (
-            get_llm_client,
             get_non_reasoning_llm_client,
         )
         from auto_ontology.utils import (
@@ -127,17 +185,12 @@ def _worker_loop(
         try:
             follow_up_llm = get_non_reasoning_llm_client(max_tokens=1024)
         except Exception:
-            try:
-                follow_up_llm = get_llm_client(max_tokens=1024)
-            except Exception:
-                logger.exception(
-                    "No LLM available for follow-up resolution; using raw questions"
-                )
-                follow_up_llm = None
+            # Missing configuration must not redirect conversation history.
+            follow_up_llm = None
     except BaseException as exc:  # noqa: BLE001 — surface init failure to parent
-        logger.exception("Worker init failed")
+        logger.error("Worker initialization failed error_class=%s", type(exc).__name__)
         try:
-            out_q.put((_TAG_ERROR, f"Worker init failed: {exc}"))
+            out_q.put((_TAG_ERROR, "Worker initialization failed"))
             out_q.put((_TAG_DONE, None))
         except Exception:  # noqa: BLE001
             pass
@@ -202,9 +255,9 @@ def _worker_loop(
                 llm=follow_up_llm,
             )
             logger.info(
-                "Conversation context resolution: follow_up=%s processing_question=%s",
+                "Conversation context resolution: follow_up=%s question_chars=%d",
                 is_follow_up,
-                processing_question,
+                len(processing_question),
             )
             custom_prompts = fetch_custom_prompts()
 
@@ -224,12 +277,13 @@ def _worker_loop(
             for event in stream_agent_response(agent_payload):
                 out_q.put((_TAG_EVENT, event))
         except BaseException as exc:  # noqa: BLE001 — surface to parent
-            logger.exception("Agent run failed")
+            logger.error("Agent run failed error_class=%s", type(exc).__name__)
             try:
-                out_q.put((_TAG_ERROR, str(exc)))
+                out_q.put((_TAG_ERROR, "Agent execution failed"))
             except Exception:  # noqa: BLE001
                 pass
-        finally:
+            return
+        else:
             try:
                 out_q.put((_TAG_DONE, None))
             except Exception:  # noqa: BLE001
@@ -260,40 +314,53 @@ def _metrics_worker_loop(
         try:
             for event in stream_metric_response(payload):
                 out_q.put((_TAG_EVENT, event))
-        except BaseException:
-            logger.exception("Metric worker failed")
+        except BaseException as exc:
+            logger.error("Metric worker failed error_class=%s", type(exc).__name__)
             out_q.put((_TAG_ERROR, "Governed metric query failed"))
-        finally:
+            return
+        else:
             out_q.put((_TAG_DONE, None))
 
 
 class PrewarmedWorker:
-    """A subprocess running ``_worker_loop`` — imports done, ready to ask.
+    """One request at a time; failed, expired or mismatched streams are never reused."""
 
-    Lifecycle:
-
-        worker = PrewarmedWorker()  # spawns subprocess; returns immediately
-        worker.submit(question)     # enqueue question
-        for event in worker.events():  # iterate until DONE / proc death
-            ...
-        # Optionally reuse: worker is now idle, can take another submit().
-        worker.kill()               # SIGTERM → SIGKILL; idempotent
-    """
-
-    def __init__(self, mode: str = "explore") -> None:
+    def __init__(
+        self, mode: str = "explore", *, loop_override: Callable | None = None
+    ) -> None:
         self._mode = mode
+        self._closed = False
+        self._ready = False
+        self._request_id: str | None = None
+        self._kill_lock = threading.Lock()
+        self._permit = False
+        self._owns_process = True
+        if not _PROCESS_PERMITS.acquire(blocking=False):
+            raise WorkerBusy("Chat worker capacity is full")
+        self._permit = True
         self._ctx = mp.get_context("spawn")
-        self._in_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
-        self._out_q: "mp.Queue[tuple[str, Any]]" = self._ctx.Queue()
-        self._proc = self._ctx.Process(
-            target=_worker_entrypoint,
-            args=(self._in_q, self._out_q, mode),
-            daemon=True,
-        )
-        self._proc.start()
+        try:
+            self._in_q = self._ctx.Queue(maxsize=1)
+            self._out_q = self._ctx.Queue(maxsize=128)
+            # A killed child may close its read end during a pending send.
+            # This is deliberate cancellation, not an asynchronous feed error.
+            self._in_q._ignore_epipe = True
+            self._out_q._ignore_epipe = True
+            self._proc = self._ctx.Process(
+                target=_worker_entrypoint,
+                args=(self._in_q, self._out_q, mode, os.getpid(), loop_override),
+                daemon=True,
+            )
+            self._proc.start()
+        except BaseException:
+            self.kill()
+            raise
 
     def is_alive(self) -> bool:
-        return self._proc.is_alive()
+        return not getattr(self, "_closed", False) and self._proc.is_alive()
+
+    def reusable(self) -> bool:
+        return self.is_alive() and self._ready and self._request_id is None
 
     def submit(
         self,
@@ -308,174 +375,286 @@ class PrewarmedWorker:
         persistent: bool = False,
         turn_id: str | None = None,
     ) -> None:
-        """Ask *question*, optionally forcing the prediction/SQL branch.
-
-        *prediction* mirrors the API parameter: True or False skips the
-        classification step, None classifies as usual.
-        *target_db* scopes the run to one connected database when set.
-        *subject_token* is the caller's SSO JWT. When present the worker builds
-        per-user connectors for this question instead of using the prewarmed
-        ones, so SQL executes under that user's own Databricks grants.
-        *evidence* is optional authoritative evidence kept separate from
-        the question.
-        """
+        if not self.reusable():
+            raise RuntimeError("Worker is not ready for a new request")
         if self._mode == "metrics":
-            self._in_q.put(
-                (
-                    _MSG_ASK,
-                    {
-                        "question": question,
-                        "metric_context": metric_context,
-                        "user_id": user_id,
-                        "persistent": persistent,
-                        "turn_id": turn_id,
-                        "conversation_history": conversation_history or [],
-                    },
-                )
+            payload = {
+                "question": question,
+                "metric_context": metric_context,
+                "user_id": user_id,
+                "persistent": persistent,
+                "turn_id": turn_id,
+                "conversation_history": conversation_history or [],
+            }
+        else:
+            payload = (
+                question,
+                prediction,
+                target_db,
+                subject_token,
+                conversation_history or [],
+                evidence,
             )
-            return
-        self._in_q.put(
-            (
-                _MSG_ASK,
-                (
-                    question,
-                    prediction,
-                    target_db,
-                    subject_token,
-                    conversation_history or [],
-                    evidence,
-                ),
-            )
-        )
+        if len(json.dumps(payload, default=str).encode()) > _MAX_IPC_BYTES:
+            raise ValueError("Worker request byte budget exceeded")
+        self._request_id = uuid.uuid4().hex
+        self._run_deadline = time.monotonic() + _REQUEST_TIMEOUT_S
+        try:
+            self._in_q.put((_MSG_ASK, self._request_id, payload), timeout=1)
+        except BaseException:
+            self.kill()
+            raise
 
     def events(self) -> Generator[dict[str, Any] | None, None, None]:
-        """Yield agent events for the current question.
-
-        ``None`` is yielded when the queue is empty so the router can write
-        an SSE heartbeat comment to keep proxies/load balancers happy.
-        Returns when the worker emits ``done`` or the subprocess dies.
-        Raises ``RuntimeError`` on worker-reported errors.
-        """
-
-        while True:
-            try:
-                tag, value = self._out_q.get(timeout=_QUEUE_POLL_S)
-            except Empty:
-                if not self._proc.is_alive():
+        if not self._request_id:
+            raise RuntimeError("Worker has no submitted request")
+        expected = self._request_id
+        try:
+            while True:
+                if time.monotonic() >= self._run_deadline:
+                    raise RuntimeError("Chat request deadline exceeded")
+                try:
+                    frame = self._out_q.get(timeout=_QUEUE_POLL_S)
+                except Empty:
+                    if not self.is_alive():
+                        raise RuntimeError(
+                            "Worker exited before completing its request"
+                        )
+                    yield None
+                    continue
+                if not isinstance(frame, tuple) or len(frame) != 3:
+                    raise RuntimeError("Invalid worker event envelope")
+                tag, request_id, value = frame
+                if request_id != expected:
+                    raise RuntimeError("Worker event belongs to another request")
+                if tag == _TAG_ERROR:
+                    raise RuntimeError("Worker execution failed")
+                if tag == _TAG_DONE:
+                    self._request_id = None
                     return
-                yield None
-                continue
-            if tag == _TAG_DONE:
-                return
-            if tag == _TAG_ERROR:
-                raise RuntimeError(value)
-            if tag == _TAG_READY:
-                # Drained from a previous-readiness or warm-replay; ignore.
-                continue
-            yield value  # _TAG_EVENT
+                if tag != _TAG_EVENT or not isinstance(value, dict):
+                    raise RuntimeError("Invalid worker event")
+                yield value
+        except BaseException:
+            self.kill()
+            raise
 
     def drain_until_ready(self, timeout: float | None = None) -> bool:
-        """Block until the subprocess has finished its imports.
-
-        Returns False if the worker errored or didn't become ready within
-        the timeout. The pool uses this on warm spawns to log health; the
-        request path doesn't need to wait — submit/events handle a still-
-        warming worker transparently (they just block longer).
-        """
-
-        try:
-            tag, _ = self._out_q.get(timeout=timeout)
-        except Empty:
-            return False
-        return tag == _TAG_READY
+        if self._ready:
+            return self.is_alive()
+        deadline = time.monotonic() + (
+            timeout if timeout is not None else _STARTUP_TIMEOUT_S
+        )
+        while time.monotonic() < deadline and self.is_alive():
+            try:
+                frame = self._out_q.get(
+                    timeout=min(_QUEUE_POLL_S, max(0.001, deadline - time.monotonic()))
+                )
+            except Empty:
+                continue
+            if frame == (_TAG_READY, None, None):
+                self._ready = True
+                return True
+            break
+        self.kill()
+        return False
 
     def kill(self) -> None:
-        proc = self._proc
-        if not proc.is_alive():
-            return
-        proc.terminate()
-        proc.join(timeout=_TERMINATE_GRACE_S)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=_TERMINATE_GRACE_S)
+        # Also supports externally-owned deterministic test processes.
+        if not hasattr(self, "_kill_lock"):
+            self._kill_lock = threading.Lock()
+        with self._kill_lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            proc = getattr(self, "_proc", None)
+            if proc is not None and proc.pid is not None:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=_TERMINATE_GRACE_S)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=_TERMINATE_GRACE_S)
+                else:
+                    proc.join(timeout=0)
+                if getattr(self, "_owns_process", False) and not proc.is_alive():
+                    proc.close()
+            for name in ("_in_q", "_out_q"):
+                queue = getattr(self, name, None)
+                if queue is not None:
+                    queue.cancel_join_thread()
+                    queue.close()
+                    feeder = getattr(queue, "_thread", None)
+                    if feeder is not None:
+                        feeder.join(timeout=0.5)
+                        if feeder.is_alive():
+                            # No child is reading now. Unblock a pending large
+                            # write, then let the feeder exit before closing its
+                            # writer; closing a live writer races its sentinel.
+                            queue._reader.close()
+                            feeder.join(timeout=0.5)
+                    if feeder is None or not feeder.is_alive():
+                        queue._reader.close()
+                        queue._writer.close()
+            if getattr(self, "_permit", False):
+                self._permit = False
+                _PROCESS_PERMITS.release()
 
 
 class WarmPool:
-    """Maintains exactly one prewarmed standby worker.
-
-    * ``acquire()`` — take the standby (or cold-start synchronously if it
-      isn't there yet); does NOT immediately spawn a replacement, since the
-      caller decides whether the acquired worker will be returned (natural
-      end) or killed (cancel).
-    * ``return_alive(w)`` — request finished naturally; if ``w`` is still
-      alive, put it back as the standby (no fresh spawn needed). Otherwise
-      spawn a new standby.
-    * ``replace(w)`` — request was cancelled; kill ``w`` and spawn a new
-      standby in the background.
-
-    All spawn work happens off the request thread so we never block a POST
-    on subprocess startup unless the standby genuinely isn't there yet.
-    """
+    """One standby per mode, one warming task, and a shared process capacity bound."""
 
     def __init__(self, mode: str = "explore") -> None:
         self._mode = mode
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._standby: PrewarmedWorker | None = None
+        self._leased: set[PrewarmedWorker] = set()
+        self._warming = False
+        self._closed = False
+        self._generation = 0
+        self._warmup_error: Exception | None = None
+        with _POOLS_LOCK:
+            _POOLS.add(self)
         self._spawn_async()
 
     def _spawn_async(self) -> None:
-        threading.Thread(target=self._spawn_sync, daemon=True).start()
-
-    def _spawn_sync(self) -> None:
-        worker = PrewarmedWorker(self._mode)
-        # Block here (off the request path) until imports complete, so
-        # ``acquire()`` is more likely to hand back a fully warm worker.
-        # We don't enforce a timeout — initial imports can be slow on
-        # cold caches and we'd rather wait than serve a half-warm one.
-        worker.drain_until_ready()
         with self._lock:
-            if self._standby is None:
-                self._standby = worker
+            if self._closed or self._warming or self._standby is not None:
                 return
-        # A concurrent return_alive filled the slot first; drop the spare.
-        worker.kill()
+            self._warming = True
+            self._warmup_error = None
+            generation = self._generation
+        threading.Thread(
+            target=self._spawn_sync, args=(generation,), daemon=True
+        ).start()
+
+    def _spawn_sync(self, generation: int) -> None:
+        worker = None
+        try:
+            worker = PrewarmedWorker(self._mode)
+            worker._generation = generation
+            if not worker.drain_until_ready():
+                raise WorkerStartupError("Worker startup failed")
+            with self._lock:
+                if (
+                    not self._closed
+                    and generation == self._generation
+                    and self._standby is None
+                ):
+                    self._standby, worker = worker, None
+        except Exception as exc:
+            with self._lock:
+                if generation == self._generation:
+                    self._warmup_error = exc
+            logger.warning(
+                "Worker warmup unavailable error_class=%s", type(exc).__name__
+            )
+        finally:
+            if worker is not None:
+                worker.kill()
+            with self._condition:
+                self._warming = False
+                self._condition.notify_all()
+
+    def _evict_idle_spare(self) -> bool:
+        with _POOLS_LOCK:
+            pools = list(_POOLS)
+        for pool in pools:
+            if pool is self:
+                continue
+            with pool._lock:
+                worker, pool._standby = pool._standby, None
+            if worker is not None:
+                worker.kill()
+                return True
+        return False
 
     def acquire(self) -> PrewarmedWorker:
+        with self._condition:
+            if self._closed:
+                raise WorkerBusy("Chat worker pool is closed")
+            if self._warming and self._standby is None:
+                if not self._condition.wait_for(
+                    lambda: not self._warming or self._closed,
+                    timeout=_STARTUP_TIMEOUT_S,
+                ):
+                    raise WorkerStartupError("Worker startup deadline exceeded")
+            if self._closed:
+                raise WorkerBusy("Chat worker pool is closed")
+            if self._warmup_error is not None and not isinstance(
+                self._warmup_error, WorkerBusy
+            ):
+                self._warmup_error = None
+                raise WorkerStartupError(
+                    "Worker warmup failed; retry after configuration is repaired"
+                )
+            worker, self._standby = self._standby, None
+            generation = self._generation
+        if worker is not None and not worker.reusable():
+            worker.kill()
+            worker = None
+        if worker is None:
+            try:
+                worker = PrewarmedWorker(self._mode)
+            except WorkerBusy:
+                if not self._evict_idle_spare():
+                    raise
+                worker = PrewarmedWorker(self._mode)
+            worker._generation = generation
+            if not worker.drain_until_ready():
+                raise WorkerStartupError("Worker startup failed")
         with self._lock:
-            w = self._standby
-            self._standby = None
-        if w is not None and w.is_alive():
-            return w
-        # Standby missing/dead — pay cold start synchronously this once.
-        w = PrewarmedWorker(self._mode)
-        w.drain_until_ready()
-        return w
+            if self._closed or generation != self._generation:
+                worker.kill()
+                raise WorkerBusy("Chat worker configuration changed; retry")
+            self._leased.add(worker)
+        return worker
 
     def return_alive(self, worker: PrewarmedWorker) -> None:
-        if not worker.is_alive():
-            self._spawn_async()
-            return
         with self._lock:
-            if self._standby is None:
-                self._standby = worker
+            if self._standby is worker:
                 return
-        worker.kill()
+            owned = worker in self._leased
+            self._leased.discard(worker)
+            keep = (
+                owned
+                and not self._closed
+                and getattr(worker, "_generation", None) == self._generation
+                and worker.reusable()
+                and self._standby is None
+            )
+            if keep:
+                self._standby = worker
+        if not keep:
+            worker.kill()
+        self._spawn_async()
 
     def replace(self, worker: PrewarmedWorker) -> None:
-        worker.kill()
         with self._lock:
-            if self._standby is not None and self._standby.is_alive():
-                return
+            self._leased.discard(worker)
+        worker.kill()
+        self._spawn_async()
+
+    def refresh(self) -> None:
+        with self._lock:
+            self._generation += 1
+            worker, self._standby = self._standby, None
+        if worker is not None:
+            worker.kill()
         self._spawn_async()
 
     def shutdown(self) -> None:
-        """Tear down on server shutdown so we don't leak orphaned subprocs."""
-
-        with self._lock:
-            standby = self._standby
-            self._standby = None
-        if standby is not None:
-            standby.kill()
+        with self._condition:
+            self._closed = True
+            workers = list(self._leased)
+            self._leased.clear()
+            if self._standby is not None:
+                workers.append(self._standby)
+                self._standby = None
+            self._condition.notify_all()
+        for worker in workers:
+            worker.kill()
 
 
 _pool: WarmPool | None = None
@@ -513,16 +692,9 @@ def shutdown_pool() -> None:
 
 
 def refresh_chat_workers() -> None:
-    """Replace the warm standby worker so the next request loads fresh connectors."""
-    pool = get_pool()
-    with pool._lock:
-        standby = pool._standby
-        pool._standby = None
-    if standby is not None:
-        standby.kill()
-    pool._spawn_async()
-    global _metrics_pool
+    """Invalidate standby and leased generations without creating unused pools."""
     with _pool_lock:
-        metrics_pool, _metrics_pool = _metrics_pool, None
-    if metrics_pool is not None:
-        metrics_pool.shutdown()
+        pools = (_pool, _metrics_pool)
+    for pool in pools:
+        if pool is not None:
+            pool.refresh()
