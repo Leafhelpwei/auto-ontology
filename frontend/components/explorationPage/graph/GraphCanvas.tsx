@@ -22,6 +22,15 @@ import { ExplorationLayer } from '@/enums/exploration';
 import type { ExplorationGraph } from '@/types/exploration';
 import { NODE_TYPE_ACCENT_COLOR } from './nodeTypeColors';
 import type { NodeType } from './nodeTypeColors';
+import {
+	GRAPH_LIMITS,
+	expansionBudgetIssue,
+	edgeIdentity,
+	stablePoint,
+	rememberPosition,
+	type Point,
+	type GraphSnapshot,
+} from './graphBudget';
 
 export type HoveredNode = {
 	id: string;
@@ -460,6 +469,7 @@ export type ExpansionEdgeInput = {
 export type GraphController = {
 	getCamera: () => ReturnType<Sigma<GraphNodeAttributes, GraphEdgeAttributes>['getCamera']>;
 	refresh: () => void;
+	setLayoutPaused: (paused: boolean) => void;
 	/**
 	 * Re-derives the frozen graph-to-viewport mapping (see `setCustomBBox`
 	 * below) from every node's *current* position — including any node
@@ -491,7 +501,7 @@ export type GraphController = {
 		originNodeId: string,
 		nodes: ExpansionNodeInput[],
 		edges: ExpansionEdgeInput[],
-	) => void;
+	) => boolean;
 	/**
 	 * Reverses one origin's `addExpansion` call (a double click collapsing a
 	 * table or term back down). Nodes/edges shared with another still-live
@@ -521,6 +531,7 @@ const buildGraphologyGraph = (
 	nodeTypeColor: Record<NodeType, string>,
 	edgeColor: string,
 	containerAspectRatio: number,
+	positions: Map<string, Point>,
 ) => {
 	const graphology = new UndirectedGraph<GraphNodeAttributes, GraphEdgeAttributes>();
 
@@ -572,8 +583,7 @@ const buildGraphologyGraph = (
 	const scatterWidth = scatterHeight * containerAspectRatio;
 	graphology.forEachNode((node) => {
 		graphology.mergeNodeAttributes(node, {
-			x: (Math.random() - 0.5) * scatterWidth,
-			y: (Math.random() - 0.5) * scatterHeight,
+			...(positions.get(node) ?? stablePoint(node, scatterWidth, scatterHeight)),
 		});
 	});
 
@@ -613,6 +623,8 @@ type GraphCanvasProps = {
 	onDoubleClickNode: (nodeId: string) => void;
 	onHoverNode: (hoveredNode: HoveredNode | null) => void;
 	onControllerChange: (controller: GraphController | null) => void;
+	onGraphChange: (snapshot: GraphSnapshot) => void;
+	positions: Map<string, Point>;
 };
 
 /** Sigma.js-backed graph canvas shared by both the semantic and data Exploration layers. */
@@ -626,6 +638,8 @@ export const GraphCanvas = ({
 	onDoubleClickNode,
 	onHoverNode,
 	onControllerChange,
+	onGraphChange,
+	positions,
 }: GraphCanvasProps) => {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const activeNodeIdRef = useRef<string | null>(activeNodeId);
@@ -666,18 +680,23 @@ export const GraphCanvas = ({
 		const containerRect = containerRef.current.getBoundingClientRect();
 		const containerAspectRatio =
 			containerRect.height > 0 ? containerRect.width / containerRect.height : 1;
+		const limitedGraph = {
+			nodes: graph.nodes.slice(0, GRAPH_LIMITS.nodes),
+			links: graph.links.slice(0, GRAPH_LIMITS.edges),
+		};
 		const graphology = buildGraphologyGraph(
-			graph,
+			limitedGraph,
 			isDark ? NODE_TYPE_COLOR_DARK : NODE_TYPE_COLOR_LIGHT,
 			edgeColors.base,
 			containerAspectRatio,
+			positions,
 		);
 		// Permanent nodes from the base graph payload — an expansion (see
 		// `addExpansion` below) can graft an edge onto one of these (e.g. a
 		// Term expanding onto a Table already drawn from `graph.nodes`), but
 		// must never ref-count or remove it: it stays on the graph regardless
 		// of any expansion's own collapsed/expanded state.
-		const baseNodeIds = new Set(graph.nodes.map((node) => node.id));
+		const baseNodeIds = new Set(limitedGraph.nodes.map((node) => node.id));
 		const hoveredNodeIdRef = { current: null as string | null };
 		const hoveredEdgeIdRef = { current: null as string | null };
 
@@ -917,6 +936,7 @@ export const GraphCanvas = ({
 				size: attributes.size,
 				x: attributes.x,
 				y: attributes.y,
+				...(positions.has(node) ? { fx: attributes.x, fy: attributes.y } : {}),
 			};
 			simNodesById.set(node, simNode);
 			return simNode;
@@ -1025,6 +1045,28 @@ export const GraphCanvas = ({
 		// the charge/collision forces to finish re-relaxing a newly-grown or
 		// -shrunk graph after `addExpansion`/`removeExpansion` below.
 		const DEFAULT_ALPHA_DECAY = 1 - 0.001 ** (1 / 300);
+		let layoutPaused = false;
+		let graphNotice =
+			graph.nodes.length > GRAPH_LIMITS.nodes || graph.links.length > GRAPH_LIMITS.edges
+				? 'The initial graph exceeds the display budget. Narrow the database filter to inspect other entities.'
+				: '';
+		const publishGraph = () =>
+			onGraphChange({
+				nodes: graphology.mapNodes((id, attributes) => ({
+					id,
+					name: attributes.label,
+					kind: attributes.kind,
+					expanded: expansionsByOrigin.has(id),
+				})),
+				edges: graphology.mapEdges((id, attributes, source, target) => ({
+					id,
+					source,
+					target,
+					kind: attributes.kind,
+				})),
+				expansions: expansionsByOrigin.size,
+				notice: graphNotice,
+			});
 
 		const simulation = forceSimulation<SimNode>(simNodes)
 			// More damping than d3-force's own default (0.4) so a reheated
@@ -1074,7 +1116,7 @@ export const GraphCanvas = ({
 			// steady while nodes are actually moving, while still letting it
 			// grow to fit legitimately new content.
 			.on('end', () => {
-				if (!bboxFreezeArmed) return;
+				if (!bboxFreezeArmed || layoutPaused) return;
 				animateCustomBBoxTo(computeStableBBox() ?? renderer.getBBox());
 				bboxFreezeArmed = false;
 			});
@@ -1271,6 +1313,34 @@ export const GraphCanvas = ({
 		// behaves correctly either way and every origin that shares a node/edge
 		// has to let go before it actually disappears.
 		const addExpansion: GraphController['addExpansion'] = (originNodeId, nodes, edges) => {
+			if (expansionsByOrigin.has(originNodeId)) return false;
+			nodes = [...new Map(nodes.map((node) => [node.id, node])).values()];
+			edges = [
+				...new Map(
+					edges.map((edge) => [edgeIdentity(edge.source, edge.target), edge]),
+				).values(),
+			];
+			const problem = expansionBudgetIssue(
+				graphology.nodes(),
+				graphology.mapEdges((_id, _attributes, source, target) => ({ source, target })),
+				expansionsByOrigin.size,
+				nodes,
+				edges,
+			);
+			if (problem) {
+				graphNotice = problem;
+				publishGraph();
+				return false;
+			}
+			graphNotice = '';
+			// Keep previously reviewed entities stationary while new neighbors settle.
+			simNodes.forEach((node) => {
+				node.fx = node.x;
+				node.fy = node.y;
+				node.vx = 0;
+				node.vy = 0;
+			});
+
 			const origin = graphology.hasNode(originNodeId)
 				? graphology.getNodeAttributes(originNodeId)
 				: null;
@@ -1314,9 +1384,10 @@ export const GraphCanvas = ({
 				// new nodes blooms outward instead of stacking them all in the
 				// same spot for the simulation to untangle from scratch.
 				const jitterRadius = 60;
-				const angle = Math.random() * Math.PI * 2;
-				const x = originX + Math.cos(angle) * jitterRadius;
-				const y = originY + Math.sin(angle) * jitterRadius;
+				const angle = stablePoint(node.id, Math.PI * 2, 1).x;
+				const remembered = positions.get(node.id);
+				const x = remembered?.x ?? originX + Math.cos(angle) * jitterRadius;
+				const y = remembered?.y ?? originY + Math.sin(angle) * jitterRadius;
 				const size = getNodeSize(node.kind, 0);
 				graphology.addNode(node.id, {
 					x,
@@ -1328,7 +1399,13 @@ export const GraphCanvas = ({
 					kind: node.kind,
 					borderColor: NODE_TYPE_BORDER_COLOR[node.kind],
 				});
-				const simNode: SimNode = { id: node.id, size, x, y };
+				const simNode: SimNode = {
+					id: node.id,
+					size,
+					x,
+					y,
+					...(remembered ? { fx: x, fy: y } : {}),
+				};
 				simNodesById.set(node.id, simNode);
 				simNodes.push(simNode);
 			});
@@ -1374,7 +1451,7 @@ export const GraphCanvas = ({
 			simulation.nodes(simNodes);
 			linkForce.links(simLinks);
 			bboxFreezeArmed = true;
-			simulation.alphaDecay(DEFAULT_ALPHA_DECAY).alpha(0.5).restart();
+			if (!layoutPaused) simulation.alphaDecay(DEFAULT_ALPHA_DECAY).alpha(0.5).restart();
 			renderer.refresh();
 			// Also frames every *pre-existing* neighbour of the origin (e.g. another
 			// Table already linked to it by a direct SQL/FOREIGN_KEY edge on the base
@@ -1387,6 +1464,8 @@ export const GraphCanvas = ({
 				? graphology.neighbors(originNodeId)
 				: [];
 			focusExpansionIfOffscreen([originNodeId, ...addedNodeIds, ...neighborIds]);
+			publishGraph();
+			return true;
 		};
 
 		// Reverses one origin's `addExpansion` — see the `GraphController` type
@@ -1398,6 +1477,9 @@ export const GraphCanvas = ({
 		// protects a non-base origin, this very node's *own* still-live
 		// expansion rooted on it — in place.
 		const removeExpansion: GraphController['removeExpansion'] = (originNodeId) => {
+			graphology.forEachNode((id, attributes) =>
+				rememberPosition(positions, id, { x: attributes.x, y: attributes.y }),
+			);
 			const entry = expansionsByOrigin.get(originNodeId);
 			if (entry == null) return null;
 			expansionsByOrigin.delete(originNodeId);
@@ -1481,9 +1563,11 @@ export const GraphCanvas = ({
 			simulation.nodes(simNodes);
 			linkForce.links(simLinks);
 			bboxFreezeArmed = true;
-			simulation.alphaDecay(DEFAULT_ALPHA_DECAY).alpha(0.4).restart();
+			if (!layoutPaused) simulation.alphaDecay(DEFAULT_ALPHA_DECAY).alpha(0.4).restart();
 			renderer.refresh();
 
+			graphNotice = '';
+			publishGraph();
 			return removedNodeIds;
 		};
 
@@ -1669,9 +1753,19 @@ export const GraphCanvas = ({
 		});
 		resizeObserver.observe(containerRef.current);
 
+		publishGraph();
 		onControllerChange({
 			getCamera: () => renderer.getCamera(),
 			refresh: () => renderer.refresh(),
+			setLayoutPaused: (paused) => {
+				if (layoutPaused === paused) return;
+				layoutPaused = paused;
+				if (paused) {
+					simulation.stop();
+					if (bboxAnimationFrame != null) cancelAnimationFrame(bboxAnimationFrame);
+					bboxAnimationFrame = null;
+				} else simulation.alphaDecay(DEFAULT_ALPHA_DECAY).alpha(0.3).restart();
+			},
 			resetExtent: () => {
 				renderer.setCustomBBox(renderer.getBBox());
 				renderer.refresh();
@@ -1682,6 +1776,9 @@ export const GraphCanvas = ({
 		});
 
 		return () => {
+			graphology.forEachNode((id, attributes) =>
+				rememberPosition(positions, id, { x: attributes.x, y: attributes.y }),
+			);
 			window.clearTimeout(centerTimeout);
 			if (bboxAnimationFrame != null) cancelAnimationFrame(bboxAnimationFrame);
 			colorSchemeQuery.removeEventListener('change', handleColorSchemeChange);
@@ -1697,6 +1794,8 @@ export const GraphCanvas = ({
 		graph,
 		onClickNode,
 		onControllerChange,
+		onGraphChange,
+		positions,
 		onDoubleClickNode,
 		onHoverNode,
 		onSelectEdge,

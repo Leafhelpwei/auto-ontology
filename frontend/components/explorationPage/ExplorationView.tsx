@@ -12,9 +12,9 @@ import { datasources } from '@/api/datasources';
 import { explorationApi } from '@/api/exploration';
 import { termsApi } from '@/api/terms';
 import { catalogNodeInfo } from '@/components/dataPage/catalog-node-utils';
-import { SelectButton } from '@/common/Button';
+import { Button, SelectButton } from '@/common/Button';
 import { EmptyState } from '@/common/EmptyState';
-import { SelectButtonTheme } from '@/enums/button';
+import { ButtonTheme, Size, SelectButtonTheme } from '@/enums/button';
 import { EmptyStateVariant } from '@/enums/emptyState';
 import { Icon, IconName } from '@/common/icons';
 import { catalogPathFromFocusId } from '@/lib/data/data-catalog-path';
@@ -47,6 +47,8 @@ import { NODE_TYPE_ACCENT_COLOR } from './graph/nodeTypeColors';
 import type { NodeType } from './graph/nodeTypeColors';
 import { ViewToggle } from './graph/ViewToggle';
 import { ZoomControls } from './graph/ZoomControls';
+import { GraphEntityList } from './graph/GraphEntityList';
+import { GRAPH_LIMITS, type GraphSnapshot, type Point } from './graph/graphBudget';
 import { DatabaseFilter } from './DatabaseFilter';
 import { ActiveExpansionCard } from './ActiveExpansionCard';
 import { HoverNodeCard } from './HoverNodeCard';
@@ -203,6 +205,16 @@ export const ExplorationView = () => {
 	const [semanticError, setSemanticError] = useState<string | null>(null);
 	const [dataError, setDataError] = useState<string | null>(null);
 	const [search, setSearch] = useState('');
+	const [showEntityList, setShowEntityList] = useState(false);
+	const [layoutPaused, setLayoutPaused] = useState(false);
+	const layoutPausedRef = useRef(false);
+	const positions = useRef(new Map<string, Point>()).current;
+	const [graphSnapshot, setGraphSnapshot] = useState<GraphSnapshot>({
+		nodes: [],
+		edges: [],
+		expansions: 0,
+		notice: '',
+	});
 	/** One database id, or null for the unfiltered (500-node) graphs. */
 	const [selectedDatabaseId, setSelectedDatabaseId] = useState<string | null>(null);
 	const [activeNodeId, setActiveNodeId] = useState<string | null>(activeNodeIdFromUrl);
@@ -623,7 +635,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(tableNode.id, activeController)) return;
 
-			activeController.addExpansion(tableNode.id, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(tableNode.id, expansionNodes, expansionEdges)) {
+				expandedTableIdsRef.current.delete(tableNode.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -806,7 +821,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(termEntity.id, activeController)) return;
 
-			activeController.addExpansion(termEntity.id, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(termEntity.id, expansionNodes, expansionEdges)) {
+				expandedTermIdsRef.current.delete(termEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -880,7 +898,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(schemaEntity.id, activeController)) return;
 
-			activeController.addExpansion(schemaEntity.id, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(schemaEntity.id, expansionNodes, expansionEdges)) {
+				expandedSchemaIdsRef.current.delete(schemaEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -983,7 +1004,12 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(attributeEntity.id, activeController)) return;
 
-			activeController.addExpansion(attributeEntity.id, expansionNodes, expansionEdges);
+			if (
+				!activeController.addExpansion(attributeEntity.id, expansionNodes, expansionEdges)
+			) {
+				expandedColumnAttributeIdsRef.current.delete(attributeEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -1217,7 +1243,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(columnEntity.id, activeController)) return;
 
-			activeController.addExpansion(columnEntity.id, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(columnEntity.id, expansionNodes, expansionEdges)) {
+				expandedColumnIdsRef.current.delete(columnEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -1296,7 +1325,12 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(attributeEntity.id, activeController)) return;
 
-			activeController.addExpansion(attributeEntity.id, expansionNodes, expansionEdges);
+			if (
+				!activeController.addExpansion(attributeEntity.id, expansionNodes, expansionEdges)
+			) {
+				expandedSqlAttributeIdsRef.current.delete(attributeEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -1470,7 +1504,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(sqlEntity.id, activeController)) return;
 
-			activeController.addExpansion(sqlEntity.id, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(sqlEntity.id, expansionNodes, expansionEdges)) {
+				expandedSqlIdsRef.current.delete(sqlEntity.id);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 		},
 		[isExpansionStale, mergeExpandedNodes],
@@ -1810,7 +1847,10 @@ export const ExplorationView = () => {
 
 			if (isExpansionStale(originId, activeController)) return;
 
-			activeController.addExpansion(originId, expansionNodes, expansionEdges);
+			if (!activeController.addExpansion(originId, expansionNodes, expansionEdges)) {
+				expandedConnectionIdsRef.current.delete(edgeId);
+				return;
+			}
 			mergeExpandedNodes(newEntities);
 			setConnectionHopsByEdgeId((previous) => {
 				const next = new Map(previous);
@@ -1960,6 +2000,7 @@ export const ExplorationView = () => {
 
 	const handleControllerChange = useCallback((nextController: GraphController | null) => {
 		controllerRef.current = nextController;
+		nextController?.setLayoutPaused(layoutPausedRef.current);
 		setController(nextController);
 	}, []);
 	const handleHoverNode = useCallback((hoveredNode: HoveredNode | null) => {
@@ -2188,10 +2229,56 @@ export const ExplorationView = () => {
 						selected={selectedDatabaseId}
 						onChange={handleDatabaseFilterChange}
 					/>
+					<Button
+						theme={ButtonTheme.Secondary}
+						size={Size.SMALL}
+						aria-expanded={showEntityList}
+						onClick={() => setShowEntityList((value) => !value)}
+					>
+						Graph list
+					</Button>
+					<Button
+						theme={ButtonTheme.Secondary}
+						size={Size.SMALL}
+						disabled={!controller}
+						aria-pressed={layoutPaused}
+						onClick={() => {
+							const next = !layoutPaused;
+							layoutPausedRef.current = next;
+							setLayoutPaused(next);
+							controller?.setLayoutPaused(next);
+						}}
+					>
+						{layoutPaused ? 'Resume layout' : 'Pause layout'}
+					</Button>
 					<ZoomControls controller={controller} />
 				</div>
 			</div>
 
+			{showEntityList && !loading && (
+				<GraphEntityList
+					snapshot={graphSnapshot}
+					activeId={activeNodeId}
+					onSelect={handleSelectNode}
+					onExpand={handleDoubleClickNode}
+					onConnection={handleSelectEdge}
+				/>
+			)}
+			{!loading && (
+				<div
+					role="status"
+					className="absolute bottom-4 right-4 z-10 max-w-sm rounded bg-white/95 p-2 text-xs dark:bg-zinc-900/95"
+				>
+					{graphSnapshot.nodes.length}/{GRAPH_LIMITS.nodes} entities ·{' '}
+					{graphSnapshot.edges.length}/{GRAPH_LIMITS.edges} connections ·{' '}
+					{graphSnapshot.expansions}/{GRAPH_LIMITS.expansions} expansions
+					{graphSnapshot.notice && (
+						<p className="mt-1 text-amber-700 dark:text-amber-300">
+							{graphSnapshot.notice}
+						</p>
+					)}
+				</div>
+			)}
 			{loading && <ExplorationLoader overlay />}
 
 			{!loading && error != null && (
@@ -2229,6 +2316,8 @@ export const ExplorationView = () => {
 					onDoubleClickNode={handleDoubleClickNode}
 					onHoverNode={handleHoverNode}
 					onControllerChange={handleControllerChange}
+					onGraphChange={setGraphSnapshot}
+					positions={positions}
 				/>
 			)}
 

@@ -12,6 +12,24 @@ import type { GovernedModel } from '@/types/governedMetrics';
 import { unsafeModelEdit } from '@/lib/modelIntegrity';
 
 afterEach(cleanup);
+it('does not let an unrelated source hide a deleted metric dimension', () => {
+	const before = newModel();
+	before.sources.push(newSource(2));
+	for (const source of before.sources)
+		source.dimensions = [
+			{
+				dimension_id: 'country',
+				field: { source_id: source.source_id, field_id: '' },
+				relationship_path: [],
+			},
+		];
+	before.metrics[0].supported_dimensions = ['country'];
+	const after = structuredClone(before);
+	after.sources[0].dimensions = [];
+	expect(unsafeModelEdit(before, after)).toContain(
+		'Metric metric_1 references dimension country',
+	);
+});
 const Harness = ({ initial }: { initial: GovernedModel }) => {
 	const [model, update] = useState(initial);
 	return (

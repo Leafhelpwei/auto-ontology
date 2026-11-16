@@ -2,6 +2,7 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { CatalogBindingPicker, TermPicker } from './CatalogBindingPicker';
 import { useState } from 'react';
 import { nextStableIndex, unsafeModelEdit } from '@/lib/modelIntegrity';
 import { Button } from '@/common/Button';
@@ -33,16 +34,28 @@ const SourceEditor = ({
 }: {
 	source: SourceBinding;
 	model: GovernedModel;
-	onChange: (source: SourceBinding) => void;
+	onChange: (source: SourceBinding) => boolean;
 	onRemove: () => void;
 }) => {
 	const patch = (value: Partial<SourceBinding>) => onChange({ ...source, ...value });
+	const [catalogOpen, setCatalogOpen] = useState(false);
 	return (
 		<details className={panelClass} open>
 			<summary className="cursor-pointer text-base font-semibold">
 				Source · {source.source_id || 'Untitled'}
 			</summary>
 			<div className="mt-4 space-y-5">
+				<Button theme={ButtonTheme.Secondary} onClick={() => setCatalogOpen(true)}>
+					Choose Catalog table and columns
+				</Button>
+				{catalogOpen && (
+					<CatalogBindingPicker
+						source={source}
+						onApply={onChange}
+						onClose={() => setCatalogOpen(false)}
+					/>
+				)}
+				<TermPicker onSelect={(owner_term_id) => patch({ owner_term_id })} />
 				<div className="grid gap-4 md:grid-cols-3">
 					<TextField
 						label="Source ID"
@@ -525,6 +538,7 @@ const MetricEditor = ({
 						value={metric.name}
 						onChange={(name) => patch({ name })}
 					/>
+					<TermPicker onSelect={(owner_term_id) => patch({ owner_term_id })} />
 					<TextField
 						label="Owner term ID"
 						value={metric.owner_term_id}

@@ -18,9 +18,6 @@ export const modelReferenceIssues = (model: GovernedModel): string[] => {
 	const sources = new Map(model.sources.map((source) => [source.source_id, source]));
 	const relationships = new Set(model.relationships.map((item) => item.relationship_id));
 	const metrics = new Set(model.metrics.map((item) => item.metric_id));
-	const dimensions = new Set(
-		model.sources.flatMap((source) => source.dimensions.map((item) => item.dimension_id)),
-	);
 	const unique = (ids: string[], owner: string) => {
 		const seen = new Set<string>();
 		for (const id of ids) {
@@ -89,6 +86,12 @@ export const modelReferenceIssues = (model: GovernedModel): string[] => {
 		const owner = `Metric ${metric.metric_id}`;
 		metric.source_ids.forEach((id) => sourceRef(id, owner));
 		predicates(metric.required_filters, owner);
+		const dimensions = new Set(
+			metric.source_ids.flatMap(
+				(id) =>
+					sources.get(id)?.dimensions.map((dimension) => dimension.dimension_id) ?? [],
+			),
+		);
 		for (const id of metric.supported_dimensions)
 			if (id && !dimensions.has(id)) issues.push(`${owner} references dimension ${id}`);
 		const field = (id: string | null) => {
