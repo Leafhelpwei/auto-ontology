@@ -173,11 +173,13 @@ export const PredicateEditor = ({
 	value,
 	sources,
 	onChange,
+	allowRolePaths = false,
 }: {
 	label: string;
 	value: Predicate[];
 	sources: SourceBinding[];
 	onChange: (value: Predicate[]) => void;
+	allowRolePaths?: boolean;
 }) => {
 	const id = useId();
 	const update = (index: number, patch: Partial<Predicate>) =>
@@ -198,7 +200,10 @@ export const PredicateEditor = ({
 							...options(sources.map((source) => source.source_id)),
 						]}
 						onChange={(source_id) =>
-							update(index, { field: { source_id, field_id: '' } })
+							update(index, {
+								field: { source_id, field_id: '' },
+								relationship_path: undefined,
+							})
 						}
 					/>
 					<SelectField
@@ -215,9 +220,66 @@ export const PredicateEditor = ({
 							),
 						]}
 						onChange={(field_id) =>
-							update(index, { field: { ...predicate.field, field_id } })
+							update(index, {
+								field: { ...predicate.field, field_id },
+								relationship_path: undefined,
+							})
 						}
 					/>
+					{allowRolePaths && (
+						<SelectField
+							label="Filter role"
+							value={
+								predicate.relationship_path == null
+									? '__auto'
+									: JSON.stringify(predicate.relationship_path)
+							}
+							options={[
+								{
+									value: '__auto',
+									label: 'Automatic (requires one unambiguous path)',
+								},
+								{ value: '[]', label: 'Selected fact' },
+								...[
+									...new Map(
+										sources.flatMap((source) =>
+											source.dimensions
+												.filter(
+													(dimension) =>
+														dimension.field.source_id ===
+															predicate.field.source_id &&
+														dimension.field.field_id ===
+															predicate.field.field_id &&
+														dimension.relationship_path.length > 0,
+												)
+												.map(
+													(dimension) =>
+														[
+															JSON.stringify(
+																dimension.relationship_path,
+															),
+															{
+																value: JSON.stringify(
+																	dimension.relationship_path,
+																),
+																label: `${dimension.dimension_id} (${source.source_id})`,
+															},
+														] as const,
+												),
+										),
+									).values(),
+								],
+							]}
+							onChange={(value) =>
+								update(index, {
+									relationship_path:
+										value === '__auto'
+											? undefined
+											: (JSON.parse(value) as string[]),
+								})
+							}
+						/>
+					)}
 					<SelectField
 						label="Operator"
 						value={predicate.operator}

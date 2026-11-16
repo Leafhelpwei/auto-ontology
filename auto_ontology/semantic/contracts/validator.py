@@ -217,33 +217,42 @@ def dimension_path(
             "UNSUPPORTED_DIMENSION",
             f"Source {source.source_id} has no dimension {dimension_id}",
         )
+    resolve_field(model, dimension.field)
+    return dimension.field, explicit_relationship_path(
+        model, source.source_id, dimension.field.source_id, dimension.relationship_path
+    )
+
+
+def explicit_relationship_path(
+    model: GovernedModel, start: str, target: str, identifiers: tuple[str, ...]
+) -> tuple[Relationship, ...]:
+    """Resolve a closed role path; never infer an alias for an explicit request."""
     by_id = {relation.relationship_id: relation for relation in model.relationships}
     path: list[Relationship] = []
-    current = source.source_id
+    current = start
     visited = {current}
-    for relationship_id in dimension.relationship_path:
-        relation = by_id.get(relationship_id)
+    for identifier in identifiers:
+        relation = by_id.get(identifier)
         if relation is None or relation.source_id != current:
             fail(
                 "INVALID_RELATIONSHIP_PATH",
-                f"Invalid path for dimension {dimension_id}",
+                "The role path does not start at the selected fact or is discontinuous",
             )
         if relation.target_id in visited:
             fail(
                 "CYCLIC_ROLE_PATH",
-                "Repeated source roles require distinct registered sources; cyclic dimension paths are unsupported",
+                "Repeated source roles require distinct registered sources; cyclic paths are unsupported",
             )
         path.append(relation)
         current = relation.target_id
         visited.add(current)
-    if current != dimension.field.source_id:
+    if current != target:
         fail(
             "INVALID_RELATIONSHIP_PATH",
-            f"Dimension {dimension_id} does not end at its field source",
+            "The role path does not end at the filter field source",
         )
     ensure_safe_path(tuple(path))
-    resolve_field(model, dimension.field)
-    return dimension.field, tuple(path)
+    return tuple(path)
 
 
 def currency_ref(
@@ -316,6 +325,19 @@ def numeric_value(value: object) -> int | float | Decimal:
 
 def validate_predicate(model: GovernedModel, predicate: Predicate) -> None:
     field = resolve_field(model, predicate.field)
+    if predicate.relationship_path:
+        relations = {
+            relation.relationship_id: relation for relation in model.relationships
+        }
+        first = relations.get(predicate.relationship_path[0])
+        if first is None:
+            fail("INVALID_RELATIONSHIP_PATH", "Unknown filter role path")
+        explicit_relationship_path(
+            model,
+            first.source_id,
+            predicate.field.source_id,
+            predicate.relationship_path,
+        )
     value = predicate.value
     if predicate.operator in ("is_null", "is_not_null"):
         if value is not None:
@@ -469,7 +491,10 @@ def _validate_model(model: GovernedModel) -> None:
                 )
             output_identifier(identifier, model.dialect)
         for predicate in source.required_filters:
-            if predicate.field.source_id != source.source_id:
+            if (
+                predicate.field.source_id != source.source_id
+                or predicate.relationship_path
+            ):
                 fail(
                     "INVALID_SOURCE_FILTER", "Source filters must refer to that source"
                 )
@@ -516,7 +541,7 @@ def _validate_model(model: GovernedModel) -> None:
                 f"Relationship {relation.relationship_id} does not cover target grain",
             )
         for predicate in relation.predicates:
-            if predicate.field.source_id not in (
+            if predicate.relationship_path or predicate.field.source_id not in (
                 relation.source_id,
                 relation.target_id,
             ):

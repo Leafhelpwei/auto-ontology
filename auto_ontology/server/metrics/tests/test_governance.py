@@ -570,3 +570,98 @@ def test_non_finite_physical_results_do_not_return_trusted_null(catalog):
             model.model_id, MetricQueryRequest(metric_ids=("amount",), all_time=True)
         )
     assert error.value.code == "NON_FINITE_RESULT"
+
+
+def test_execution_checks_only_reviewed_plan_dependencies_and_never_recertifies(
+    catalog, monkeypatch
+):
+    from contextlib import contextmanager
+    from time import perf_counter
+    from auto_ontology.server.metrics.source_adapters import PostgresSourceAdapter
+
+    model, connector, physical, _ = catalog
+    primary = model.sources[0]
+    schema_id = store().query_read(
+        select(s.catalog_table.c.schema_id).where(
+            s.catalog_table.c.id == primary.catalog_table_id
+        )
+    )[0]["schema_id"]
+    table_id = store().query_write(
+        s.catalog_table.insert()
+        .values(schema_id=schema_id, name="unrelated", pk=["id"])
+        .returning(s.catalog_table.c.id)
+    )[0]["id"]
+    column_id = store().query_write(
+        s.catalog_column.insert()
+        .values(
+            table_id=table_id,
+            name="id",
+            data_type="integer",
+            is_nullable=False,
+            is_unique=True,
+        )
+        .returning(s.catalog_column.c.id)
+    )[0]["id"]
+    connector.execute(
+        f'CREATE TABLE "{primary.schema_name}".unrelated (id integer PRIMARY KEY)'
+    )
+    unrelated = primary.model_copy(
+        update={
+            "source_id": "unrelated_0",
+            "catalog_table_id": table_id,
+            "table_name": "unrelated",
+            "fields": (
+                primary.fields[0].model_copy(update={"catalog_column_id": column_id}),
+            ),
+        }
+    )
+    model = model.model_copy(
+        update={
+            "sources": (
+                *model.sources,
+                *(
+                    unrelated.model_copy(update={"source_id": f"unrelated_{i}"})
+                    for i in range(40)
+                ),
+            )
+        }
+    )
+    published = publish(model)
+    certificate = published["revisions"][0]["certification"]
+    assert len(certificate["dependency_fingerprints"]["sources"]) == 41
+    connector.execute(f'DROP TABLE "{primary.schema_name}".unrelated')
+    transactions, locked = [], []
+    original_transaction, original_lock = (
+        service.source_transaction,
+        PostgresSourceAdapter.lock,
+    )
+
+    @contextmanager
+    def counted_transaction(*args, **kwargs):
+        transactions.append(1)
+        with original_transaction(*args, **kwargs) as read:
+            yield read
+
+    def counted_lock(self, read, source):
+        locked.append(source.source_id)
+        return original_lock(self, read, source)
+
+    monkeypatch.setattr(service, "source_transaction", counted_transaction)
+    monkeypatch.setattr(PostgresSourceAdapter, "lock", counted_lock)
+    elapsed = []
+    query = MetricQueryRequest(metric_ids=("amount",), all_time=True)
+    for _ in range(5):
+        started = perf_counter()
+        result = service.execute(model.model_id, query)
+        elapsed.append(perf_counter() - started)
+        assert result["trusted"] is True
+        assert result["plan"]["source_ids"] == ["orders"]
+    assert locked == ["orders"] * 10
+    assert len(transactions) == 10  # one preflight and one pinned execution per query
+    assert max(elapsed) < 3
+    assert dal.get_revision(model.model_id, 1)["certification"] == certificate
+    connector.execute(f"ALTER TABLE {physical} ADD COLUMN changed integer")
+    with pytest.raises(ContractError) as error:
+        service.execute(model.model_id, query)
+    assert error.value.code == "SOURCE_CHANGED"
+    assert dal.get_revision(model.model_id, 1)["certification"] == certificate

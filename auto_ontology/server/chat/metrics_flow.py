@@ -167,7 +167,9 @@ def stream_metric_response(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         require_metric_access(
             payload.get("user_id"), persistent=bool(payload.get("persistent"))
         )
-        model, _, row, _ = service.executable_model(model_id, revision)
+        model, _, row, _ = service.executable_model(
+            model_id, revision, metadata_only=True
+        )
         revision = row["revision"]
         context.update(revision=revision, model_fingerprint=model.fingerprint())
         prior = _interpretation_context(

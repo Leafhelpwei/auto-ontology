@@ -47,6 +47,10 @@ Scalar = str | int | float | bool | Decimal | None
 
 class Predicate(Contract):
     field: FieldRef
+    # None retains unambiguous path inference; () explicitly means the fact.
+    relationship_path: tuple[str, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     operator: Literal[
         "eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in", "is_null", "is_not_null"
     ]

@@ -223,3 +223,36 @@ INSERT INTO sales_order VALUES
 INSERT INTO order_line VALUES
 (1,1001,101,2,100),(2,1001,102,1,50),(3,1002,101,1,100),(4,1003,102,1,50);
 """
+
+
+def buyer_seller_model(model: GovernedModel) -> GovernedModel:
+    """Two distinct relationship roles ending in the same customer source."""
+    data = model.model_dump(mode="json")
+    orders = next(
+        source for source in data["sources"] if source["source_id"] == "orders"
+    )
+    orders["fields"].append(field("seller_id"))
+    original = next(
+        relation
+        for relation in data["relationships"]
+        if relation["target_id"] == "customers"
+    )
+    data["relationships"].append(
+        {
+            **original,
+            "relationship_id": "seller",
+            "role": "seller",
+            "keys": [
+                {"source_field_id": "seller_id", "target_field_id": "customer_id"}
+            ],
+        }
+    )
+    lines = next(source for source in data["sources"] if source["source_id"] == "lines")
+    lines["dimensions"].append(
+        {
+            "dimension_id": "seller_name",
+            "field": ref("customers", "customer_name"),
+            "relationship_path": ["line_order", "seller"],
+        }
+    )
+    return GovernedModel.model_validate(data)

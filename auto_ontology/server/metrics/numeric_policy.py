@@ -18,7 +18,10 @@ from auto_ontology.semantic.contracts.models import (
 
 
 def validate_mysql_arithmetic(
-    model: GovernedModel, physical: dict[str, dict[str, dict[str, Any]]]
+    model: GovernedModel,
+    physical: dict[str, dict[str, dict[str, Any]]],
+    *,
+    metric_ids: set[str] | None = None,
 ) -> None:
     """Reject operations that silently discard exact fractional digits in MySQL 5.7.
 
@@ -80,6 +83,7 @@ def validate_mysql_arithmetic(
                     expression_scale(metric.expression, source)
                     for source in model.sources
                     if source.source_id in metric.source_ids
+                    and source.source_id in physical
                 ]
                 if metric.aggregation == "sum"
                 else [0]
@@ -91,5 +95,5 @@ def validate_mysql_arithmetic(
         scales[metric_id] = value
         return value
 
-    for metric_id in metrics:
+    for metric_id in metric_ids if metric_ids is not None else metrics:
         metric_scale(metric_id)

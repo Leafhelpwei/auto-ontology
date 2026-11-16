@@ -35,6 +35,7 @@ from .models import (
 from .validator import (
     currency_ref,
     dimension_path,
+    explicit_relationship_path,
     expression_type,
     fail,
     relationship_path,
@@ -234,13 +235,35 @@ class FactScope:
     def logical_ref(self, field_id: str) -> FieldRef:
         return logical_field_ref(self.model, self.source, field_id)
 
+    def predicate_reference(
+        self, predicate: Predicate
+    ) -> tuple[FieldRef, tuple[Relationship, ...]]:
+        ref = (
+            self.remap(predicate.field)
+            if not predicate.relationship_path
+            else predicate.field
+        )
+        path = (
+            relationship_path(self.model, self.source.source_id, ref.source_id)
+            if predicate.relationship_path is None
+            else explicit_relationship_path(
+                self.model,
+                self.source.source_id,
+                ref.source_id,
+                predicate.relationship_path,
+            )
+        )
+        return ref, path
+
     def predicate(
         self, predicate: Predicate, aliases: dict[str, str] | None = None
     ) -> str:
-        ref = self.remap(predicate.field) if aliases is None else predicate.field
-        column = (
-            self.column(ref, aliases[ref.source_id]) if aliases else self.use_ref(ref)
-        )
+        if aliases is None:
+            ref, path = self.predicate_reference(predicate)
+            column = self.use_ref(ref, path)
+        else:
+            ref = predicate.field
+            column = self.column(ref, aliases[ref.source_id])
         if predicate.operator in ("is_null", "is_not_null"):
             return f"{column} IS {'NOT ' if predicate.operator == 'is_not_null' else ''}NULL"
         field = resolve_field(self.model, ref)
@@ -319,8 +342,14 @@ class FactScope:
             *self.metric.required_filters,
             *self.request.filters,
         )
+
+        def same_currency_role(predicate: Predicate) -> bool:
+            return self.remap(predicate.field) == ref and self.predicate_reference(
+                predicate
+            ) == (ref, expected_path)
+
         fixed = any(
-            self.remap(predicate.field) == ref
+            same_currency_role(predicate)
             and (
                 predicate.operator == "eq"
                 and isinstance(predicate.value, str)
@@ -349,7 +378,7 @@ class FactScope:
                 "is_not_null",
             }
             direct_non_null = any(
-                self.remap(predicate.field) == ref
+                same_currency_role(predicate)
                 and predicate.operator in non_null_operators
                 for predicate in predicates
             )
@@ -363,6 +392,7 @@ class FactScope:
                 relation.join_type == "inner" for path in paths for relation in path
             ) or any(
                 self.remap(predicate.field).source_id == ref.source_id
+                and self.predicate_reference(predicate)[1] == expected_path
                 and predicate.operator in non_null_operators
                 for predicate in predicates
             )
@@ -384,7 +414,7 @@ class FactScope:
             values = {
                 predicate.value if predicate.operator == "eq" else predicate.value[0]
                 for predicate in predicates
-                if self.remap(predicate.field) == ref
+                if same_currency_role(predicate)
                 and (
                     predicate.operator == "eq"
                     and isinstance(predicate.value, str)

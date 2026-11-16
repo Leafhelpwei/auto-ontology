@@ -172,6 +172,7 @@ def certify(
     evidence: str,
     model_fingerprint: str,
     catalog_fingerprint: str,
+    dependency_fingerprints: dict[str, Any] | None = None,
 ) -> None:
     store().query_write(
         s.governed_model_certification.insert().values(
@@ -180,6 +181,7 @@ def certify(
             evidence=evidence,
             model_fingerprint=model_fingerprint,
             catalog_fingerprint=catalog_fingerprint,
+            dependency_fingerprints=dependency_fingerprints or {},
         )
     )
     set_revision_status(revision_id, "certified")

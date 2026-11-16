@@ -292,6 +292,14 @@ governed_model_certification = Table(
     Column("evidence", Text, nullable=False),
     Column("model_fingerprint", Text, nullable=False),
     Column("catalog_fingerprint", Text, nullable=False),
+    # Empty on legacy certificates: retain full-model verification until a new
+    # revision is reviewed. Never derive authority from live data on read.
+    Column(
+        "dependency_fingerprints",
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+    ),
     Column(
         "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
     ),

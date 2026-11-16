@@ -320,3 +320,55 @@ def test_mysql_exact_scale_budget_rejects_silent_fraction_loss():
     with pytest.raises(ContractError) as error:
         validate_mysql_arithmetic(model, physical)
     assert error.value.code == "NUMERIC_SCALE_UNSUPPORTED"
+
+
+@pytest.mark.parametrize(
+    "roles,expected",
+    [
+        (["order_customer"], [("CNY", Decimal("250"))]),
+        (["seller"], [("USD", Decimal("100"))]),
+        (["order_customer", "seller"], []),
+    ],
+)
+def test_mysql_role_scoped_filters(mysql_fixture, roles, expected):
+    from auto_ontology.semantic.contracts.tests.fixtures import buyer_seller_model, ref
+    from auto_ontology.semantic.contracts.models import ContractError
+
+    admin, reader, model = mysql_fixture
+    sources = {source.source_id: source for source in model.sources}
+    orders = quote(sources["orders"].table_name, "mysql")
+    customers = quote(sources["customers"].table_name, "mysql")
+    with admin.cursor() as cursor:
+        cursor.execute(f"ALTER TABLE {orders} ADD COLUMN seller_id bigint")
+        cursor.execute(
+            f"UPDATE {orders} SET seller_id = CASE WHEN customer_id=1 THEN 2 ELSE 1 END"
+        )
+        cursor.execute(
+            f"UPDATE {customers} SET customer_name=CASE WHEN customer_id=1 THEN 'Alice' ELSE 'Bob' END"
+        )
+    model = buyer_seller_model(model)
+    filters = [
+        {
+            "field": ref("customers", "customer_name"),
+            "relationship_path": ["line_order", role],
+            "operator": "eq",
+            "value": "Alice",
+        }
+        for role in roles
+    ]
+    query = MetricQueryRequest.model_validate(
+        {
+            "metric_ids": ["confirmed_amount"],
+            "dimensions": ["currency_code"],
+            "all_time": True,
+            "filters": filters,
+        }
+    )
+    assert [
+        (row["currency_code"], row["confirmed_amount"])
+        for row in rows(reader, compile_query(model, query))
+    ] == expected
+    data = query.model_dump(mode="json")
+    data["filters"][0].pop("relationship_path")
+    with pytest.raises(ContractError):
+        compile_query(model, MetricQueryRequest.model_validate(data))

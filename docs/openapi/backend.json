@@ -4147,6 +4147,20 @@
             "title": "Operator",
             "type": "string"
           },
+          "relationship_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Relationship Path"
+          },
           "value": {
             "anyOf": [
               {
@@ -9376,7 +9390,7 @@
     },
     "/api/metrics/models/{model_id}/certify": {
       "post": {
-        "description": "Record authenticated review evidence and a live PostgreSQL fingerprint.",
+        "description": "Record authenticated review evidence and live dependency fingerprints.",
         "operationId": "certify_api_metrics_models__model_id__certify_post",
         "parameters": [
           {

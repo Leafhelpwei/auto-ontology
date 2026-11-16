@@ -149,7 +149,7 @@ def test_metric_flow_pins_history_revision_and_never_falls_back(
             }
         )
     )
-    loader.assert_called_once_with(model.model_id, 3)
+    loader.assert_called_once_with(model.model_id, 3, metadata_only=True)
     assert (
         events[-1]["answer"]["query_context"]["clarification"]["code"] == "NOT_ACTIVE"
     )
@@ -166,7 +166,7 @@ def test_clarification_stores_selection_and_validated_base_query(
     monkeypatch.setattr(
         metrics_flow.service,
         "executable_model",
-        lambda *a: (model, {}, {"revision": 1}, None),
+        lambda *a, **k: (model, {}, {"revision": 1}, None),
     )
     interpreter = Mock(
         return_value=InterpretationResult(
@@ -214,7 +214,7 @@ def test_success_stream_keeps_exact_results_and_actual_plan(
     monkeypatch.setattr(
         metrics_flow.service,
         "executable_model",
-        lambda *a: (model, {}, {"revision": 1}, None),
+        lambda *a, **k: (model, {}, {"revision": 1}, None),
     )
     monkeypatch.setattr(
         metrics_flow,

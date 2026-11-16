@@ -482,6 +482,7 @@ export const MetricQueryPanel = ({
 						</div>
 					)}
 					<PredicateEditor
+						allowRolePaths
 						label="Additional query filters"
 						value={query.filters}
 						sources={model.sources}

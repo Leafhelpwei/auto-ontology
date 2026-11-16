@@ -7,6 +7,7 @@ export type Scalar = string | number | boolean | null;
 export type FieldRef = { source_id: string; field_id: string };
 export type Predicate = {
 	field: FieldRef;
+	relationship_path?: string[] | null;
 	operator:
 		| 'eq'
 		| 'ne'

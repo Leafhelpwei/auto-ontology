@@ -39,7 +39,12 @@ export const modelReferenceIssues = (model: GovernedModel): string[] => {
 			issues.push(`${owner} references field ${field.source_id}.${field.field_id}`);
 	};
 	const predicates = (items: Predicate[], owner: string) =>
-		items.forEach((item) => fieldRef(item.field, `${owner} filter`));
+		items.forEach((item) => {
+			fieldRef(item.field, `${owner} filter`);
+			for (const id of item.relationship_path ?? [])
+				if (!relationships.has(id))
+					issues.push(`${owner} filter references relationship ${id}`);
+		});
 	unique([...model.sources.map((source) => source.source_id)], 'Sources');
 	unique(
 		model.relationships.map((item) => item.relationship_id),

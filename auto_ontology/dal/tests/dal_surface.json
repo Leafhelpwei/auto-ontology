@@ -116,7 +116,7 @@
     "ModelNotFound": "class(ValueError)",
     "VersionConflict": "class(ValueError)",
     "archive": "(model_id: 'str', expected_version: 'int') -> 'dict[str, Any]'",
-    "certify": "(revision_id: 'str', *, reviewer_id: 'str', evidence: 'str', model_fingerprint: 'str', catalog_fingerprint: 'str') -> 'None'",
+    "certify": "(revision_id: 'str', *, reviewer_id: 'str', evidence: 'str', model_fingerprint: 'str', catalog_fingerprint: 'str', dependency_fingerprints: 'dict[str, Any] | None' = None) -> 'None'",
     "create_draft": "(*, model_id: 'str', expected_version: 'int', payload: 'dict[str, Any]', fingerprint: 'str', user_id: 'str') -> 'dict[str, Any]'",
     "create_model": "(*, payload: 'dict[str, Any]', fingerprint: 'str', user_id: 'str', owner_id: 'str | None') -> 'dict[str, Any]'",
     "detail": "(model_id: 'str') -> 'dict[str, Any] | None'",

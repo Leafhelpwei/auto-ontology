@@ -1077,3 +1077,53 @@ def test_cyclic_currency_role_cannot_merge_fact_currencies(postgres):
             ),
         )
     assert error.value.code == "CYCLIC_ROLE_PATH"
+
+
+@pytest.mark.parametrize(
+    "roles,expected",
+    [
+        (["order_customer"], [("CNY", Decimal("250"))]),
+        (["seller"], [("USD", Decimal("100"))]),
+        (["order_customer", "seller"], []),
+    ],
+)
+def test_role_scoped_filters_apply_to_exact_aliases(f0, roles, expected):
+    from auto_ontology.semantic.contracts.tests.fixtures import buyer_seller_model
+
+    connection, model = f0
+    connection.execute("ALTER TABLE sales_order ADD COLUMN seller_id bigint")
+    connection.execute(
+        "UPDATE sales_order SET seller_id = CASE WHEN customer_id=1 THEN 2 ELSE 1 END"
+    )
+    connection.execute(
+        "UPDATE customer SET customer_name=CASE WHEN customer_id=1 THEN 'Alice' ELSE 'Bob' END"
+    )
+    model = buyer_seller_model(model)
+    filters = [
+        {
+            "field": ref("customers", "customer_name"),
+            "relationship_path": ["line_order", role],
+            "operator": "eq",
+            "value": "Alice",
+        }
+        for role in roles
+    ]
+    plan = compile_query(model, request(filters=filters))
+    assert [
+        (row["currency_code"], row["confirmed_amount"])
+        for row in rows(connection, plan)
+    ] == expected
+    with pytest.raises(ContractError) as error:
+        compile_query(
+            model,
+            request(
+                filters=[
+                    {
+                        key: value
+                        for key, value in filters[0].items()
+                        if key != "relationship_path"
+                    }
+                ]
+            ),
+        )
+    assert error.value.code == "AMBIGUOUS_RELATIONSHIP"

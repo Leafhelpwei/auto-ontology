@@ -6264,7 +6264,7 @@
     },
     "/api/metrics/models/{model_id}/certify": {
       "post": {
-        "description": "Record authenticated review evidence and a live PostgreSQL fingerprint.",
+        "description": "Record authenticated review evidence and live dependency fingerprints.",
         "operationId": "post_api_metrics_models_model_id_certify",
         "parameters": [
           {
@@ -13767,6 +13767,20 @@
             ],
             "title": "Operator",
             "type": "string"
+          },
+          "relationship_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Relationship Path"
           },
           "value": {
             "anyOf": [

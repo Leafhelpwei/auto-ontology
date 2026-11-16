@@ -771,6 +771,7 @@ const MetricEditor = ({
 					onChange={(default_of_family) => patch({ default_of_family })}
 				/>
 				<PredicateEditor
+					allowRolePaths
 					label="Required metric filters"
 					value={metric.required_filters}
 					sources={model.sources}

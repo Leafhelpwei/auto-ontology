@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from contextlib import ExitStack
 from datetime import date, datetime
 from decimal import Decimal
@@ -53,6 +53,7 @@ class CatalogState:
     fingerprint: str
     database_names: dict[str, str]
     connectors: dict[str, SourceConnector]
+    source_fingerprints: dict[str, str] = dc_field(default_factory=dict)
 
 
 def enabled() -> bool:
@@ -86,6 +87,9 @@ def catalog_state(
     *,
     live: bool = False,
     readers: dict[str, SourceReader] | None = None,
+    source_ids: set[str] | None = None,
+    metric_ids: set[str] | None = None,
+    relationship_ids: set[str] | None = None,
 ) -> CatalogState:
     """Resolve Catalog IDs and inspect each supported physical business source.
 
@@ -97,7 +101,17 @@ def catalog_state(
     """
     adapter = adapter_for(model.dialect)
     inspect_live = live or model.dialect == "mysql"
-    table_ids = [source.catalog_table_id for source in model.sources]
+    selected_sources = [
+        source
+        for source in model.sources
+        if source_ids is None or source.source_id in source_ids
+    ]
+    selected_metrics = [
+        metric
+        for metric in model.metrics
+        if metric_ids is None or metric.metric_id in metric_ids
+    ]
+    table_ids = [source.catalog_table_id for source in selected_sources]
     table_rows = store().query_read(
         select(
             s.catalog_table.c.id,
@@ -122,8 +136,8 @@ def catalog_state(
             s.catalog_column.c.is_unique,
         ).where(s.catalog_column.c.table_id.in_(table_ids))
     )
-    terms = {source.owner_term_id for source in model.sources} | {
-        metric.owner_term_id for metric in model.metrics
+    terms = {source.owner_term_id for source in selected_sources} | {
+        metric.owner_term_id for metric in selected_metrics
     }
     existing_terms = {
         row["id"]
@@ -140,7 +154,7 @@ def catalog_state(
     physical_by_source: dict[str, dict[str, dict[str, Any]]] = {}
     connectors: dict[str, SourceConnector] = {}
     available = get_connectors() if inspect_live else None
-    for source in model.sources:
+    for source in selected_sources:
         table = tables.get(source.catalog_table_id)
         _require(
             table is not None,
@@ -288,6 +302,11 @@ def catalog_state(
         snapshots.append(snapshot)
     sources = {source.source_id: source for source in model.sources}
     for relationship in model.relationships:
+        if (
+            relationship_ids is not None
+            and relationship.relationship_id not in relationship_ids
+        ):
+            continue
         target = sources.get(relationship.target_id)
         _require(
             target is not None, "UNKNOWN_SOURCE", "Relationship target does not exist"
@@ -345,9 +364,12 @@ def catalog_state(
                 f"Relationship {relationship.relationship_id}: one-to-one source keys are not unique",
             )
     if inspect_live and model.dialect == "mysql" and validate_model(model).valid:
-        validate_mysql_arithmetic(model, physical_by_source)
+        validate_mysql_arithmetic(model, physical_by_source, metric_ids=metric_ids)
     return CatalogState(
-        _hash(sorted(snapshots, key=lambda item: item["source_id"])), names, connectors
+        _hash(sorted(snapshots, key=lambda item: item["source_id"])),
+        names,
+        connectors,
+        {item["source_id"]: _hash(item) for item in snapshots},
     )
 
 
@@ -466,6 +488,10 @@ def transition(
                 evidence=evidence.strip(),
                 model_fingerprint=row["fingerprint"],
                 catalog_fingerprint=state.fingerprint,
+                dependency_fingerprints={
+                    "version": 1,
+                    "sources": state.source_fingerprints,
+                },
             )
         elif action == "activate":
             _check_certificate(model, row)
@@ -479,12 +505,7 @@ def transition(
     return dal.detail(model_id)
 
 
-def _check_certificate(
-    model: GovernedModel,
-    row: dict[str, Any],
-    *,
-    readers: dict[str, SourceReader] | None = None,
-) -> CatalogState:
+def _certificate_identity(model: GovernedModel, row: dict[str, Any]) -> dict[str, Any]:
     certificate = row.get("certification")
     _require(
         row["status"] == "certified" and certificate is not None,
@@ -497,17 +518,58 @@ def _check_certificate(
         "REVISION_CHANGED",
         "The certified model fingerprint no longer matches",
     )
-    state = catalog_state(model, live=True, readers=readers)
+    return certificate
+
+
+def _check_certificate(
+    model: GovernedModel,
+    row: dict[str, Any],
+    *,
+    readers: dict[str, SourceReader] | None = None,
+    plan: Plan | None = None,
+) -> CatalogState:
+    certificate = _certificate_identity(model, row)
+    dependencies = certificate.get("dependency_fingerprints") or {}
     _require(
-        state.fingerprint == certificate["catalog_fingerprint"],
+        not dependencies or dependencies.get("version") == 1,
+        "CERTIFICATE_VERSION_UNSUPPORTED",
+        "Review a new revision using the supported certificate format",
+    )
+    scoped = plan is not None and dependencies.get("version") == 1
+    state = catalog_state(
+        model,
+        live=True,
+        readers=readers,
+        source_ids=set(plan.source_ids) if scoped else None,
+        metric_ids=set(plan.metric_fingerprints) if scoped else None,
+        relationship_ids={
+            item["relationship_id"] for item in plan.evidence.get("joins", [])
+        }
+        if scoped
+        else None,
+    )
+    if scoped:
+        certified = dependencies.get("sources", {})
+        valid = all(
+            certified.get(source_id) == fingerprint
+            for source_id, fingerprint in state.source_fingerprints.items()
+        ) and set(state.source_fingerprints) == set(plan.source_ids)
+    else:
+        valid = state.fingerprint == certificate["catalog_fingerprint"]
+    _require(
+        valid,
         "SOURCE_CHANGED",
-        "Source structure changed after review; create and certify a new revision",
+        "A reviewed query dependency changed; create and certify a new revision",
     )
     return state
 
 
 def executable_model(
-    model_id: str, revision: int | None = None
+    model_id: str,
+    revision: int | None = None,
+    *,
+    query: MetricQueryRequest | None = None,
+    metadata_only: bool = False,
 ) -> tuple[GovernedModel, dict[str, Any], dict[str, Any], CatalogState]:
     require_enabled()
     parent = dal.get_model(model_id)
@@ -521,7 +583,13 @@ def executable_model(
     )
     row = _revision(model_id, active)
     model = GovernedModel.model_validate(row["payload"])
-    state = _check_certificate(model, row)
+    if metadata_only:
+        _certificate_identity(model, row)
+        state = CatalogState("", {}, {})
+    else:
+        state = _check_certificate(
+            model, row, plan=compile_query(model, query) if query else None
+        )
     return model, parent, row, state
 
 
@@ -546,7 +614,7 @@ def compile_model(
         model = GovernedModel.model_validate(row["payload"])
         catalog_state(model)
     else:
-        model, _, row, _ = executable_model(model_id, revision)
+        model, _, row, _ = executable_model(model_id, revision, query=query)
     plan = compile_query(model, query)
     return {
         "revision": row["revision"],
@@ -626,7 +694,7 @@ def execute(
     require_enabled()
     # Lifecycle writers cannot revoke the selected revision midway through a query.
     with dal.read_snapshot(model_id):
-        model, _, row, state = executable_model(model_id, revision)
+        model, _, row, state = executable_model(model_id, revision, query=query)
         plan: Plan = compile_query(model, query)
         with ExitStack() as stack:
             readers = {
@@ -640,7 +708,15 @@ def execute(
             # snapshot. DDL and concurrent duplicate rows cannot slip between
             # validation and execution through separate pool connections.
             for source in sorted(
-                model.sources,
+                (
+                    source
+                    for source in model.sources
+                    if source.datasource_id in readers
+                    and (
+                        not row["certification"].get("dependency_fingerprints")
+                        or source.source_id in plan.source_ids
+                    )
+                ),
                 key=lambda source: (
                     source.datasource_id,
                     source.schema_name,
@@ -648,7 +724,7 @@ def execute(
                 ),
             ):
                 adapter_for(model.dialect).lock(readers[source.datasource_id], source)
-            _check_certificate(model, row, readers=readers)
+            _check_certificate(model, row, readers=readers, plan=plan)
             try:
                 frame = readers[plan.datasource_id](plan.sql, plan.params)
             except (psycopg.Error, mysql.connector.Error) as exc:

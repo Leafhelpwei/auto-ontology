@@ -16,6 +16,7 @@ const scalar = z.union([z.string(), z.number().finite(), z.boolean(), z.null()])
 const fieldRef = z.object({ source_id: z.string(), field_id: z.string() }).strict();
 export const predicateSchema = z
 	.object({
+		relationship_path: z.array(z.string().min(1)).nullable().optional(),
 		field: fieldRef,
 		operator: z.enum([
 			'eq',

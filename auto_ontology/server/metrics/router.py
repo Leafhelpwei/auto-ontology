@@ -228,7 +228,7 @@ def validate(
 def certify(
     model_id: str, body: TransitionRequest, user_id: str = Depends(reader)
 ) -> dict[str, Any]:
-    """Record authenticated review evidence and a live PostgreSQL fingerprint."""
+    """Record authenticated review evidence and live dependency fingerprints."""
     editor(user_id, model_id)
     return {
         "data": service.transition(
@@ -329,7 +329,9 @@ def interpret(
     model_id: str, body: InterpretationRequest, user_id: str = Depends(reader)
 ) -> dict[str, Any]:
     """Interpret a question against the active certified model and validate its plan."""
-    model, _, _, _ = service.executable_model(model_id, body.revision)
+    model, _, _, _ = service.executable_model(
+        model_id, body.revision, metadata_only=True
+    )
     result = interpret_question(
         model,
         InterpretRequest(
