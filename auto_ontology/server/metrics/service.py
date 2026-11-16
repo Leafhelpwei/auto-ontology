@@ -17,6 +17,8 @@ from uuid import UUID
 import math
 
 import pandas as pd
+import psycopg
+import mysql.connector
 from typing import Any
 
 from sqlalchemy import select
@@ -35,8 +37,8 @@ from auto_ontology.semantic.contracts.models import (
     ValidationReport,
 )
 from auto_ontology.semantic.contracts.validator import validate_model
+from auto_ontology.server.metrics.numeric_policy import validate_mysql_arithmetic
 from auto_ontology.server.metrics.source_adapters import (
-    MySQLSourceAdapter,
     SourceConnector,
     SourceReader,
     adapter_for,
@@ -89,7 +91,7 @@ def catalog_state(
 
     MySQL always inspects the real source because Catalog's DATA_TYPE/individual
     is_unique fields cannot establish full column precision or composite indexes.
-    PostgreSQL keeps its previous static-draft behavior and fingerprint format.
+    PostgreSQL drafts can use Catalog metadata; certification uses physical fingerprint v2.
     Current Auto Ontology grants catalog readers global visibility; zones are
     organizational filters rather than account grants.
     """
@@ -291,8 +293,7 @@ def catalog_state(
             target is not None, "UNKNOWN_SOURCE", "Relationship target does not exist"
         )
         assert target is not None
-        if model.dialect == "mysql":
-            assert isinstance(adapter, MySQLSourceAdapter)
+        if inspect_live:
             origin = sources.get(relationship.source_id)
             _require(
                 origin is not None,
@@ -343,6 +344,8 @@ def catalog_state(
                 "FANOUT_RISK",
                 f"Relationship {relationship.relationship_id}: one-to-one source keys are not unique",
             )
+    if inspect_live and model.dialect == "mysql" and validate_model(model).valid:
+        validate_mysql_arithmetic(model, physical_by_source)
     return CatalogState(
         _hash(sorted(snapshots, key=lambda item: item["source_id"])), names, connectors
     )
@@ -554,6 +557,11 @@ def compile_model(
 
 def _json_value(value: Any) -> Any:
     if isinstance(value, Decimal):
+        _require(
+            value.is_finite(),
+            "NON_FINITE_RESULT",
+            "The metric returned a non-finite decimal; correct the source data or calculation",
+        )
         return str(value)
     if (
         isinstance(value, int)
@@ -566,7 +574,10 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, float) and not math.isfinite(value):
-        return None
+        raise ContractError(
+            "NON_FINITE_RESULT",
+            "The metric returned a non-finite number; correct the source data or calculation",
+        )
     return value
 
 
@@ -638,7 +649,17 @@ def execute(
             ):
                 adapter_for(model.dialect).lock(readers[source.datasource_id], source)
             _check_certificate(model, row, readers=readers)
-            frame = readers[plan.datasource_id](plan.sql, plan.params)
+            try:
+                frame = readers[plan.datasource_id](plan.sql, plan.params)
+            except (psycopg.Error, mysql.connector.Error) as exc:
+                if getattr(exc, "sqlstate", None) == "22003" or getattr(
+                    exc, "errno", None
+                ) in {1264, 1690}:
+                    raise ContractError(
+                        "NUMERIC_RANGE_EXCEEDED",
+                        "The metric exceeds the database numeric range; narrow the scope or use a reviewed wider representation",
+                    ) from exc
+                raise
         return {
             "revision": row["revision"],
             "trusted": True,

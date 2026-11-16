@@ -220,6 +220,7 @@ def dimension_path(
     by_id = {relation.relationship_id: relation for relation in model.relationships}
     path: list[Relationship] = []
     current = source.source_id
+    visited = {current}
     for relationship_id in dimension.relationship_path:
         relation = by_id.get(relationship_id)
         if relation is None or relation.source_id != current:
@@ -227,8 +228,14 @@ def dimension_path(
                 "INVALID_RELATIONSHIP_PATH",
                 f"Invalid path for dimension {dimension_id}",
             )
+        if relation.target_id in visited:
+            fail(
+                "CYCLIC_ROLE_PATH",
+                "Repeated source roles require distinct registered sources; cyclic dimension paths are unsupported",
+            )
         path.append(relation)
         current = relation.target_id
+        visited.add(current)
     if current != dimension.field.source_id:
         fail(
             "INVALID_RELATIONSHIP_PATH",

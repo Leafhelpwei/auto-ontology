@@ -928,3 +928,152 @@ def test_explicit_non_null_currency_filter_excludes_unknown_money(
     assert rows(connection, compile_query(model, query)) == [
         {"currency_code": "CNY", "confirmed_amount": Decimal("250")}
     ]
+
+
+def test_exact_row_multiplication_promotes_before_integer_overflow(f0):
+    connection, model = f0
+    schema = model.sources[0].schema_name
+    connection.execute(
+        f'ALTER TABLE "{schema}".order_line ALTER COLUMN quantity TYPE integer, ALTER COLUMN unit_price TYPE integer'
+    )
+    connection.execute(
+        f'UPDATE "{schema}".order_line SET quantity = CASE WHEN order_line_id = 1 THEN 50000 ELSE 0 END, unit_price = 50000'
+    )
+    result = rows(connection, compile_query(model, request()))
+    assert next(row for row in result if row["currency_code"] == "CNY")[
+        "confirmed_amount"
+    ] == Decimal("2500000000")
+
+
+def test_postgres_physical_join_semantics_reject_float_exact_fanout(postgres):
+    from auto_ontology.server.metrics.source_adapters import PostgresSourceAdapter
+    from auto_ontology.semantic.contracts.models import FieldBinding, SourceBinding
+
+    connection, schema = postgres
+    connection.execute("CREATE TABLE exact_keys (id bigint PRIMARY KEY)")
+    connection.execute(
+        "INSERT INTO exact_keys VALUES (9007199254740992), (9007199254740993)"
+    )
+    connection.execute("CREATE TABLE float_keys (id double precision PRIMARY KEY)")
+    connection.execute("INSERT INTO float_keys VALUES (9007199254740992)")
+    assert (
+        connection.execute(
+            "SELECT count(*) FROM float_keys f JOIN exact_keys e ON f.id=e.id"
+        ).fetchone()[0]
+        == 2
+    )
+
+    def read(sql, params):
+        import pandas as pd
+
+        cursor = connection.execute(sql, params)
+        return pd.DataFrame(
+            cursor.fetchall(),
+            columns=[item.name for item in cursor.description],
+            dtype=object,
+        )
+
+    adapter = PostgresSourceAdapter()
+    structures = [
+        adapter.inspect(
+            read,
+            SourceBinding.model_validate(
+                source(name, name, ["id"], [field("id")], schema)
+            ),
+        )
+        for name in ("float_keys", "exact_keys")
+    ]
+    binding = FieldBinding.model_validate(field("id"))
+    with pytest.raises(ContractError) as error:
+        adapter.validate_join_key(
+            structures[0].columns[0], structures[1].columns[0], binding, binding
+        )
+    assert error.value.code == "INCOMPATIBLE_JOIN_KEYS"
+    connection.execute("CREATE TABLE text_keys (id text NOT NULL)")
+    connection.execute(
+        "CREATE UNIQUE INDEX text_pattern_key ON text_keys (id text_pattern_ops)"
+    )
+    target = SourceBinding.model_validate(
+        source("text_keys", "text_keys", ["id"], [field("id", "string")], schema)
+    )
+    assert adapter.inspect(read, target).unique_keys == []
+    connection.execute("CREATE UNIQUE INDEX text_default_key ON text_keys (id)")
+    assert adapter.inspect(read, target).unique_keys == [["id"]]
+
+
+def test_cyclic_currency_role_cannot_merge_fact_currencies(postgres):
+    connection, schema = postgres
+    connection.execute(
+        "CREATE TABLE currency_a(id integer PRIMARY KEY, b_id integer, amount numeric, currency text)"
+    )
+    connection.execute(
+        "CREATE TABLE currency_b(id integer PRIMARY KEY, primary_a_id integer)"
+    )
+    connection.execute("INSERT INTO currency_a VALUES (1,1,100,'USD'),(2,1,200,'CNY')")
+    connection.execute("INSERT INTO currency_b VALUES (1,1)")
+    assert connection.execute(
+        "SELECT back.currency, sum(f.amount) FROM currency_a f JOIN currency_b b ON f.b_id=b.id JOIN currency_a back ON b.primary_a_id=back.id GROUP BY back.currency"
+    ).fetchall() == [("USD", Decimal("300"))]
+    a = source(
+        "a",
+        "currency_a",
+        ["id"],
+        [field("id"), field("b_id"), field("amount"), field("currency", "string")],
+        schema,
+    )
+    b = source("b", "currency_b", ["id"], [field("id"), field("primary_a_id")], schema)
+    a["dimensions"] = [
+        {
+            "dimension_id": "currency",
+            "field": ref("a", "currency"),
+            "relationship_path": ["a_b", "b_a"],
+        }
+    ]
+    data = {
+        "model_id": "cycle",
+        "name": "Cycle",
+        "sources": [a, b],
+        "relationships": [
+            {
+                "relationship_id": "a_b",
+                "source_id": "a",
+                "target_id": "b",
+                "role": "group",
+                "keys": [{"source_field_id": "b_id", "target_field_id": "id"}],
+                "cardinality": "many_to_one",
+                "join_type": "inner",
+            },
+            {
+                "relationship_id": "b_a",
+                "source_id": "b",
+                "target_id": "a",
+                "role": "primary",
+                "keys": [{"source_field_id": "primary_a_id", "target_field_id": "id"}],
+                "cardinality": "many_to_one",
+                "join_type": "inner",
+            },
+        ],
+        "metrics": [
+            {
+                "metric_id": "amount",
+                "name": "Amount",
+                "description": "",
+                "owner_term_id": "a",
+                "kind": "atomic",
+                "source_ids": ["a"],
+                "aggregation": "sum",
+                "expression": {"kind": "field", "field_id": "amount"},
+                "supported_dimensions": ["currency"],
+                "unit": "currency",
+                "currency_field_id": "currency",
+            }
+        ],
+    }
+    with pytest.raises(ContractError) as error:
+        compile_query(
+            GovernedModel.model_validate(data),
+            MetricQueryRequest(
+                metric_ids=("amount",), dimensions=("currency",), all_time=True
+            ),
+        )
+    assert error.value.code == "CYCLIC_ROLE_PATH"

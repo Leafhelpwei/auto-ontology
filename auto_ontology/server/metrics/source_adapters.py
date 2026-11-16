@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Physical source checks for governed business databases, never metadata storage.
 
-PostgreSQL retains its original fingerprint shape. MySQL requires InnoDB tables,
+PostgreSQL fingerprint v2 includes generated expressions and comparison semantics. MySQL requires InnoDB tables,
 complete unique keys, explicit datetime storage semantics and a pinned read-only
 session. Only SELECT privileges on the business schema are needed for inspection.
 """
@@ -42,10 +42,24 @@ def normalize_dialect(dialect: str | None) -> str | None:
 
 _PG_COLUMNS_SQL = """
 SELECT a.attname AS name, pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-       NOT a.attnotnull AS nullable
+       NOT a.attnotnull AS nullable, a.atttypid AS type_oid,
+       a.attcollation AS collation_oid, co.collname AS collation,
+       co.collprovider AS collation_provider, co.collcollate AS collation_locale,
+       pg_catalog.pg_collation_actual_version(co.oid) AS collation_version,
+       a.attgenerated AS generated,
+       CASE WHEN a.attgenerated <> '' THEN pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) END AS generation_expression,
+       NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_depend d
+           LEFT JOIN pg_catalog.pg_proc p ON d.refclassid = 'pg_catalog.pg_proc'::regclass AND p.oid = d.refobjid
+           LEFT JOIN pg_catalog.pg_operator op ON d.refclassid = 'pg_catalog.pg_operator'::regclass AND op.oid = d.refobjid
+           WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.objid = ad.oid
+             AND (p.pronamespace <> 'pg_catalog'::regnamespace OR op.oprnamespace <> 'pg_catalog'::regnamespace)
+       ) AS generated_builtin_only
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
 WHERE n.nspname = %(schema)s AND c.relname = %(table)s
   AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum
@@ -57,10 +71,22 @@ JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+JOIN pg_catalog.pg_opclass oc ON oc.oid = i.indclass[k.ordinality - 1]
+JOIN pg_catalog.pg_am am ON am.oid = oc.opcmethod
 WHERE n.nspname = %(schema)s AND c.relname = %(table)s
   AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
   AND k.ordinality <= i.indnkeyatts
-GROUP BY i.indexrelid ORDER BY i.indexrelid
+GROUP BY i.indexrelid
+HAVING bool_and(oc.opcdefault AND oc.opcnamespace = 'pg_catalog'::regnamespace
+                AND am.amname = 'btree' AND i.indcollation[k.ordinality - 1] = a.attcollation)
+ORDER BY i.indexrelid
+"""
+_PG_TABLE_SQL = """
+SELECT c.relkind AS kind, c.relrowsecurity AS row_security,
+       c.relforcerowsecurity AS force_row_security, c.relhassubclass AS has_children,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid) AS has_parent
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s AND c.relname = %(table)s
 """
 _MYSQL_TABLE_SQL = """
 SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name,
@@ -158,6 +184,24 @@ class PostgresSourceAdapter:
             f"Field {field.field_id}: type differs from the {'physical source' if physical else 'Catalog'}",
         )
 
+    def validate_join_key(
+        self,
+        left: dict[str, Any],
+        right: dict[str, Any],
+        left_field: FieldBinding,
+        right_field: FieldBinding,
+    ) -> None:
+        # Same native comparison or an exact numeric widening only. In
+        # particular, bigint/numeric -> float can collapse distinct unique keys.
+        exact = {20, 21, 23, 1700}
+        same = left["type_oid"] == right["type_oid"]
+        widening = left["type_oid"] in exact and right["type_oid"] in exact
+        require(
+            (same or widening) and left["collation_oid"] == right["collation_oid"],
+            "INCOMPATIBLE_JOIN_KEYS",
+            f"Join {left_field.field_id}/{right_field.field_id} requires compatible exact types and identical collation semantics",
+        )
+
     def lock(self, read: SourceReader, source: SourceBinding) -> None:
         statement = (
             pg_sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE")
@@ -173,7 +217,23 @@ class PostgresSourceAdapter:
             list(row["columns"])
             for row in read(_PG_UNIQUE_SQL, parameters).to_dict("records")
         ]
-        return SourceStructure(columns, unique)
+        table = read(_PG_TABLE_SQL, parameters).to_dict("records")
+        require(
+            len(table) == 1
+            and table[0]["kind"] == "r"
+            and not table[0]["has_children"]
+            and not table[0]["has_parent"],
+            "UNSUPPORTED_SOURCE_STRUCTURE",
+            "Governed PostgreSQL sources require ordinary tables without inheritance",
+        )
+        require(
+            all(column["generated_builtin_only"] for column in columns),
+            "UNSUPPORTED_GENERATED_DEPENDENCY",
+            "Generated columns using custom functions or operators require a materialized, reviewed source",
+        )
+        return SourceStructure(
+            columns, unique, {"fingerprint_version": 2, "table": table[0]}
+        )
 
 
 class MySQLSourceAdapter:

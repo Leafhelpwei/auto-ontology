@@ -178,24 +178,35 @@ def test_mysql_datetime_storage_is_explicit_and_timestamp_utc() -> None:
         adapter.validate_field(field("flag", "boolean"), "tinyint(1)")
 
 
-def test_postgres_time_semantics_and_fingerprint_shape_are_unchanged() -> None:
+def test_postgres_time_semantics_and_versioned_physical_fingerprint() -> None:
     adapter = adapters.PostgresSourceAdapter()
     adapter.validate_field(field("time", "datetime"), "timestamp(6) with time zone")
     with pytest.raises(ContractError) as error:
         adapter.validate_field(field("time", "datetime"), "timestamp without time zone")
     assert error.value.code == "NAIVE_TIMESTAMP_UNSUPPORTED"
-    columns = [{"name": "id", "data_type": "bigint", "nullable": False}]
+    columns = [
+        {
+            "name": "id",
+            "data_type": "bigint",
+            "nullable": False,
+            "generated_builtin_only": True,
+        }
+    ]
 
     def read(sql: str, params: Any) -> pd.DataFrame:
         return pd.DataFrame(
-            columns if sql == adapters._PG_COLUMNS_SQL else [{"columns": ["id"]}],
+            columns
+            if sql == adapters._PG_COLUMNS_SQL
+            else [{"kind": "r", "has_children": False, "has_parent": False}]
+            if sql == adapters._PG_TABLE_SQL
+            else [{"columns": ["id"]}],
             dtype=object,
         )
 
     inspected = adapter.inspect(read, source())
     assert inspected.columns == columns
     assert inspected.unique_keys == [["id"]]
-    assert inspected.properties is None
+    assert inspected.properties["fingerprint_version"] == 2
 
 
 def test_mysql_join_key_coercion_cannot_weaken_uniqueness() -> None:
@@ -258,3 +269,60 @@ def test_mysql_result_metadata_and_exact_values_include_empty_decimal_columns() 
         serialize_frame(empty)["column_metadata"][0]["json_encoding"]
         == "decimal-string"
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        Decimal("NaN"),
+        Decimal("sNaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_non_finite_values_are_not_silently_serialized_as_null(value):
+    frame = pd.DataFrame({"amount": [value]}, dtype=object)
+    with pytest.raises(ContractError) as error:
+        serialize_frame(frame)
+    assert error.value.code == "NON_FINITE_RESULT"
+    assert serialize_frame(pd.DataFrame({"amount": [None]}, dtype=object))["rows"] == [
+        {"amount": None}
+    ]
+
+
+@pytest.mark.parametrize(
+    "left,right,allowed",
+    [
+        (20, 23, True),
+        (20, 1700, True),
+        (1700, 1700, True),
+        (701, 701, True),
+        (20, 701, False),
+        (1700, 701, False),
+        (700, 1700, False),
+    ],
+)
+def test_postgres_join_type_matrix(left, right, allowed):
+    adapter = adapters.PostgresSourceAdapter()
+    pair = (
+        {"type_oid": left, "collation_oid": 0},
+        {"type_oid": right, "collation_oid": 0},
+    )
+    if allowed:
+        adapter.validate_join_key(*pair, field(), field())
+    else:
+        with pytest.raises(ContractError, match="exact types"):
+            adapter.validate_join_key(*pair, field(), field())
+
+
+def test_postgres_join_collation_must_match():
+    with pytest.raises(ContractError):
+        adapters.PostgresSourceAdapter().validate_join_key(
+            {"type_oid": 25, "collation_oid": 100},
+            {"type_oid": 25, "collation_oid": 950},
+            field("name", "string"),
+            field("name", "string"),
+        )

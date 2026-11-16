@@ -186,3 +186,32 @@ def test_upper_datetime_boundary_does_not_overflow_daily_scan() -> None:
             ),
         )
     assert error.value.code == "UNSUPPORTED_TIMEZONE_RANGE"
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        ("2026-03-29T00:00:00Z", "2026-03-29T01:00:00Z"),
+        ("2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z"),
+    ],
+)
+def test_grouping_excludes_transition_at_upper_bound(start, end):
+    from datetime import timedelta
+    from auto_ontology.semantic.contracts.compiler import _mysql_fixed_offset
+
+    begin, finish = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    # Autumn wall clocks inside the repeated hour are still ambiguous: reject.
+    if "10-25" in start:
+        with pytest.raises(ContractError):
+            _mysql_fixed_offset("Europe/Paris", begin, finish, end_exclusive=True)
+        return
+    compile_query(timed_model("UTC"), time_request(start, end, "Europe/Paris", "day"))
+    with pytest.raises(ContractError):
+        _mysql_fixed_offset(
+            "Europe/Paris",
+            begin,
+            finish + timedelta(microseconds=1),
+            end_exclusive=True,
+        )
+    with pytest.raises(ContractError):
+        _mysql_fixed_offset("Europe/Paris", begin, finish)  # storage bound stays strict

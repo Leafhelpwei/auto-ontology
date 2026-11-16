@@ -256,3 +256,67 @@ def test_mysql_empty_ungrouped_and_null_division(
         ),
     )
     assert all(row["confirmed_amount"] is None for row in result)
+
+
+@pytest.mark.parametrize(
+    "left,right,operation,expected",
+    [
+        ("CAST(0 AS UNSIGNED)", "CAST(1 AS UNSIGNED)", "subtract", "-1"),
+        ("CAST(50000 AS SIGNED)", "CAST(50000 AS SIGNED)", "multiply", "2500000000"),
+        (
+            "CAST('99999999999999999999999999999999999999999999999999999999999999999' AS DECIMAL(65,0))",
+            "1",
+            "subtract",
+            "99999999999999999999999999999999999999999999999999999999999999998",
+        ),
+        (
+            "CAST('0.000000000000000000000000000001' AS DECIMAL(30,30))",
+            "1",
+            "multiply",
+            "0.000000000000000000000000000001",
+        ),
+        ("NULL", "1", "subtract", None),
+    ],
+)
+def test_mysql_exact_arithmetic_uses_native_scale(
+    mysql_fixture, left, right, operation, expected
+):
+    from auto_ontology.semantic.contracts.compiler import binary_sql
+    from auto_ontology.semantic.contracts.models import (
+        BinaryExpression,
+        NumberExpression,
+    )
+
+    _, reader, _ = mysql_fixture
+    expression = BinaryExpression(
+        operator=operation,
+        left=NumberExpression(value=0),
+        right=NumberExpression(value=0),
+    )
+    with reader.cursor() as cursor:
+        cursor.execute("SELECT " + binary_sql(expression, left, right, "null", "mysql"))
+        actual = cursor.fetchone()[0]
+        assert actual == (Decimal(expected) if expected is not None else None)
+        cursor.execute("SHOW WARNINGS")
+        assert cursor.fetchall() == []
+
+
+def test_mysql_exact_scale_budget_rejects_silent_fraction_loss():
+    from auto_ontology.server.metrics.numeric_policy import validate_mysql_arithmetic
+    from auto_ontology.semantic.contracts.models import ContractError
+
+    model = mysql_model()
+    physical = {
+        source.source_id: {
+            field.column_name: {
+                "data_type": "decimal(30,20)"
+                if field.field_id in {"quantity", "unit_price"}
+                else "bigint"
+            }
+            for field in source.fields
+        }
+        for source in model.sources
+    }
+    with pytest.raises(ContractError) as error:
+        validate_mysql_arithmetic(model, physical)
+    assert error.value.code == "NUMERIC_SCALE_UNSUPPORTED"

@@ -67,7 +67,9 @@ def table(source: SourceBinding, dialect: str = "postgres") -> str:
     return f"{quote(source.schema_name, dialect)}.{quote(source.table_name, dialect)}"
 
 
-def _mysql_fixed_offset(name: str, start: datetime, end: datetime) -> timedelta:
+def _mysql_fixed_offset(
+    name: str, start: datetime, end: datetime, *, end_exclusive: bool = False
+) -> timedelta:
     """Reject ambiguous wall clocks or offset transitions in a bounded range.
 
     MySQL DATETIME cannot distinguish repeated local times. Fixed-offset queries
@@ -75,6 +77,10 @@ def _mysql_fixed_offset(name: str, start: datetime, end: datetime) -> timedelta:
     The supported IANA range is bounded to 100 years and checked at daily UTC
     points plus both edges; fold checks cover bounds inside a repeated hour.
     """
+    # Storage bounds themselves must remain unambiguous. Grouping only covers
+    # the half-open interval, excluding a transition exactly at its upper bound.
+    if end_exclusive and end > start:
+        end -= timedelta(microseconds=1)
     zone = storage_timezone(name)
     start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
     if end - start > timedelta(days=36600):
@@ -295,8 +301,17 @@ class FactScope:
             return
         if resolve_field(self.model, ref).data_type != "string":
             fail("INVALID_CURRENCY", "Currency fields must be strings")
+        expected_path = (
+            ()
+            if ref.source_id == self.source.source_id
+            else next(
+                dimension_path(self.model, self.source, dimension.dimension_id)[1]
+                for dimension in self.source.dimensions
+                if dimension.field == ref
+            )
+        )
         grouped = any(
-            dimension_path(self.model, self.source, dimension)[0] == ref
+            dimension_path(self.model, self.source, dimension) == (ref, expected_path)
             for dimension in self.request.dimensions
         )
         predicates = (
@@ -341,7 +356,8 @@ class FactScope:
             paths = [
                 dimension_path(self.model, self.source, dimension)[1]
                 for dimension in self.request.dimensions
-                if dimension_path(self.model, self.source, dimension)[0] == ref
+                if dimension_path(self.model, self.source, dimension)
+                == (ref, expected_path)
             ]
             target_present = all(
                 relation.join_type == "inner" for path in paths for relation in path
@@ -357,7 +373,13 @@ class FactScope:
                     "UNKNOWN_CURRENCY",
                     "Currency groups must be non-null; declare an explicit non-null/single-currency scope or repair missing currency data",
                 )
-            self.currency_scope = ("group", ref.source_id, ref.field_id)
+            self.currency_scope = (
+                "group",
+                self.source.source_id,
+                *(relation.relationship_id for relation in expected_path),
+                ref.source_id,
+                ref.field_id,
+            )
         else:
             values = {
                 predicate.value if predicate.operator == "eq" else predicate.value[0]
@@ -429,7 +451,10 @@ class FactScope:
                 grouping_time = column
                 if time.granularity:
                     target_offset = _mysql_fixed_offset(
-                        time.timezone, time.start, time.end_exclusive
+                        time.timezone,
+                        time.start,
+                        time.end_exclusive,
+                        end_exclusive=True,
                     )
                     minutes = int((target_offset - offset).total_seconds() // 60)
                     if minutes:
@@ -491,11 +516,21 @@ def binary_sql(
     zero_division: str,
     dialect: str = "postgres",
 ) -> str:
+    # Promote *before* every operation. Adding a scale-zero decimal in MySQL
+    # preserves a field's native decimal scale while avoiding unsigned/integer
+    # arithmetic; a fixed DECIMAL(65,30) cast would truncate large integers.
+    if dialect == "postgres":
+        left, right = f"CAST(({left}) AS NUMERIC)", f"CAST(({right}) AS NUMERIC)"
+    else:
+        left, right = (
+            f"(({left}) + CAST(0 AS DECIMAL(1,0)))",
+            f"(({right}) + CAST(0 AS DECIMAL(1,0)))",
+        )
     if expression.operator == "divide":
         denominator = (
             f"NULLIF(({right}), 0)" if zero_division == "null" else f"({right})"
         )
-        numerator = f"({left})" if dialect == "mysql" else f"CAST(({left}) AS NUMERIC)"
+        numerator = f"({left})"
         return f"({numerator} / {denominator})"
     operator = {"add": "+", "subtract": "-", "multiply": "*"}[expression.operator]
     return f"(({left}) {operator} ({right}))"

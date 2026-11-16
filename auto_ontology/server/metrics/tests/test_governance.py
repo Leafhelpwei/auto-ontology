@@ -505,3 +505,68 @@ def test_read_transaction_rejects_writes_and_keeps_snapshot(catalog) -> None:
         second = read(f"SELECT COUNT(*) AS n FROM {physical}", None).iloc[0, 0]
         assert first == second == 3
     assert connector.execute(f"SELECT COUNT(*) AS n FROM {physical}").iloc[0, 0] == 4
+
+
+def test_generated_formula_changes_invalidate_certification_and_allow_new_review(
+    catalog,
+):
+    model, connector, physical, _ = catalog
+    connector.execute(f"ALTER TABLE {physical} DROP COLUMN amount")
+    connector.execute(
+        f"ALTER TABLE {physical} ADD COLUMN amount numeric GENERATED ALWAYS AS (id * 250) STORED NOT NULL"
+    )
+    row = publish(model)
+    query = MetricQueryRequest(metric_ids=("amount",), all_time=True)
+    # Comments do not change calculation semantics.
+    connector.execute(
+        f"COMMENT ON COLUMN {physical}.amount IS 'business documentation'"
+    )
+    assert service.execute(model.model_id, query)["trusted"] is True
+    connector.execute(f"ALTER TABLE {physical} DROP COLUMN amount")
+    connector.execute(
+        f"ALTER TABLE {physical} ADD COLUMN amount numeric GENERATED ALWAYS AS (id * 500) STORED NOT NULL"
+    )
+    with pytest.raises(ContractError) as error:
+        service.execute(model.model_id, query)
+    assert error.value.code == "SOURCE_CHANGED"
+    row = service.draft(
+        model.model_id, model, expected_version=row["version"], user_id="reviewer"
+    )
+    for action in ("validate", "certify", "activate"):
+        row = service.transition(
+            model.model_id,
+            revision=2,
+            expected_version=row["version"],
+            action=action,
+            user_id="reviewer",
+            evidence="Reviewed new generated formula",
+        )
+    assert service.execute(model.model_id, query)["trusted"] is True
+
+
+def test_custom_generated_function_is_not_silently_certified(catalog):
+    model, connector, physical, _ = catalog
+    schema = model.sources[0].schema_name
+    connector.execute(
+        f"CREATE FUNCTION \"{schema}\".amount_formula(integer) RETURNS numeric LANGUAGE sql IMMUTABLE AS 'SELECT $1 * 250'"
+    )
+    connector.execute(f"ALTER TABLE {physical} DROP COLUMN amount")
+    connector.execute(
+        f'ALTER TABLE {physical} ADD COLUMN amount numeric GENERATED ALWAYS AS ("{schema}".amount_formula(id)) STORED NOT NULL'
+    )
+    with pytest.raises(ContractError) as error:
+        service.catalog_state(model, live=True)
+    assert error.value.code == "UNSUPPORTED_GENERATED_DEPENDENCY"
+
+
+def test_non_finite_physical_results_do_not_return_trusted_null(catalog):
+    model, connector, physical, _ = catalog
+    publish(model)
+    connector.execute(
+        f"UPDATE {physical} SET amount = 'Infinity'::numeric WHERE id = 1"
+    )
+    with pytest.raises(ContractError) as error:
+        service.execute(
+            model.model_id, MetricQueryRequest(metric_ids=("amount",), all_time=True)
+        )
+    assert error.value.code == "NON_FINITE_RESULT"
